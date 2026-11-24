@@ -1,0 +1,49 @@
+[package]
+name = "shoes-panel"
+version = "0.1.0"
+edition = "2021"
+description = "Unofficial 3x-ui style web management panel for cfal/shoes multi-protocol proxy server"
+license = "Apache-2.0"
+repository = "https://github.com/huangming774/shoes-ui"
+
+[[bin]]
+name = "shoes-panel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+axum = { version = "0.8", features = ["multipart", "macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+mime_guess = "2"
+parking_lot = "0.12"
+percent-encoding = "2"
+rand = "0.8"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sysinfo = "0.33"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

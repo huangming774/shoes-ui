@@ -1,0 +1,15 @@
+# Local reference & build artifacts
+/shoes/
+/target/
+/data/
+/data-*/
+/web/node_modules/
+/web/dist/
+
+# Runtime SQLite & temporary configs
+*.db
+*.db-shm
+*.db-wal
+*.yaml.tmp
+.DS_Store
+Thumbs.db

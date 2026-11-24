@@ -1,0 +1,18 @@
+[Unit]
+Description=Shoes Panel - Multi-Protocol Proxy Management Panel for cfal/shoes
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/shoes-panel
+Environment="SHOES_PANEL_DATA=/etc/shoes-panel"
+Environment="RUST_LOG=shoes_panel=info"
+ExecStart=/usr/local/bin/shoes-panel serve --data-dir /etc/shoes-panel
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

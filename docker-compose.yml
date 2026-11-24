@@ -1,0 +1,13 @@
+services:
+  shoes-panel:
+    build: .
+    container_name: shoes-panel
+    restart: unless-stopped
+    # Host networking allows newly created inbound ports (TCP & UDP/QUIC) to listen immediately without container recreation
+    network_mode: host
+    environment:
+      - SHOES_PANEL_DATA=/etc/shoes-panel
+      - PANEL_PORT=54321
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/etc/shoes-panel
