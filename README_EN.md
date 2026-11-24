@@ -5,6 +5,8 @@
 **A 3x-ui Style Multi-Protocol Web Management Panel for [cfal/shoes](https://github.com/cfal/shoes)**  
 *Single-Binary Rust Backend · Embedded Vue 3 + Ant Design Vue Bilingual SPA · Zero-Patch Hot Reload*
 
+[![Release](https://img.shields.io/github/v/release/huangming774/shoes-ui?logo=github)](https://github.com/huangming774/shoes-ui/releases)
+[![Build & Release](https://github.com/huangming774/shoes-ui/actions/workflows/release.yml/badge.svg)](https://github.com/huangming774/shoes-ui/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Backend-Rust%20%2B%20Axum-orange.svg)](https://www.rust-lang.org/)
 [![Vue](https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Ant%20Design-42b883.svg)](https://vuejs.org/)
@@ -54,17 +56,27 @@ bash <(curl -fsSL https://raw.githubusercontent.com/huangming774/shoes-ui/main/i
 
 Automatically installs the official `shoes` binary and `shoes-panel`, generates random admin credentials, port, and secret base path, enables the `shoes-panel` systemd service, and installs the `s-ui` management CLI.
 
-### Option 2: Docker Compose
+### Option 2: Prebuilt Multi-Arch Docker Image (`linux/amd64` & `linux/arm64`)
 
 ```bash
-git clone https://github.com/huangming774/shoes-ui.git
-cd shoes-ui
-docker compose up -d --build
+docker run -d --name shoes-panel \
+  --net=host --restart=unless-stopped \
+  -v $(pwd)/data:/etc/shoes-panel \
+  ghcr.io/huangming774/shoes-ui:latest
 ```
 
 Default URL on first start: `http://<SERVER_IP>:54321/` (`admin` / `admin` — change immediately in **Panel Settings**).
 
-### Option 3: Build from Source
+### Option 3: Prebuilt Release Binaries ([GitHub Releases](https://github.com/huangming774/shoes-ui/releases))
+
+GitHub Actions automatically builds and publishes single-binary archives + `SHA256SUMS.txt` for:
+- `shoes-panel-x86_64-unknown-linux-musl.tar.gz` / `gnu`
+- `shoes-panel-aarch64-unknown-linux-musl.tar.gz` / `gnu`
+- `shoes-panel-armv7-unknown-linux-musleabihf.tar.gz`
+- `shoes-panel-x86_64-pc-windows-msvc.zip`
+- `shoes-panel-aarch64-apple-darwin.tar.gz` & `shoes-panel-x86_64-apple-darwin.tar.gz`
+
+### Option 4: Build from Source
 
 ```bash
 cd web && npm install && npm run build && cd ..

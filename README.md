@@ -5,6 +5,8 @@
 **面向 [cfal/shoes](https://github.com/cfal/shoes) 的 3x-ui 风格多协议代理可视化管理面板**  
 *Rust 单二进制后端 · 内嵌 Vue 3 + Ant Design Vue 双语前端 · 零侵入热重载*
 
+[![Release](https://img.shields.io/github/v/release/huangming774/shoes-ui?logo=github)](https://github.com/huangming774/shoes-ui/releases)
+[![Build & Release](https://github.com/huangming774/shoes-ui/actions/workflows/release.yml/badge.svg)](https://github.com/huangming774/shoes-ui/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Backend-Rust%20%2B%20Axum-orange.svg)](https://www.rust-lang.org/)
 [![Vue](https://img.shields.io/badge/Frontend-Vue%203%20%2B%20Ant%20Design-42b883.svg)](https://vuejs.org/)
@@ -112,19 +114,45 @@ sudo bash install.sh
 3. 随机生成安全的**管理员密码、面板端口与随机访问根路径**并配置 `systemd` 开机自启；
 4. 安装 `s-ui` 命令行快捷管理菜单（随时在终端输入 `s-ui` 即可查看面板地址、启停服务、重置密码或修改端口）。
 
-### 方式二：Docker Compose 部署
+### 方式二：Docker / Docker Compose 部署（支持 `amd64` / `arm64` 预编译镜像）
+
+直接一键运行官方 GHCR 多架构镜像（内置 `shoes` 核心与 `shoes-panel`）：
+
+```bash
+docker run -d --name shoes-panel \
+  --net=host --restart=unless-stopped \
+  -v $(pwd)/data:/etc/shoes-panel \
+  ghcr.io/huangming774/shoes-ui:latest
+```
+
+或使用 `docker-compose.yml`：
 
 ```bash
 git clone https://github.com/huangming774/shoes-ui.git
 cd shoes-ui
-docker compose up -d --build
+docker compose up -d
 ```
 
 - 默认采用 `network_mode: host`，在面板中动态新增任何 TCP / UDP(QUIC) 入站端口均直接生效，无需重建容器。
 - 数据与证书持久化在 `./data` 目录（映射至容器内 `/etc/shoes-panel`）。
 - 首次启动默认地址：`http://<服务器IP>:54321/`，默认账号密码：`admin` / `admin`（**首次登录后请立即在「面板设置」修改密码与访问根路径**）。
 
-### 方式三：从源码手动编译
+### 方式三：直接下载各系统预编译包（[GitHub Releases](https://github.com/huangming774/shoes-ui/releases)）
+
+每次发布版本标签（`v*`）时，GitHub Actions 会自动编译打包以下 8 个平台单文件压缩包及 `SHA256SUMS.txt`：
+
+| 系统与架构 | 预编译压缩包 | 说明 |
+| :--- | :--- | :--- |
+| **Linux x86_64 (musl)** | `shoes-panel-x86_64-unknown-linux-musl.tar.gz` | 零依赖静态链接，通用于 Debian/Ubuntu/CentOS/Alpine/OpenWrt |
+| **Linux x86_64 (gnu)** | `shoes-panel-x86_64-unknown-linux-gnu.tar.gz` | 标准 glibc 动态链接版 |
+| **Linux ARM64 (musl)** | `shoes-panel-aarch64-unknown-linux-musl.tar.gz` | 零依赖静态链接，适用于甲骨文 ARM / 树莓派 4&5 / ARM64 软路由 |
+| **Linux ARM64 (gnu)** | `shoes-panel-aarch64-unknown-linux-gnu.tar.gz` | 标准 glibc ARM64 版 |
+| **Linux ARMv7 (musl)** | `shoes-panel-armv7-unknown-linux-musleabihf.tar.gz` | 适用于 32 位 ARM 软路由 / 嵌入式设备 |
+| **Windows x86_64** | `shoes-panel-x86_64-pc-windows-msvc.zip` | Windows 10 / 11 / Server 免安装单文件 |
+| **macOS Apple Silicon** | `shoes-panel-aarch64-apple-darwin.tar.gz` | Mac M1 / M2 / M3 / M4 |
+| **macOS Intel** | `shoes-panel-x86_64-apple-darwin.tar.gz` | Intel Mac |
+
+### 方式四：从源码手动编译
 
 环境要求：Node.js 20+、Rust 1.80+，并自行准备 [cfal/shoes](https://github.com/cfal/shoes/releases) 可执行文件。
 

@@ -5,23 +5,26 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish_docker:
+        description: 'Push multi-arch Docker image to GHCR'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CROSS_VERSION: 0.2.5
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-
-    runs-on: ${{ matrix.os }}
-
+  # 1. Build Vue 3 SPA once and share across all OS/arch targets
+  build-web:
+    name: Build Web Frontend
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -32,47 +35,247 @@ jobs:
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
-      - name: Build Frontend SPA
+      - name: Build Production SPA
         working-directory: web
         run: |
           npm ci
           npm run build
 
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config build-essential
+      - name: Upload Web Dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  # 2. Cross-compile & package single-file binaries for 8 OS/CPU targets
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: build-web
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            use_cross: true
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            use_cross: false
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            use_cross: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            use_cross: true
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-24.04
+            use_cross: true
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            archive: zip
+          - target: aarch64-apple-darwin
+            os: macos-15
+            use_cross: false
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15
+            use_cross: false
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Web Dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build Static Binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Install cross-rs
+        if: matrix.use_cross
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v${CROSS_VERSION}" --repo cross-rs/cross \
+            --pattern cross-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$RUNNER_TEMP/cross.tar.gz"
+          tar -xzf "$RUNNER_TEMP/cross.tar.gz" -C "$HOME/.cargo/bin" cross
 
-      - name: Prepare Release Artifact
-        run: cp target/${{ matrix.target }}/release/shoes-panel shoes-panel-${{ matrix.target }}
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
-      - name: Upload Artifact
+      - name: Compile Release Binary (cross)
+        if: matrix.use_cross
+        shell: bash
+        run: cross build --release --locked --target "${{ matrix.target }}"
+
+      - name: Compile Release Binary (native)
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package Archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TARGET="${{ matrix.target }}"
+          mkdir -p package artifacts
+          cp LICENSE README.md README_EN.md package/
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            cp "target/${TARGET}/release/shoes-panel.exe" package/
+            7z a -tzip "artifacts/shoes-panel-${TARGET}.zip" ./package/*
+          else
+            cp "target/${TARGET}/release/shoes-panel" package/
+            cp install.sh package/
+            mkdir -p package/deploy
+            cp deploy/shoes-panel.service package/deploy/
+            chmod +x package/shoes-panel package/install.sh
+            tar -czf "artifacts/shoes-panel-${TARGET}.tar.gz" -C package .
+          fi
+
+      - name: Upload Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shoes-panel-${{ matrix.target }}
-          path: shoes-panel-${{ matrix.target }}
+          name: pkg-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
 
+  # 3. Publish GitHub Release with all 8 archives + SHA256SUMS.txt
   release:
-    needs: build
+    name: Publish GitHub Release
+    needs: build-binaries
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - name: Download Artifacts
+      - name: Download All Built Packages
         uses: actions/download-artifact@v4
         with:
-          path: dist-bins
+          pattern: pkg-*
+          path: release-assets
           merge-multiple: true
 
-      - name: Publish GitHub Release
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          ls -lh
+          sha256sum shoes-panel-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-bins/shoes-panel-*
+          files: release-assets/*
           generate_release_notes: true
+          body: |
+            ### Quick Linux VPS Install (systemd)
+            ```bash
+            bash <(curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh)
+            ```
+
+            ### Docker Multi-Arch Image (`linux/amd64` & `linux/arm64`)
+            ```bash
+            docker run -d --name shoes-panel --net=host --restart=unless-stopped \
+              -v ./data:/etc/shoes-panel \
+              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+  # 4. Build & Push Multi-Arch (amd64 + arm64) Docker Image to GHCR
+  docker:
+    name: Publish Multi-Arch GHCR Image
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker == true
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Linux Static Packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*-unknown-linux-musl
+          path: musl-pkgs
+          merge-multiple: true
+
+      - name: Prepare Fast Multi-Arch Docker Context
+        run: |
+          set -euxo pipefail
+          mkdir -p docker-ctx/amd64 docker-ctx/arm64
+          tar -xzf musl-pkgs/shoes-panel-x86_64-unknown-linux-musl.tar.gz -C docker-ctx/amd64 shoes-panel
+          tar -xzf musl-pkgs/shoes-panel-aarch64-unknown-linux-musl.tar.gz -C docker-ctx/arm64 shoes-panel
+
+          cat > docker-ctx/Dockerfile <<'EOF'
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              ca-certificates curl tar tzdata \
+              && rm -rf /var/lib/apt/lists/*
+
+          ARG TARGETARCH
+          RUN set -eux; \
+              case "${TARGETARCH}" in \
+                amd64) SHOES_TARGET="x86_64-unknown-linux-musl" ;; \
+                arm64) SHOES_TARGET="aarch64-unknown-linux-musl" ;; \
+                *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
+              esac; \
+              mkdir -p /tmp/shoes-dl /usr/share/doc/shoes; \
+              curl -fsSL "https://github.com/cfal/shoes/releases/latest/download/shoes-${SHOES_TARGET}.tar.gz" -o /tmp/shoes-dl/shoes.tar.gz; \
+              tar -xzf /tmp/shoes-dl/shoes.tar.gz -C /tmp/shoes-dl; \
+              install -m 0755 "$(find /tmp/shoes-dl -type f -name shoes | head -n 1)" /usr/local/bin/shoes; \
+              find /tmp/shoes-dl -maxdepth 2 \( -name "LICENSE*" -o -name "THIRD_PARTY*" -o -name "licenses" \) -exec cp -r {} /usr/share/doc/shoes/ \; || true; \
+              rm -rf /tmp/shoes-dl
+
+          COPY ${TARGETARCH}/shoes-panel /usr/local/bin/shoes-panel
+          RUN chmod 0755 /usr/local/bin/shoes-panel
+
+          VOLUME ["/etc/shoes-panel"]
+          ENV SHOES_PANEL_DATA=/etc/shoes-panel
+          ENV PANEL_PORT=54321
+          ENV RUST_LOG=shoes_panel=info
+          EXPOSE 54321
+          ENTRYPOINT ["/usr/local/bin/shoes-panel"]
+          CMD ["serve", "--data-dir", "/etc/shoes-panel"]
+          EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Lowercase Image Name & Tags
+        id: meta
+        run: |
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tags=${IMAGE}:${{ github.ref_name }},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE}:edge" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and Push Multi-Arch Image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}

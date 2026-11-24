@@ -27,6 +27,7 @@ detect_arch() {
   case "$(uname -m)" in
     x86_64|amd64) echo "x86_64-unknown-linux-musl" ;;
     aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
+    armv7l|armv7|armhf) echo "armv7-unknown-linux-musleabihf" ;;
     *)
       echo -e "${RED}Unsupported CPU architecture: $(uname -m)${NC}" >&2
       exit 1
@@ -66,22 +67,29 @@ install_shoes_core() {
 
 install_panel_binary() {
   mkdir -p "$DATA_DIR" "$WORK_DIR"
+  local target tmp_dl
+  target="$(detect_arch)"
+  tmp_dl="$(mktemp -d)"
+
   if [[ -f "./target/release/shoes-panel" ]]; then
     echo -e "${CYAN}>>> Installing local release binary ./target/release/shoes-panel...${NC}"
     install -m 0755 "./target/release/shoes-panel" "$PANEL_BIN"
-  elif [[ -n "$PANEL_REPO" ]] && curl -fsSL "https://github.com/${PANEL_REPO}/releases/latest/download/shoes-panel-$(detect_arch)" -o "$PANEL_BIN" 2>/dev/null; then
-    echo -e "${GREEN}Downloaded prebuilt shoes-panel from GitHub (${PANEL_REPO}).${NC}"
-    chmod +x "$PANEL_BIN"
+  elif [[ -n "$PANEL_REPO" ]] && curl -fsSL "https://github.com/${PANEL_REPO}/releases/latest/download/shoes-panel-${target}.tar.gz" -o "${tmp_dl}/panel.tar.gz" 2>/dev/null; then
+    tar -xzf "${tmp_dl}/panel.tar.gz" -C "${tmp_dl}"
+    install -m 0755 "$(find "${tmp_dl}" -type f -name 'shoes-panel' | head -n 1)" "$PANEL_BIN"
+    echo -e "${GREEN}Downloaded prebuilt shoes-panel (${target}) from GitHub Releases.${NC}"
   else
     echo -e "${CYAN}>>> Building shoes-panel from source...${NC}"
     if ! command -v npm >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
-      echo -e "${RED}Error: Neither ./target/release/shoes-panel nor PANEL_REPO found, and cargo/npm are not installed.${NC}"
+      rm -rf "${tmp_dl}"
+      echo -e "${RED}Error: Prebuilt release not found and cargo/npm are not installed.${NC}"
       exit 1
     fi
     (cd web && npm install && npm run build)
     cargo build --release
     install -m 0755 "./target/release/shoes-panel" "$PANEL_BIN"
   fi
+  rm -rf "${tmp_dl}"
 }
 
 install_management_cli() {

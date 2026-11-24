@@ -1,6 +1,8 @@
 services:
   shoes-panel:
-    build: .
+    image: ghcr.io/huangming774/shoes-ui:latest
+    # Uncomment 'build: .' below if you want to build locally from source instead of pulling GHCR image
+    # build: .
     container_name: shoes-panel
     restart: unless-stopped
     # Host networking allows newly created inbound ports (TCP & UDP/QUIC) to listen immediately without container recreation
