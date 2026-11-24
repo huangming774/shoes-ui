@@ -147,7 +147,7 @@ jobs:
             mkdir -p package/deploy
             cp deploy/shoes-panel.service package/deploy/
             chmod +x package/shoes-panel package/install.sh
-            tar -czf "artifacts/shoes-panel-${TARGET}.tar.gz" -C package .
+            tar -czf "artifacts/shoes-panel-${TARGET}.tar.gz" -C package shoes-panel install.sh LICENSE README.md README_EN.md deploy
           fi
 
       - name: Upload Package Artifact
@@ -203,6 +203,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker == true
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download Linux Static Packages
         uses: actions/download-artifact@v4
         with:
@@ -216,38 +218,7 @@ jobs:
           mkdir -p docker-ctx/amd64 docker-ctx/arm64
           tar -xzf musl-pkgs/shoes-panel-x86_64-unknown-linux-musl.tar.gz -C docker-ctx/amd64 shoes-panel
           tar -xzf musl-pkgs/shoes-panel-aarch64-unknown-linux-musl.tar.gz -C docker-ctx/arm64 shoes-panel
-
-          cat > docker-ctx/Dockerfile <<'EOF'
-          FROM debian:bookworm-slim
-          RUN apt-get update && apt-get install -y --no-install-recommends \
-              ca-certificates curl tar tzdata \
-              && rm -rf /var/lib/apt/lists/*
-
-          ARG TARGETARCH
-          RUN set -eux; \
-              case "${TARGETARCH}" in \
-                amd64) SHOES_TARGET="x86_64-unknown-linux-musl" ;; \
-                arm64) SHOES_TARGET="aarch64-unknown-linux-musl" ;; \
-                *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
-              esac; \
-              mkdir -p /tmp/shoes-dl /usr/share/doc/shoes; \
-              curl -fsSL "https://github.com/cfal/shoes/releases/latest/download/shoes-${SHOES_TARGET}.tar.gz" -o /tmp/shoes-dl/shoes.tar.gz; \
-              tar -xzf /tmp/shoes-dl/shoes.tar.gz -C /tmp/shoes-dl; \
-              install -m 0755 "$(find /tmp/shoes-dl -type f -name shoes | head -n 1)" /usr/local/bin/shoes; \
-              find /tmp/shoes-dl -maxdepth 2 \( -name "LICENSE*" -o -name "THIRD_PARTY*" -o -name "licenses" \) -exec cp -r {} /usr/share/doc/shoes/ \; || true; \
-              rm -rf /tmp/shoes-dl
-
-          COPY ${TARGETARCH}/shoes-panel /usr/local/bin/shoes-panel
-          RUN chmod 0755 /usr/local/bin/shoes-panel
-
-          VOLUME ["/etc/shoes-panel"]
-          ENV SHOES_PANEL_DATA=/etc/shoes-panel
-          ENV PANEL_PORT=54321
-          ENV RUST_LOG=shoes_panel=info
-          EXPOSE 54321
-          ENTRYPOINT ["/usr/local/bin/shoes-panel"]
-          CMD ["serve", "--data-dir", "/etc/shoes-panel"]
-          EOF
+          cp deploy/Dockerfile.release docker-ctx/Dockerfile
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

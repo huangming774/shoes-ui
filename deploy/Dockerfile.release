@@ -1,0 +1,32 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl tar tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) SHOES_TARGET="x86_64-unknown-linux-musl" ;; \
+      arm64) SHOES_TARGET="aarch64-unknown-linux-musl" ;; \
+      *) echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    mkdir -p /tmp/shoes-dl /usr/share/doc/shoes; \
+    curl -fsSL "https://github.com/cfal/shoes/releases/latest/download/shoes-${SHOES_TARGET}.tar.gz" -o /tmp/shoes-dl/shoes.tar.gz; \
+    tar -xzf /tmp/shoes-dl/shoes.tar.gz -C /tmp/shoes-dl; \
+    install -m 0755 "$(find /tmp/shoes-dl -type f -name shoes | head -n 1)" /usr/local/bin/shoes; \
+    find /tmp/shoes-dl -maxdepth 2 \( -name "LICENSE*" -o -name "THIRD_PARTY*" -o -name "licenses" \) -exec cp -r {} /usr/share/doc/shoes/ \; || true; \
+    rm -rf /tmp/shoes-dl
+
+COPY ${TARGETARCH}/shoes-panel /usr/local/bin/shoes-panel
+RUN chmod 0755 /usr/local/bin/shoes-panel
+
+VOLUME ["/etc/shoes-panel"]
+ENV SHOES_PANEL_DATA=/etc/shoes-panel
+ENV PANEL_PORT=54321
+ENV RUST_LOG=shoes_panel=info
+
+EXPOSE 54321
+
+ENTRYPOINT ["/usr/local/bin/shoes-panel"]
+CMD ["serve", "--data-dir", "/etc/shoes-panel"]
