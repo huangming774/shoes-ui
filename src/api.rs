@@ -24,7 +24,9 @@ use crate::models::{
     RoutingRuleRecord, SubscriptionRecord,
 };
 use crate::state::{is_loopback_or_unspecified_host, AppState};
-use crate::sub_gen::{build_client_share_info, generate_subscription, SubFormat};
+use crate::sub_gen::{
+    build_client_share_info, generate_subscription_with_certs, SubFormat,
+};
 use crate::yaml_gen::build_shoes_yaml;
 
 #[derive(RustEmbed)]
@@ -985,6 +987,7 @@ async fn public_subscription_handler(
     let Ok(inbounds) = state.db.list_inbounds() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response();
     };
+    let certs = state.db.list_certificates().unwrap_or_default();
     let Ok(settings) = state.db.get_settings() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Settings error").into_response();
     };
@@ -998,7 +1001,7 @@ async fn public_subscription_handler(
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let fmt = SubFormat::detect(query.get("format").map(String::as_str), ua);
 
-    let payload = generate_subscription(&inbounds, &sub.sub_id, &host, fmt);
+    let payload = generate_subscription_with_certs(&inbounds, &certs, &sub.sub_id, &host, fmt);
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)

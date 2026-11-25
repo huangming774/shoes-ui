@@ -8,7 +8,7 @@ use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use crate::crypto_util::derive_reality_public_key;
-use crate::models::{ClientRecord, Inbound};
+use crate::models::{CertificateRecord, ClientRecord, Inbound};
 
 /// RFC 3986 query value encode set: preserves unreserved chars (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`)
 /// and `/`, encoding only controls, spaces, and query/URI delimiters (`#`, `%`, `&`, `+`, `=`, `?`).
@@ -166,6 +166,92 @@ pub fn build_client_share_info(ib: &Inbound, c: &ClientRecord, host: &str) -> Sh
     }
 }
 
+fn effective_snell_cipher(ib: &Inbound) -> &str {
+    let c = ib.protocol_settings.cipher.trim();
+    if c.is_empty() {
+        "aes-128-gcm"
+    } else {
+        c
+    }
+}
+
+fn has_non_host_ws_headers(ib: &Inbound) -> bool {
+    ib.stream_settings
+        .ws
+        .headers
+        .keys()
+        .any(|key| !key.eq_ignore_ascii_case("host"))
+}
+
+/// Reads the inbound's public TLS certificate PEM (never private keys) so strict TLS
+/// clients like sing-box NaiveProxy (Cronet) can pin self-signed certs cleanly.
+fn resolve_inbound_cert_pem(ib: &Inbound, certs: &[CertificateRecord]) -> Option<String> {
+    let tls = &ib.stream_settings.tls;
+    let cert_path = if tls.cert_mode == "files" && !tls.cert_file.trim().is_empty() {
+        tls.cert_file.trim().to_string()
+    } else if tls.cert_mode == "source" && !tls.certificate_source.trim().is_empty() {
+        certs
+            .iter()
+            .find(|c| c.name.trim() == tls.certificate_source.trim() && c.cert_type == "files")
+            .map(|c| c.cert_file.trim().to_string())
+            .filter(|p| !p.is_empty())?
+    } else {
+        return None;
+    };
+    let pem = std::fs::read_to_string(&cert_path).ok()?;
+    if pem.contains("-----BEGIN CERTIFICATE-----") {
+        Some(pem.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_pem_cert_raw(pem: &str) -> Option<String> {
+    let mut in_cert = false;
+    let mut body = String::new();
+    for line in pem.lines() {
+        let trimmed = line.trim();
+        if trimmed == "-----BEGIN CERTIFICATE-----" {
+            in_cert = true;
+            continue;
+        }
+        if trimmed == "-----END CERTIFICATE-----" {
+            if !body.is_empty() {
+                return Some(body);
+            }
+            return None;
+        }
+        if in_cert {
+            body.push_str(trimmed);
+        }
+    }
+    None
+}
+
+fn can_export_uri_transport(ib: &Inbound) -> bool {
+    let ss = &ib.stream_settings;
+    match ib.protocol.as_str() {
+        "tuic" | "hysteria2" => true,
+        "snell" => {
+            ss.network == "tcp"
+                && ss.security == "none"
+                && matches!(
+                    effective_snell_cipher(ib),
+                    "aes-128-gcm" | "chacha20-ietf-poly1305"
+                )
+        }
+        "shadowsocks" => {
+            (ss.network == "tcp" && ss.security == "none")
+                || (ss.network == "ws"
+                    && matches!(ss.security.as_str(), "none" | "tls")
+                    && !has_non_host_ws_headers(ib))
+        }
+        "vless" => matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp"),
+        "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
+        _ => ss.network == "tcp",
+    }
+}
+
 pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> String {
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
@@ -173,8 +259,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
     let port = ib.port;
     let tag = enc_fragment(name);
 
-    if !can_export_transport(ib)
-        || (ss.network == "ws" && ss.ws.headers.keys().any(|key| !key.eq_ignore_ascii_case("host")))
+    if !can_export_uri_transport(ib)
+        || (ss.network == "ws" && has_non_host_ws_headers(ib))
         || (ss.security == "reality" && matches!(ib.protocol.as_str(), "vmess" | "naiveproxy"))
         || (ss.security == "tls" && matches!(ib.protocol.as_str(), "socks" | "mixed"))
     {
@@ -368,7 +454,26 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 ps.cipher.trim()
             };
             let userinfo = URL_SAFE_NO_PAD.encode(format!("{cipher}:{}", c.password.trim()));
-            format!("ss://{userinfo}@{addr}:{port}#{tag}")
+            if ss.network == "ws" {
+                let mut opts = vec!["v2ray-plugin".to_string(), "mode=websocket".to_string(), "mux=0".to_string()];
+                if ss.security == "tls" {
+                    opts.push("tls".to_string());
+                }
+                let ws_host = ss.ws.host_header();
+                let sni = effective_tls_sni(ib);
+                let host_val = if !ws_host.is_empty() { ws_host } else { sni.as_str() };
+                if !host_val.is_empty() {
+                    opts.push(format!("host={host_val}"));
+                }
+                let path = ss.ws.path.trim();
+                if !path.is_empty() {
+                    opts.push(format!("path={path}"));
+                }
+                let plugin_param = enc_userinfo(&opts.join(";"));
+                format!("ss://{userinfo}@{addr}:{port}/?plugin={plugin_param}#{tag}")
+            } else {
+                format!("ss://{userinfo}@{addr}:{port}#{tag}")
+            }
         }
         "hysteria2" => {
             let mut params = Vec::new();
@@ -478,12 +583,17 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             )
         }
         "snell" => {
+            let version = match effective_snell_cipher(ib) {
+                "chacha20-ietf-poly1305" => 1,
+                _ => 3,
+            };
             format!(
-                "{} = snell, {}, {}, psk={}, version=3, reuse=true",
+                "{} = snell, {}, {}, psk={}, version={}, reuse=true",
                 name,
                 host.trim(),
                 port,
-                c.password.trim()
+                c.password.trim(),
+                version
             )
         }
         "socks" | "mixed" => {
@@ -552,11 +662,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             json!({"type": "naiveproxy", "username": uname, "password": c.password.trim()})
         }
         "snell" => {
-            let cipher = if ps.cipher.trim().is_empty() {
-                "chacha20-ietf-poly1305"
-            } else {
-                ps.cipher.trim()
-            };
+            let cipher = effective_snell_cipher(ib);
             json!({"type": "snell", "cipher": cipher, "password": c.password.trim()})
         }
         "socks" | "mixed" => {
@@ -672,7 +778,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             }
         });
         if ib.protocol == "naiveproxy" {
-            hop["protocol"]["alpn_protocols"] = json!(["h2"]);
+            hop["protocol"]["alpn_protocols"] = json!(["h2", "http/1.1"]);
         } else if !ss.tls.alpn.is_empty() {
             hop["protocol"]["alpn_protocols"] = json!(ss.tls.alpn);
         }
@@ -701,33 +807,21 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
     serde_yaml::to_string(&full).unwrap_or_default()
 }
 
-// These formats encode transports per protocol. A plain TCP node cannot reach a
-// listener that expects a WebSocket, XHTTP, QUIC, or TLS handshake first.
-fn can_export_transport(ib: &Inbound) -> bool {
-    let ss = &ib.stream_settings;
-    match ib.protocol.as_str() {
-        "tuic" | "hysteria2" => true,
-        "shadowsocks" | "snell" => ss.network == "tcp" && ss.security == "none",
-        "vless" => matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp"),
-        "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
-        _ => ss.network == "tcp",
-    }
-}
-
 fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Option<JsonValue> {
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let server = host.trim();
     let port = ib.port;
 
-    if !can_export_transport(ib) {
-        return None;
-    }
-    if ib.protocol == "trojan" && ss.security == "none" {
-        return None;
-    }
     let mut obj = match ib.protocol.as_str() {
         "vless" => {
+            if !matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp") {
+                return None;
+            }
+            // Mihomo v1.19.x WebSocket path (`case "ws":`) ignores `reality-opts` and dials plain TLS.
+            if ss.network == "ws" && ss.security == "reality" {
+                return None;
+            }
             let mut obj = json!({
                 "name": name,
                 "type": "vless",
@@ -766,6 +860,18 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             Some(obj)
         }
         "vmess" => {
+            if !matches!(ss.network.as_str(), "tcp" | "ws") {
+                return None;
+            }
+            // Mihomo v1.19.x WebSocket path ignores `reality-opts`.
+            if ss.network == "ws" && ss.security == "reality" {
+                return None;
+            }
+            // Mihomo uses sing-vmess which omits RequestOptionChunkStream for cipher=none on TCP,
+            // whereas shoes strictly requires chunked VMess streams.
+            if ps.cipher.trim().eq_ignore_ascii_case("none") {
+                return None;
+            }
             let cipher = match ps.cipher.trim() {
                 "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
@@ -792,6 +898,13 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             Some(obj)
         }
         "trojan" => {
+            if !matches!(ss.network.as_str(), "tcp" | "ws") {
+                return None;
+            }
+            // Mihomo Trojan always requires TLS and ignores `reality-opts` on WS.
+            if ss.security == "none" || (ss.network == "ws" && ss.security == "reality") {
+                return None;
+            }
             let mut obj = json!({
                 "name": name,
                 "type": "trojan",
@@ -818,7 +931,7 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             } else {
                 ps.cipher.trim()
             };
-            Some(json!({
+            let mut obj = json!({
                 "name": name,
                 "type": "ss",
                 "server": server,
@@ -826,7 +939,50 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "cipher": cipher,
                 "password": c.password.trim(),
                 "udp": ps.udp_enabled,
-            }))
+            });
+            if ss.network == "tcp" && ss.security == "none" {
+                Some(obj)
+            } else if ss.network == "ws" && matches!(ss.security.as_str(), "none" | "tls") {
+                let ws_host = ss.ws.host_header();
+                let sni = effective_tls_sni(ib);
+                if ss.security == "tls"
+                    && !ss.tls.allow_any_sni
+                    && !sni.is_empty()
+                    && !ws_host.is_empty()
+                    && !sni.eq_ignore_ascii_case(ws_host)
+                {
+                    // Mihomo v2ray-plugin shares one `host` for both TLS SNI and HTTP Host header.
+                    return None;
+                }
+                let mut plugin_opts = json!({
+                    "mode": "websocket",
+                    "path": if ss.ws.path.trim().is_empty() { "/" } else { ss.ws.path.trim() },
+                    "tls": ss.security == "tls",
+                    "mux": false,
+                });
+                let effective_host = if !ws_host.is_empty() {
+                    ws_host.to_string()
+                } else if ss.security == "tls" {
+                    sni
+                } else {
+                    String::new()
+                };
+                if !effective_host.is_empty() {
+                    plugin_opts["host"] = json!(effective_host);
+                }
+                let headers = ss.ws.matching_headers();
+                if !headers.is_empty() {
+                    plugin_opts["headers"] = json!(headers);
+                }
+                if ss.security == "tls" {
+                    plugin_opts["skip-cert-verify"] = json!(ss.tls.allow_insecure);
+                }
+                obj["plugin"] = json!("v2ray-plugin");
+                obj["plugin-opts"] = plugin_opts;
+                Some(obj)
+            } else {
+                None
+            }
         }
         "hysteria2" => {
             let mut obj = json!({
@@ -851,7 +1007,7 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "port": port,
                 "uuid": c.uuid.trim(),
                 "password": c.password.trim(),
-                "alpn": ["h3"],
+                "alpn": if ss.tls.alpn.is_empty() { json!(["h3"]) } else { json!(ss.tls.alpn) },
                 "udp-relay-mode": "native",
                 "congestion-controller": "bbr",
                 "skip-cert-verify": ss.tls.allow_insecure,
@@ -863,6 +1019,10 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             Some(obj)
         }
         "anytls" => {
+            // Mihomo AnyTLSOption does not support `reality-opts`.
+            if ss.network != "tcp" || ss.security != "tls" {
+                return None;
+            }
             let mut obj = json!({
                 "name": name,
                 "type": "anytls",
@@ -878,16 +1038,31 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             }
             Some(obj)
         }
-        "snell" => Some(json!({
-            "name": name,
-            "type": "snell",
-            "server": server,
-            "port": port,
-            "psk": c.password.trim(),
-            "version": 3,
-            "udp": ps.udp_enabled,
-        })),
+        "snell" => {
+            if ss.network != "tcp" || ss.security != "none" {
+                return None;
+            }
+            // Mihomo Snell transport maps version 1 -> chacha20-ietf-poly1305 (TCP only),
+            // version 2/3 -> aes-128-gcm (v3 supports UDP); aes-256-gcm is unsupported by Mihomo.
+            let (version, udp) = match effective_snell_cipher(ib) {
+                "aes-128-gcm" => (3, ps.udp_enabled),
+                "chacha20-ietf-poly1305" => (1, false),
+                _ => return None,
+            };
+            Some(json!({
+                "name": name,
+                "type": "snell",
+                "server": server,
+                "port": port,
+                "psk": c.password.trim(),
+                "version": version,
+                "udp": udp,
+            }))
+        }
         "socks" | "mixed" => {
+            if ss.network != "tcp" {
+                return None;
+            }
             let mut obj = json!({
                 "name": name,
                 "type": "socks5",
@@ -902,6 +1077,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             Some(obj)
         }
         "http" => {
+            if ss.network != "tcp" {
+                return None;
+            }
             let mut obj = json!({
                 "name": name,
                 "type": "http",
@@ -928,7 +1106,7 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
         });
     }
-    if ss.network == "ws" {
+    if ss.network == "ws" && ib.protocol != "shadowsocks" {
         let mut ws_opts = json!({ "path": ss.ws.path.trim() });
         let headers = ss.ws.matching_headers();
         if !headers.is_empty() {
@@ -958,6 +1136,7 @@ fn build_singbox_outbound(
     c: &ClientRecord,
     host: &str,
     name: &str,
+    certs: &[CertificateRecord],
 ) -> Option<JsonValue> {
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
@@ -974,7 +1153,11 @@ fn build_singbox_outbound(
             t["server_name"] = json!(sni);
         }
         if ib.is_quic() {
-            t["alpn"] = json!(["h3"]);
+            t["alpn"] = if ss.tls.alpn.is_empty() {
+                json!(["h3"])
+            } else {
+                json!(ss.tls.alpn)
+            };
         } else if !ss.tls.alpn.is_empty() {
             t["alpn"] = json!(ss.tls.alpn);
         }
@@ -1002,15 +1185,9 @@ fn build_singbox_outbound(
         None
     };
 
-    if !can_export_transport(ib) {
-        return None;
-    }
-    if ib.protocol == "socks" && ss.security != "none" {
-        return None;
-    }
     let mut obj = match ib.protocol.as_str() {
         "vless" => {
-            if ss.network == "xhttp" {
+            if !matches!(ss.network.as_str(), "tcp" | "ws" | "quic") {
                 return None;
             }
             let mut obj = json!({
@@ -1029,9 +1206,20 @@ fn build_singbox_outbound(
             if let Some(t) = tls_block {
                 obj["tls"] = t;
             }
+            if ss.network == "quic" {
+                obj["transport"] = json!({ "type": "quic" });
+            }
             Some(obj)
         }
         "vmess" => {
+            if !matches!(ss.network.as_str(), "tcp" | "ws") {
+                return None;
+            }
+            // sing-vmess omits RequestOptionChunkStream for security=none on TCP,
+            // which shoes VMess server rejects.
+            if ps.cipher.trim().eq_ignore_ascii_case("none") {
+                return None;
+            }
             let cipher = match ps.cipher.trim() {
                 "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
@@ -1050,6 +1238,9 @@ fn build_singbox_outbound(
             Some(obj)
         }
         "trojan" => {
+            if !matches!(ss.network.as_str(), "tcp" | "ws") {
+                return None;
+            }
             let mut obj = json!({
                 "tag": name,
                 "type": "trojan",
@@ -1070,14 +1261,69 @@ fn build_singbox_outbound(
             } else {
                 ps.cipher.trim()
             };
-            Some(json!({
+            let mut obj = json!({
                 "tag": name,
                 "type": "shadowsocks",
                 "server": server,
                 "server_port": port,
                 "method": cipher,
                 "password": c.password.trim(),
-            }))
+            });
+            if ss.network == "tcp" && ss.security == "none" {
+                Some(obj)
+            } else if ss.network == "ws"
+                && matches!(ss.security.as_str(), "none" | "tls")
+                && !has_non_host_ws_headers(ib)
+            {
+                let ws_host = ss.ws.host_header();
+                let sni = effective_tls_sni(ib);
+                let path = if ss.ws.path.trim().is_empty() {
+                    "/"
+                } else {
+                    ss.ws.path.trim()
+                };
+                let mut opts = vec![
+                    "mode=websocket".to_string(),
+                    "mux=0".to_string(),
+                    format!("path={path}"),
+                ];
+                if ss.security == "tls" {
+                    // sing-box v2ray-plugin shares `host` for both TLS SNI and HTTP Host
+                    // and has no `insecure` flag (only `certRaw` for self-signed cert pinning).
+                    if !ss.tls.allow_any_sni
+                        && !sni.is_empty()
+                        && !ws_host.is_empty()
+                        && !sni.eq_ignore_ascii_case(ws_host)
+                    {
+                        return None;
+                    }
+                    opts.push("tls".to_string());
+                    let effective_host = if !ws_host.is_empty() {
+                        ws_host.to_string()
+                    } else {
+                        sni.clone()
+                    };
+                    if !effective_host.is_empty() {
+                        opts.push(format!("host={effective_host}"));
+                    }
+                    if ss.tls.allow_insecure {
+                        if !ws_host.is_empty() && !sni.is_empty() && !ws_host.eq_ignore_ascii_case(&sni) {
+                            // Self-signed cert SAN usually matches SNI, not a different WS Host.
+                            return None;
+                        }
+                        let pem = resolve_inbound_cert_pem(ib, certs)?;
+                        let raw = extract_pem_cert_raw(&pem)?;
+                        opts.push(format!("certRaw={raw}"));
+                    }
+                } else if !ws_host.is_empty() {
+                    opts.push(format!("host={ws_host}"));
+                }
+                obj["plugin"] = json!("v2ray-plugin");
+                obj["plugin_opts"] = json!(opts.join(";"));
+                Some(obj)
+            } else {
+                None
+            }
         }
         "hysteria2" => {
             let mut obj = json!({
@@ -1109,6 +1355,9 @@ fn build_singbox_outbound(
             Some(obj)
         }
         "anytls" => {
+            if ss.network != "tcp" || !matches!(ss.security.as_str(), "tls" | "reality") {
+                return None;
+            }
             let mut obj = json!({
                 "tag": name,
                 "type": "anytls",
@@ -1121,7 +1370,37 @@ fn build_singbox_outbound(
             }
             Some(obj)
         }
-        "http" | "mixed" if ib.protocol == "http" || ss.security == "tls" => {
+        "naiveproxy" => {
+            // sing-box Cronet naive outbound requires TLS (no reality, no insecure, no alpn);
+            // for self-signed certs we embed the server's public cert PEM in `tls.certificate`.
+            if ss.network != "tcp" || ss.security != "tls" {
+                return None;
+            }
+            let uname = if c.username.trim().is_empty() {
+                c.name.trim()
+            } else {
+                c.username.trim()
+            };
+            let mut naive_tls = json!({ "enabled": true });
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                naive_tls["server_name"] = json!(sni);
+            }
+            if ss.tls.allow_insecure {
+                let pem = resolve_inbound_cert_pem(ib, certs)?;
+                naive_tls["certificate"] = json!([pem]);
+            }
+            Some(json!({
+                "tag": name,
+                "type": "naive",
+                "server": server,
+                "server_port": port,
+                "username": uname,
+                "password": c.password.trim(),
+                "tls": naive_tls,
+            }))
+        }
+        "http" | "mixed" if ss.network == "tcp" && (ib.protocol == "http" || ss.security == "tls") => {
             let mut obj = json!({
                 "tag": name, "type": "http", "server": server, "server_port": port,
             });
@@ -1134,7 +1413,7 @@ fn build_singbox_outbound(
             }
             Some(obj)
         }
-        "socks" | "mixed" => {
+        "socks" | "mixed" if ss.network == "tcp" && ss.security == "none" => {
             let mut obj = json!({
                 "tag": name,
                 "type": "socks",
@@ -1149,7 +1428,7 @@ fn build_singbox_outbound(
         }
         _ => None,
     }?;
-    if ss.network == "ws" {
+    if ss.network == "ws" && ib.protocol != "shadowsocks" {
         obj["transport"] = json!({
             "type": "ws",
             "path": ss.ws.path.trim(),
@@ -1194,8 +1473,19 @@ fn quote_sensitive_clash_strings(yaml: &str) -> String {
     out
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_subscription(
     inbounds: &[Inbound],
+    sub_id_filter: &str,
+    host: &str,
+    format: SubFormat,
+) -> SubscriptionPayload {
+    generate_subscription_with_certs(inbounds, &[], sub_id_filter, host, format)
+}
+
+pub fn generate_subscription_with_certs(
+    inbounds: &[Inbound],
+    certs: &[CertificateRecord],
     sub_id_filter: &str,
     host: &str,
     format: SubFormat,
@@ -1341,7 +1631,7 @@ pub fn generate_subscription(
             let mut outbounds = Vec::new();
             let mut tags = Vec::new();
             for (ib, c, name) in &matched_pairs {
-                if let Some(o) = build_singbox_outbound(ib, c, host, name) {
+                if let Some(o) = build_singbox_outbound(ib, c, host, name, certs) {
                     tags.push(name.clone());
                     outbounds.push(o);
                 }

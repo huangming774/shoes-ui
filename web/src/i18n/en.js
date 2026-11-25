@@ -145,6 +145,9 @@ export default {
     fallback: 'Auth Fallback Address/Dir (Optional)',
     rulesRef: 'Outbound Group / Rule Override (Empty = Global)',
     rawYaml: 'Raw Server YAML Override (Empty = Use Form)',
+    compatNoteTitle: 'Client Subscription Compatibility',
+    compatAllOk: 'Supported by Shoes, Mihomo, and sing-box',
+    compatPartial: 'Exported to: {supported}. Automatically omitted from: {omitted} (unsupported by those client cores).',
   },
   subs: {
     title: 'Subscription Management',

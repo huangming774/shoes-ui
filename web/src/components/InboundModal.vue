@@ -104,12 +104,12 @@
                 <a-select-option value="any">auto / any</a-select-option>
                 <a-select-option value="aes-128-gcm">aes-128-gcm</a-select-option>
                 <a-select-option value="chacha20-poly1305">chacha20-poly1305</a-select-option>
-                <a-select-option value="none">none</a-select-option>
+                <a-select-option value="none">none (Shoes / Xray only)</a-select-option>
               </template>
               <template v-else-if="form.protocol === 'snell'">
-                <a-select-option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</a-select-option>
-                <a-select-option value="aes-256-gcm">aes-256-gcm</a-select-option>
-                <a-select-option value="aes-128-gcm">aes-128-gcm</a-select-option>
+                <a-select-option value="aes-128-gcm">aes-128-gcm (Mihomo v3 / Surge)</a-select-option>
+                <a-select-option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (Mihomo v1 TCP)</a-select-option>
+                <a-select-option value="aes-256-gcm">aes-256-gcm (Shoes only)</a-select-option>
               </template>
             </a-select>
           </a-form-item>
@@ -169,6 +169,14 @@
           </a-form-item>
         </a-col>
       </a-row>
+
+      <a-alert
+        v-if="compatOmitted.length > 0"
+        type="info"
+        show-icon
+        style="margin-bottom: 12px"
+        :message="t('inbounds.compatPartial', { supported: compatSupported.join(' / '), omitted: compatOmitted.join(' / ') })"
+      />
 
       <!-- WebSocket Settings -->
       <div v-if="form.stream_settings.network === 'ws'" class="sub-box">
@@ -515,6 +523,61 @@ const needsPassword = computed(() =>
 const needsUsername = computed(() => ['naiveproxy', 'socks', 'http', 'mixed'].includes(form.protocol));
 const needsCipher = computed(() => ['shadowsocks', 'vmess', 'snell'].includes(form.protocol));
 
+const compatInfo = computed(() => {
+  const p = form.protocol;
+  const net = isQuicProtocol.value ? 'quic' : form.stream_settings.network;
+  const sec = isQuicOuter.value ? 'tls' : form.stream_settings.security;
+  const cipher = (form.protocol_settings.cipher || '').trim().toLowerCase();
+
+  let mihomo = false;
+  let singbox = false;
+
+  if (p === 'vless') {
+    mihomo = ['tcp', 'ws', 'xhttp'].includes(net) && !(net === 'ws' && sec === 'reality');
+    singbox = ['tcp', 'ws', 'quic'].includes(net);
+  } else if (p === 'vmess') {
+    const okCipher = cipher !== 'none';
+    mihomo = okCipher && ['tcp', 'ws'].includes(net) && !(net === 'ws' && sec === 'reality');
+    singbox = okCipher && ['tcp', 'ws'].includes(net);
+  } else if (p === 'trojan') {
+    mihomo = ['tcp', 'ws'].includes(net) && sec !== 'none' && !(net === 'ws' && sec === 'reality');
+    singbox = ['tcp', 'ws'].includes(net);
+  } else if (p === 'shadowsocks') {
+    mihomo = (net === 'tcp' && sec === 'none') || (net === 'ws' && ['none', 'tls'].includes(sec));
+    singbox = (net === 'tcp' && sec === 'none') || (net === 'ws' && sec === 'none')
+      || (net === 'ws' && sec === 'tls' && !form.stream_settings.tls.allow_insecure);
+  } else if (p === 'hysteria2' || p === 'tuic') {
+    mihomo = true;
+    singbox = true;
+  } else if (p === 'anytls') {
+    mihomo = net === 'tcp' && sec === 'tls';
+    singbox = net === 'tcp' && ['tls', 'reality'].includes(sec);
+  } else if (p === 'naiveproxy') {
+    mihomo = false;
+    singbox = net === 'tcp' && sec === 'tls';
+  } else if (p === 'snell') {
+    const effCipher = cipher || 'aes-128-gcm';
+    mihomo = net === 'tcp' && sec === 'none' && ['aes-128-gcm', 'chacha20-ietf-poly1305'].includes(effCipher);
+    singbox = false;
+  } else if (p === 'socks') {
+    mihomo = net === 'tcp';
+    singbox = net === 'tcp' && sec === 'none';
+  } else if (p === 'http' || p === 'mixed') {
+    mihomo = net === 'tcp';
+    singbox = net === 'tcp';
+  }
+
+  const supported = ['Shoes'];
+  const omitted = [];
+  if (mihomo) supported.push('Mihomo / Clash');
+  else omitted.push('Mihomo / Clash');
+  if (singbox) supported.push('sing-box');
+  else omitted.push('sing-box');
+  return { supported, omitted };
+});
+const compatSupported = computed(() => compatInfo.value.supported);
+const compatOmitted = computed(() => compatInfo.value.omitted);
+
 watch(
   () => props.open,
   async (val) => {
@@ -578,7 +641,7 @@ async function onProtocolChange(proto) {
       form.stream_settings.security = 'reality';
     } else if (['trojan', 'anytls', 'naiveproxy'].includes(proto)) {
       form.stream_settings.security = 'tls';
-      if (proto === 'naiveproxy' && !alpnStr.value) alpnStr.value = 'h2';
+      if (proto === 'naiveproxy' && !alpnStr.value) alpnStr.value = 'h2,http/1.1';
     } else {
       form.stream_settings.security = 'none';
     }
@@ -589,7 +652,7 @@ async function onProtocolChange(proto) {
   } else if (proto === 'vmess') {
     form.protocol_settings.cipher = 'any';
   } else if (proto === 'snell') {
-    form.protocol_settings.cipher = 'chacha20-ietf-poly1305';
+    form.protocol_settings.cipher = 'aes-128-gcm';
   } else if (['socks', 'http', 'mixed'].includes(proto) && !isEdit.value) {
     primaryClient.value.username = '';
     primaryClient.value.password = '';

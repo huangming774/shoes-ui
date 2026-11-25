@@ -795,4 +795,113 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn subscription_client_compatibility_matrix_rules() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (cert_pem, key_pem) = crypto_util::generate_self_signed_cert(&["localhost".to_string()])?;
+        let cert_path = tmp.path().join("cert.pem");
+        let key_path = tmp.path().join("key.pem");
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
+        let certs = vec![CertificateRecord {
+            id: 1,
+            name: "self".into(),
+            cert_type: "files".into(),
+            cert_file: cert_path.to_string_lossy().to_string(),
+            key_file: key_path.to_string_lossy().to_string(),
+            domains: vec!["localhost".into()],
+            email: String::new(),
+            directory_url: String::new(),
+            terms_of_service: String::new(),
+            challenge_type: "http01".into(),
+            http01_listen: String::new(),
+            remark: String::new(),
+            created_at: 0,
+        }];
+        let (priv_k, pub_k) = crypto_util::generate_reality_keypair();
+        let make_ib = |v: serde_json::Value| -> Inbound { serde_json::from_value(v).unwrap() };
+
+        // 1. Mihomo omits WS+Reality & AnyTLS+Reality, while sing-box exports them
+        for (proto, net) in [("vless", "ws"), ("vmess", "ws"), ("trojan", "ws"), ("anytls", "tcp")] {
+            let ib = make_ib(serde_json::json!({
+                "protocol": proto, "remark": format!("{proto}-{net}-r"), "port": 22000,
+                "stream_settings": {
+                    "network": net, "security": "reality",
+                    "reality": {"sni": "localhost", "dest": "localhost:443", "private_key": priv_k, "public_key": pub_k, "short_ids": ["01234567"]}
+                },
+                "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d", "password": "pw"}]
+            }));
+            let clash = sub_gen::generate_subscription_with_certs(std::slice::from_ref(&ib), &certs, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml);
+            let clash_doc: serde_yaml::Value = serde_yaml::from_str(&clash.body)?;
+            assert!(clash_doc["proxies"].as_sequence().unwrap().is_empty(), "Mihomo should omit {proto}+{net}+reality");
+
+            let sb = sub_gen::generate_subscription_with_certs(&[ib], &certs, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson);
+            let sb_doc: serde_json::Value = serde_json::from_str(&sb.body)?;
+            assert!(sb_doc["outbounds"].as_array().unwrap().iter().any(|o| o["type"] == proto), "sing-box should export {proto}+{net}+reality");
+        }
+
+        // 2. Snell ciphers: default/aes-128-gcm -> Mihomo v3, chacha20-ietf-poly1305 -> Mihomo v1, aes-256-gcm -> omitted
+        for (cipher, expected_ver) in [("", Some(3)), ("aes-128-gcm", Some(3)), ("chacha20-ietf-poly1305", Some(1)), ("aes-256-gcm", None)] {
+            let ib = make_ib(serde_json::json!({
+                "protocol": "snell", "remark": "sn", "port": 22001,
+                "protocol_settings": {"cipher": cipher},
+                "clients": [{"name": "u", "password": "pw"}]
+            }));
+            let clash = sub_gen::generate_subscription_with_certs(&[ib], &certs, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml);
+            let clash_doc: serde_yaml::Value = serde_yaml::from_str(&clash.body)?;
+            let proxies = clash_doc["proxies"].as_sequence().unwrap();
+            match expected_ver {
+                Some(v) => assert_eq!(proxies[0]["version"].as_u64(), Some(v), "snell cipher={cipher}"),
+                None => assert!(proxies.is_empty(), "snell aes-256-gcm must be omitted from Mihomo"),
+            }
+        }
+
+        // 3. VMess cipher=none omitted from both Mihomo & sing-box (sing-vmess incompatibility with shoes)
+        let vmess_none = make_ib(serde_json::json!({
+            "protocol": "vmess", "remark": "vm-none", "port": 22002,
+            "protocol_settings": {"cipher": "none"},
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }));
+        let c_vm = sub_gen::generate_subscription_with_certs(std::slice::from_ref(&vmess_none), &certs, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml);
+        assert!(serde_yaml::from_str::<serde_yaml::Value>(&c_vm.body)?["proxies"].as_sequence().unwrap().is_empty());
+        let s_vm = sub_gen::generate_subscription_with_certs(&[vmess_none], &certs, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson);
+        assert!(!serde_json::from_str::<serde_json::Value>(&s_vm.body)?["outbounds"].as_array().unwrap().iter().any(|o| o["type"] == "vmess"));
+
+        // 4. Newly exported: SS+WS (Mihomo none/tls + sing-box none), VLESS+QUIC (sing-box), NaiveProxy+TLS (sing-box with cert)
+        let ss_ws_none = make_ib(serde_json::json!({
+            "protocol": "shadowsocks", "remark": "ss-ws", "port": 22003,
+            "protocol_settings": {"cipher": "aes-256-gcm"},
+            "stream_settings": {"network": "ws", "security": "none", "ws": {"path": "/ws", "host": "ws.test"}},
+            "clients": [{"name": "u", "password": "pw"}]
+        }));
+        let c_ss = serde_yaml::from_str::<serde_yaml::Value>(&sub_gen::generate_subscription_with_certs(std::slice::from_ref(&ss_ws_none), &certs, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml).body)?;
+        assert_eq!(c_ss["proxies"][0]["plugin"], "v2ray-plugin");
+        assert_eq!(c_ss["proxies"][0]["plugin-opts"]["mux"], false);
+        let s_ss = serde_json::from_str::<serde_json::Value>(&sub_gen::generate_subscription_with_certs(&[ss_ws_none], &certs, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson).body)?;
+        let s_ss_node = s_ss["outbounds"].as_array().unwrap().iter().find(|o| o["type"] == "shadowsocks").unwrap();
+        assert_eq!(s_ss_node["plugin"], "v2ray-plugin");
+        assert!(s_ss_node["plugin_opts"].as_str().unwrap().contains("mux=0"));
+
+        let vless_quic = make_ib(serde_json::json!({
+            "protocol": "vless", "remark": "vl-quic", "port": 22004,
+            "stream_settings": {"network": "quic", "security": "tls", "tls": {"sni": "localhost", "allow_insecure": true}},
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }));
+        let s_vq = serde_json::from_str::<serde_json::Value>(&sub_gen::generate_subscription_with_certs(&[vless_quic], &certs, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson).body)?;
+        let s_vq_node = s_vq["outbounds"].as_array().unwrap().iter().find(|o| o["type"] == "vless").unwrap();
+        assert_eq!(s_vq_node["transport"]["type"], "quic");
+
+        let naive_tls = make_ib(serde_json::json!({
+            "protocol": "naiveproxy", "remark": "nv-tls", "port": 22005,
+            "stream_settings": {"network": "tcp", "security": "tls", "tls": {"cert_mode": "source", "certificate_source": "self", "sni": "localhost", "allow_insecure": true}},
+            "clients": [{"name": "u", "username": "u", "password": "pw"}]
+        }));
+        let s_nv = serde_json::from_str::<serde_json::Value>(&sub_gen::generate_subscription_with_certs(&[naive_tls], &certs, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson).body)?;
+        let s_nv_node = s_nv["outbounds"].as_array().unwrap().iter().find(|o| o["type"] == "naive").unwrap();
+        assert!(s_nv_node["tls"]["certificate"][0].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(s_nv_node["tls"].get("insecure").is_none());
+
+        Ok(())
+    }
 }

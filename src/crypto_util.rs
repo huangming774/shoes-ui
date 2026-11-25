@@ -129,10 +129,10 @@ pub fn generate_self_signed_cert(domains: &[String]) -> Result<(String, String)>
     }
     params.subject_alt_names = sans;
 
-    // Valid from 1 day ago to ~10 years in future so `shoes` strict validity check always passes.
+    // Keep validity within 180 days (< 200-day 2026 CA/B Forum / Chromium / Cronet TLS limit).
     let now = chrono::Utc::now();
     let start = now - chrono::Duration::days(1);
-    let end = now + chrono::Duration::days(3650);
+    let end = now + chrono::Duration::days(179);
     params.not_before = rcgen::date_time_ymd(
         start.year(),
         start.month() as u8,

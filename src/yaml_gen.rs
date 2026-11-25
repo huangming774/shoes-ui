@@ -618,7 +618,7 @@ fn build_inbound_entry(
             let c = primary.unwrap();
             insert(&mut inner, "type", str_val("snell"));
             let cipher = if ps.cipher.trim().is_empty() {
-                "chacha20-ietf-poly1305"
+                "aes-128-gcm"
             } else {
                 ps.cipher.trim()
             };
@@ -772,10 +772,14 @@ fn build_inbound_entry(
         if ib.protocol == "naiveproxy" && !ss.tls.alpn.is_empty() && !ss.tls.alpn.iter().any(|a| a == "h2") {
             return Err(anyhow!("NaiveProxy requires h2 in TLS ALPN"));
         }
-        let alpn: Vec<String> = if !ss.tls.alpn.is_empty() {
+        let alpn: Vec<String> = if ib.protocol == "naiveproxy" {
+            if ss.tls.alpn.is_empty() || (ss.tls.alpn.len() == 1 && ss.tls.alpn[0] == "h2") {
+                vec!["h2".to_string(), "http/1.1".to_string()]
+            } else {
+                ss.tls.alpn.clone()
+            }
+        } else if !ss.tls.alpn.is_empty() {
             ss.tls.alpn.clone()
-        } else if ib.protocol == "naiveproxy" {
-            vec!["h2".to_string()]
         } else {
             Vec::new()
         };

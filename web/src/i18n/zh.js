@@ -145,6 +145,9 @@ export default {
     fallback: '回落地址/目录 (Fallback, 可选)',
     rulesRef: '指定出站策略或规则 (留空跟随全局分流)',
     rawYaml: '原生 Server YAML 覆盖 (留空使用上方表单)',
+    compatNoteTitle: '客户端订阅导出兼容性提示',
+    compatAllOk: 'Shoes / Mihomo / sing-box 均支持此组合',
+    compatPartial: '当前组合导出范围：{supported}；以下订阅将自动跳过以避免连接失败：{omitted}',
   },
   subs: {
     title: '订阅链接管理',
