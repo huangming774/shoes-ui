@@ -111,7 +111,7 @@ sudo bash install.sh
 脚本会自动完成以下工作：
 1. 从官方 `cfal/shoes` Releases 下载对应架构的 `shoes` 核心二进制到 `/usr/local/bin/shoes`；
 2. 下载（或本地编译）`shoes-panel` 到 `/usr/local/bin/shoes-panel`；
-3. 随机生成安全的**管理员密码、面板端口与随机访问根路径**并配置 `systemd` 开机自启；
+3. 交互式设置（可直接回车使用默认端口 `54321` 与根路径 `/`）管理员密码、面板端口与安全路径，自动放行本机防火墙（`ufw` / `firewalld` / `iptables`），配置 `systemd` 开机自启并进行本机 HTTP 自检；
 4. 安装 `s-ui` 命令行快捷管理菜单（随时在终端输入 `s-ui` 即可查看面板地址、启停服务、重置密码或修改端口）。
 
 ### 方式二：Docker / Docker Compose 部署（支持 `amd64` / `arm64` 预编译镜像）

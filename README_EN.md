@@ -54,7 +54,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/huangming774/shoes-ui/main/install.sh)
 ```
 
-Automatically installs the official `shoes` binary and `shoes-panel`, generates random admin credentials, port, and secret base path, enables the `shoes-panel` systemd service, and installs the `s-ui` management CLI.
+Automatically installs the official `shoes` binary and `shoes-panel`, lets you customize (or accept defaults `54321` / `/`) the panel port, base path, and admin credentials, opens local firewall rules (`ufw` / `firewalld` / `iptables`), enables and verifies the `shoes-panel` systemd service, and installs the `s-ui` management CLI.
 
 ### Option 2: Prebuilt Multi-Arch Docker Image (`linux/amd64` & `linux/arm64`)
 
