@@ -2,13 +2,42 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use crate::crypto_util::derive_reality_public_key;
 use crate::models::{ClientRecord, Inbound};
+
+/// RFC 3986 query value encode set: preserves unreserved chars (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`)
+/// and `/`, encoding only controls, spaces, and query/URI delimiters (`#`, `%`, `&`, `+`, `=`, `?`).
+const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'=')
+    .add(b'?')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
+/// RFC 3986 userinfo encode set: preserves `-`, `.`, `_`, `~`, encodes `@`, `:`, `/`, `?`, `#`, `%`, etc.
+const USERINFO_ENCODE_SET: &AsciiSet = &QUERY_ENCODE_SET
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'|');
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubFormat {
@@ -25,7 +54,7 @@ impl SubFormat {
                 "clash" | "mihomo" | "stash" | "yaml" => return Self::ClashYaml,
                 "singbox" | "sing-box" | "sfa" | "sfi" | "json" => return Self::SingBoxJson,
                 "raw" | "plain" | "uri" => return Self::RawUris,
-                "v2ray" | "base64" => return Self::V2rayBase64,
+                "v2ray" | "base64" | "shadowrocket" => return Self::V2rayBase64,
                 _ => {}
             }
         }
@@ -62,8 +91,23 @@ pub struct SubscriptionPayload {
     pub userinfo_header: String,
 }
 
-fn pct(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+fn enc_query(s: &str) -> String {
+    utf8_percent_encode(s, QUERY_ENCODE_SET).to_string()
+}
+
+fn enc_path_param(s: &str) -> String {
+    // Encode `&`, `?`, `#`, `%`, `=`, `+`, space, while keeping `/` or encoding `/` cleanly?
+    // Standard Xray/Shadowrocket URI query `path=%2Fws` works everywhere, while UUID/SNI/pbk stay unescaped!
+    const PATH_SET: &AsciiSet = &QUERY_ENCODE_SET.add(b'/');
+    utf8_percent_encode(s, PATH_SET).to_string()
+}
+
+fn enc_userinfo(s: &str) -> String {
+    utf8_percent_encode(s, USERINFO_ENCODE_SET).to_string()
+}
+
+fn enc_fragment(s: &str) -> String {
+    utf8_percent_encode(s, USERINFO_ENCODE_SET).to_string()
 }
 
 fn format_host(host: &str) -> String {
@@ -86,20 +130,24 @@ fn node_display_name(ib: &Inbound, c: &ClientRecord) -> String {
 }
 
 fn effective_reality_pubkey(ib: &Inbound) -> String {
-    if !ib.stream_settings.reality.public_key.trim().is_empty() {
-        ib.stream_settings.reality.reality_pub_trimmed()
+    let explicit = ib.stream_settings.reality.public_key.trim();
+    if !explicit.is_empty() {
+        explicit.to_string()
     } else {
         derive_reality_public_key(&ib.stream_settings.reality.private_key).unwrap_or_default()
     }
 }
 
-trait RealityExt {
-    fn reality_pub_trimmed(&self) -> String;
-}
-
-impl RealityExt for crate::models::RealitySettings {
-    fn reality_pub_trimmed(&self) -> String {
-        self.public_key.trim().to_string()
+/// Resolves effective TLS SNI: if user left SNI empty on a self-signed (`allow_insecure`) inbound,
+/// fallback to `"localhost"` (which matches our generated self-signed cert SAN) so QUIC/TLS clients don't fail on empty SNI.
+fn effective_tls_sni(ib: &Inbound) -> String {
+    let sni = ib.stream_settings.tls.sni.trim();
+    if !sni.is_empty() {
+        sni.to_string()
+    } else if ib.stream_settings.tls.allow_insecure {
+        "localhost".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -120,7 +168,7 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
     let ps = &ib.protocol_settings;
     let addr = format_host(host);
     let port = ib.port;
-    let tag = pct(name);
+    let tag = enc_fragment(name);
 
     match ib.protocol.as_str() {
         "vless" => {
@@ -131,66 +179,74 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 "xhttp" => "xhttp",
                 _ => "tcp",
             };
-            params.push(format!("type={net}"));
 
             if ss.security == "reality" {
-                params.push("security=reality".to_string());
-                let pbk = effective_reality_pubkey(ib);
-                params.push(format!("pbk={}", pct(&pbk)));
-                params.push(format!("fp={}", pct(&ss.reality.fingerprint)));
-                if !ss.reality.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.reality.sni.trim())));
-                }
-                if let Some(sid) = ss.reality.short_ids.first() {
-                    if !sid.trim().is_empty() {
-                        params.push(format!("sid={}", pct(sid.trim())));
-                    }
-                }
-                if !ss.reality.mldsa65_verify.trim().is_empty() {
-                    params.push(format!("pqv={}", pct(ss.reality.mldsa65_verify.trim())));
-                }
                 if ss.network == "tcp" && ss.reality.vision {
                     params.push("flow=xtls-rprx-vision".to_string());
                 }
+                params.push("security=reality".to_string());
+                if !ss.reality.sni.trim().is_empty() {
+                    params.push(format!("sni={}", enc_query(ss.reality.sni.trim())));
+                }
+                let fp = if ss.reality.fingerprint.trim().is_empty() {
+                    "chrome"
+                } else {
+                    ss.reality.fingerprint.trim()
+                };
+                params.push(format!("fp={}", enc_query(fp)));
+                let pbk = effective_reality_pubkey(ib);
+                params.push(format!("pbk={}", enc_query(&pbk)));
+                if let Some(sid) = ss.reality.short_ids.first() {
+                    if !sid.trim().is_empty() {
+                        params.push(format!("sid={}", enc_query(sid.trim())));
+                    }
+                }
+                if !ss.reality.mldsa65_verify.trim().is_empty() {
+                    params.push(format!("pqv={}", enc_query(ss.reality.mldsa65_verify.trim())));
+                }
             } else if ss.security == "tls" {
+                if ss.network == "tcp" && ss.tls.vision {
+                    params.push("flow=xtls-rprx-vision".to_string());
+                }
                 params.push("security=tls".to_string());
-                if !ss.tls.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.tls.sni.trim())));
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    params.push(format!("sni={}", enc_query(&sni)));
                 }
                 if !ss.tls.fingerprint.trim().is_empty() {
-                    params.push(format!("fp={}", pct(ss.tls.fingerprint.trim())));
+                    params.push(format!("fp={}", enc_query(ss.tls.fingerprint.trim())));
                 }
                 if !ss.tls.alpn.is_empty() {
-                    params.push(format!("alpn={}", pct(&ss.tls.alpn.join(","))));
+                    params.push(format!("alpn={}", enc_path_param(&ss.tls.alpn.join(","))));
                 }
                 if ss.tls.allow_insecure {
                     params.push("allowInsecure=1".to_string());
-                }
-                if ss.network == "tcp" && ss.tls.vision {
-                    params.push("flow=xtls-rprx-vision".to_string());
                 }
             } else {
                 params.push("security=none".to_string());
             }
 
-            if ss.network == "ws" {
-                params.push(format!("path={}", pct(ss.ws.path.trim())));
+            params.push(format!("type={net}"));
+            if net == "tcp" {
+                params.push("headerType=none".to_string());
+            } else if net == "ws" {
+                params.push(format!("path={}", enc_path_param(ss.ws.path.trim())));
                 if !ss.ws.host.trim().is_empty() {
-                    params.push(format!("host={}", pct(ss.ws.host.trim())));
+                    params.push(format!("host={}", enc_query(ss.ws.host.trim())));
                 }
-            } else if ss.network == "xhttp" {
-                params.push(format!("path={}", pct(ss.xhttp.path.trim())));
+            } else if net == "xhttp" {
+                params.push(format!("path={}", enc_path_param(ss.xhttp.path.trim())));
                 if !ss.xhttp.host.trim().is_empty() {
-                    params.push(format!("host={}", pct(ss.xhttp.host.trim())));
+                    params.push(format!("host={}", enc_query(ss.xhttp.host.trim())));
                 }
                 if !ss.xhttp.mode.trim().is_empty() {
-                    params.push(format!("mode={}", pct(ss.xhttp.mode.trim())));
+                    params.push(format!("mode={}", enc_query(ss.xhttp.mode.trim())));
                 }
             }
 
             format!(
                 "vless://{}@{}:{}?{}#{}",
-                pct(c.uuid.trim()),
+                c.uuid.trim(),
                 addr,
                 port,
                 params.join("&"),
@@ -214,6 +270,7 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             } else {
                 ""
             };
+            let sni = effective_tls_sni(ib);
             let vmess_obj = json!({
                 "v": "2",
                 "ps": name,
@@ -227,9 +284,10 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 "host": host_hdr,
                 "path": path_str,
                 "tls": tls_str,
-                "sni": ss.tls.sni.trim(),
+                "sni": sni,
                 "alpn": ss.tls.alpn.join(","),
                 "fp": ss.tls.fingerprint.trim(),
+                "allowInsecure": if ss.tls.allow_insecure { 1 } else { 0 },
             });
             format!(
                 "vmess://{}",
@@ -243,34 +301,41 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             if ss.security == "reality" {
                 params.push("security=reality".to_string());
                 let pbk = effective_reality_pubkey(ib);
-                params.push(format!("pbk={}", pct(&pbk)));
-                params.push(format!("fp={}", pct(&ss.reality.fingerprint)));
+                params.push(format!("pbk={}", enc_query(&pbk)));
+                let fp = if ss.reality.fingerprint.trim().is_empty() {
+                    "chrome"
+                } else {
+                    ss.reality.fingerprint.trim()
+                };
+                params.push(format!("fp={}", enc_query(fp)));
                 if !ss.reality.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.reality.sni.trim())));
+                    params.push(format!("sni={}", enc_query(ss.reality.sni.trim())));
                 }
                 if let Some(sid) = ss.reality.short_ids.first() {
                     if !sid.trim().is_empty() {
-                        params.push(format!("sid={}", pct(sid.trim())));
+                        params.push(format!("sid={}", enc_query(sid.trim())));
                     }
                 }
             } else if ss.security == "tls" {
                 params.push("security=tls".to_string());
-                if !ss.tls.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.tls.sni.trim())));
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    params.push(format!("sni={}", enc_query(&sni)));
+                    params.push(format!("peer={}", enc_query(&sni)));
                 }
                 if ss.tls.allow_insecure {
                     params.push("allowInsecure=1".to_string());
                 }
             }
             if ss.network == "ws" {
-                params.push(format!("path={}", pct(ss.ws.path.trim())));
+                params.push(format!("path={}", enc_path_param(ss.ws.path.trim())));
                 if !ss.ws.host.trim().is_empty() {
-                    params.push(format!("host={}", pct(ss.ws.host.trim())));
+                    params.push(format!("host={}", enc_query(ss.ws.host.trim())));
                 }
             }
             format!(
                 "trojan://{}@{}:{}?{}#{}",
-                pct(c.password.trim()),
+                enc_userinfo(c.password.trim()),
                 addr,
                 port,
                 params.join("&"),
@@ -280,6 +345,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
         "shadowsocks" => {
             let cipher = if ps.cipher.trim().is_empty() {
                 "2022-blake3-aes-256-gcm"
+            } else if ps.cipher.trim() == "2022-blake3-chacha20-ietf-poly1305" {
+                "2022-blake3-chacha20-poly1305"
             } else {
                 ps.cipher.trim()
             };
@@ -288,8 +355,11 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
         }
         "hysteria2" => {
             let mut params = Vec::new();
-            if !ss.tls.sni.trim().is_empty() {
-                params.push(format!("sni={}", pct(ss.tls.sni.trim())));
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                params.push(format!("sni={}", enc_query(&sni)));
+                // Shadowrocket compatibility alias
+                params.push(format!("peer={}", enc_query(&sni)));
             }
             if ss.tls.allow_insecure {
                 params.push("insecure=1".to_string());
@@ -299,7 +369,14 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             } else {
                 format!("?{}", params.join("&"))
             };
-            format!("hysteria2://{}@{}:{}{}#{}", pct(c.password.trim()), addr, port, q, tag)
+            format!(
+                "hysteria2://{}@{}:{}{}#{}",
+                enc_userinfo(c.password.trim()),
+                addr,
+                port,
+                q,
+                tag
+            )
         }
         "tuic" => {
             let mut params = vec![
@@ -307,16 +384,18 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 "udp_relay_mode=native".to_string(),
                 "alpn=h3".to_string(),
             ];
-            if !ss.tls.sni.trim().is_empty() {
-                params.push(format!("sni={}", pct(ss.tls.sni.trim())));
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                params.push(format!("sni={}", enc_query(&sni)));
             }
             if ss.tls.allow_insecure {
                 params.push("allow_insecure=1".to_string());
+                params.push("insecure=1".to_string());
             }
             format!(
                 "tuic://{}:{}@{}:{}?{}#{}",
-                pct(c.uuid.trim()),
-                pct(c.password.trim()),
+                c.uuid.trim(),
+                enc_userinfo(c.password.trim()),
                 addr,
                 port,
                 params.join("&"),
@@ -328,18 +407,20 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             if ss.security == "reality" {
                 params.push("security=reality".to_string());
                 let pbk = effective_reality_pubkey(ib);
-                params.push(format!("pbk={}", pct(&pbk)));
+                params.push(format!("pbk={}", enc_query(&pbk)));
                 if !ss.reality.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.reality.sni.trim())));
+                    params.push(format!("sni={}", enc_query(ss.reality.sni.trim())));
                 }
                 if let Some(sid) = ss.reality.short_ids.first() {
                     if !sid.trim().is_empty() {
-                        params.push(format!("sid={}", pct(sid.trim())));
+                        params.push(format!("sid={}", enc_query(sid.trim())));
                     }
                 }
             } else {
-                if !ss.tls.sni.trim().is_empty() {
-                    params.push(format!("sni={}", pct(ss.tls.sni.trim())));
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    params.push(format!("sni={}", enc_query(&sni)));
+                    params.push(format!("peer={}", enc_query(&sni)));
                 }
                 if ss.tls.allow_insecure {
                     params.push("insecure=1".to_string());
@@ -350,7 +431,14 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             } else {
                 format!("?{}", params.join("&"))
             };
-            format!("anytls://{}@{}:{}{}#{}", pct(c.password.trim()), addr, port, q, tag)
+            format!(
+                "anytls://{}@{}:{}{}#{}",
+                enc_userinfo(c.password.trim()),
+                addr,
+                port,
+                q,
+                tag
+            )
         }
         "naiveproxy" => {
             let uname = if c.username.trim().is_empty() {
@@ -365,8 +453,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             };
             format!(
                 "naive+https://{}:{}@{}:{}?padding=true#{}",
-                pct(uname),
-                pct(c.password.trim()),
+                enc_userinfo(uname),
+                enc_userinfo(c.password.trim()),
                 sni_host,
                 port,
                 tag
@@ -383,7 +471,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
         }
         "socks" | "mixed" => {
             if !c.username.trim().is_empty() && !c.password.trim().is_empty() {
-                let auth = URL_SAFE_NO_PAD.encode(format!("{}:{}", c.username.trim(), c.password.trim()));
+                let auth =
+                    URL_SAFE_NO_PAD.encode(format!("{}:{}", c.username.trim(), c.password.trim()));
                 format!("socks://{auth}@{addr}:{port}#{tag}")
             } else {
                 format!("socks://{addr}:{port}#{tag}")
@@ -394,8 +483,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
             if !c.username.trim().is_empty() && !c.password.trim().is_empty() {
                 format!(
                     "{scheme}://{}:{}@{addr}:{port}#{tag}",
-                    pct(c.username.trim()),
-                    pct(c.password.trim())
+                    enc_userinfo(c.username.trim()),
+                    enc_userinfo(c.password.trim())
                 )
             } else {
                 format!("{scheme}://{addr}:{port}#{tag}")
@@ -423,13 +512,19 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         "shadowsocks" => {
             let cipher = if ps.cipher.trim().is_empty() {
                 "2022-blake3-aes-256-gcm"
+            } else if ps.cipher.trim() == "2022-blake3-chacha20-ietf-poly1305" {
+                "2022-blake3-chacha20-poly1305"
             } else {
                 ps.cipher.trim()
             };
             json!({"type": "shadowsocks", "cipher": cipher, "password": c.password.trim()})
         }
-        "hysteria2" => json!({"type": "hysteria2", "password": c.password.trim(), "udp_enabled": true}),
-        "tuic" => json!({"type": "tuic", "uuid": c.uuid.trim(), "password": c.password.trim(), "udp_enabled": true}),
+        "hysteria2" => {
+            json!({"type": "hysteria2", "password": c.password.trim(), "udp_enabled": true})
+        }
+        "tuic" => {
+            json!({"type": "tuic", "uuid": c.uuid.trim(), "password": c.password.trim(), "udp_enabled": true})
+        }
         "anytls" => json!({"type": "anytls", "password": c.password.trim(), "udp_enabled": true}),
         "naiveproxy" => {
             let uname = if c.username.trim().is_empty() {
@@ -447,8 +542,22 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             };
             json!({"type": "snell", "cipher": cipher, "password": c.password.trim()})
         }
-        "socks" | "mixed" => json!({"type": "socks", "username": c.username.trim(), "password": c.password.trim()}),
-        _ => json!({"type": "http", "username": c.username.trim(), "password": c.password.trim()}),
+        "socks" | "mixed" => {
+            let mut m = json!({"type": "socks"});
+            if !c.username.trim().is_empty() {
+                m["username"] = json!(c.username.trim());
+                m["password"] = json!(c.password.trim());
+            }
+            m
+        }
+        _ => {
+            let mut m = json!({"type": "http"});
+            if !c.username.trim().is_empty() {
+                m["username"] = json!(c.username.trim());
+                m["password"] = json!(c.password.trim());
+            }
+            m
+        }
     };
 
     let transported = if !ib.is_quic() && ss.network == "ws" {
@@ -469,7 +578,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
     };
 
     let client_hop = if ib.is_quic() {
-        let mut sni = ss.tls.sni.trim().to_string();
+        let mut sni = effective_tls_sni(ib);
         if sni.is_empty() {
             sni = host.trim().to_string();
         }
@@ -488,7 +597,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             .reality
             .short_ids
             .first()
-            .cloned()
+            .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision;
         json!({
@@ -505,7 +614,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         })
     } else if ss.security == "tls" {
         let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision;
-        let mut sni = ss.tls.sni.trim().to_string();
+        let mut sni = effective_tls_sni(ib);
         if sni.is_empty() {
             sni = host.trim().to_string();
         }
@@ -565,23 +674,31 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "network": if ss.network == "ws" { "ws" } else { "tcp" },
             });
             if ss.security == "reality" {
+                let fp = if ss.reality.fingerprint.trim().is_empty() {
+                    "chrome"
+                } else {
+                    ss.reality.fingerprint.trim()
+                };
                 obj["tls"] = json!(true);
                 obj["servername"] = json!(ss.reality.sni.trim());
-                obj["client-fingerprint"] = json!(ss.reality.fingerprint.trim());
+                obj["client-fingerprint"] = json!(fp);
                 if ss.network == "tcp" && ss.reality.vision {
                     obj["flow"] = json!("xtls-rprx-vision");
                 }
                 obj["reality-opts"] = json!({
                     "public-key": effective_reality_pubkey(ib),
-                    "short-id": ss.reality.short_ids.first().cloned().unwrap_or_default()
+                    "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
                 });
             } else if ss.security == "tls" {
                 obj["tls"] = json!(true);
-                if !ss.tls.sni.trim().is_empty() {
-                    obj["servername"] = json!(ss.tls.sni.trim());
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    obj["servername"] = json!(sni);
                 }
                 obj["skip-cert-verify"] = json!(ss.tls.allow_insecure);
-                obj["client-fingerprint"] = json!(ss.tls.fingerprint.trim());
+                if !ss.tls.fingerprint.trim().is_empty() {
+                    obj["client-fingerprint"] = json!(ss.tls.fingerprint.trim());
+                }
                 if ss.network == "tcp" && ss.tls.vision {
                     obj["flow"] = json!("xtls-rprx-vision");
                 }
@@ -614,8 +731,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             if ss.security == "tls" {
                 obj["tls"] = json!(true);
                 obj["skip-cert-verify"] = json!(ss.tls.allow_insecure);
-                if !ss.tls.sni.trim().is_empty() {
-                    obj["servername"] = json!(ss.tls.sni.trim());
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    obj["servername"] = json!(sni);
                 }
             }
             if ss.network == "ws" {
@@ -638,16 +756,22 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "network": if ss.network == "ws" { "ws" } else { "tcp" },
             });
             if ss.security == "reality" {
+                let fp = if ss.reality.fingerprint.trim().is_empty() {
+                    "chrome"
+                } else {
+                    ss.reality.fingerprint.trim()
+                };
                 obj["sni"] = json!(ss.reality.sni.trim());
-                obj["client-fingerprint"] = json!(ss.reality.fingerprint.trim());
+                obj["client-fingerprint"] = json!(fp);
                 obj["reality-opts"] = json!({
                     "public-key": effective_reality_pubkey(ib),
-                    "short-id": ss.reality.short_ids.first().cloned().unwrap_or_default()
+                    "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
                 });
             } else {
                 obj["skip-cert-verify"] = json!(ss.tls.allow_insecure);
-                if !ss.tls.sni.trim().is_empty() {
-                    obj["sni"] = json!(ss.tls.sni.trim());
+                let sni = effective_tls_sni(ib);
+                if !sni.is_empty() {
+                    obj["sni"] = json!(sni);
                 }
             }
             if ss.network == "ws" {
@@ -658,6 +782,8 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
         "shadowsocks" => {
             let cipher = if ps.cipher.trim().is_empty() {
                 "2022-blake3-aes-256-gcm"
+            } else if ps.cipher.trim() == "2022-blake3-chacha20-ietf-poly1305" {
+                "2022-blake3-chacha20-poly1305"
             } else {
                 ps.cipher.trim()
             };
@@ -680,8 +806,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "password": c.password.trim(),
                 "skip-cert-verify": ss.tls.allow_insecure,
             });
-            if !ss.tls.sni.trim().is_empty() {
-                obj["sni"] = json!(ss.tls.sni.trim());
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                obj["sni"] = json!(sni);
             }
             Some(obj)
         }
@@ -698,8 +825,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "congestion-controller": "bbr",
                 "skip-cert-verify": ss.tls.allow_insecure,
             });
-            if !ss.tls.sni.trim().is_empty() {
-                obj["sni"] = json!(ss.tls.sni.trim());
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                obj["sni"] = json!(sni);
             }
             Some(obj)
         }
@@ -713,8 +841,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "udp": ps.udp_enabled,
                 "skip-cert-verify": ss.tls.allow_insecure,
             });
-            if !ss.tls.sni.trim().is_empty() {
-                obj["sni"] = json!(ss.tls.sni.trim());
+            let sni = effective_tls_sni(ib);
+            if !sni.is_empty() {
+                obj["sni"] = json!(sni);
             }
             Some(obj)
         }
@@ -775,8 +904,9 @@ fn build_singbox_outbound(
             "enabled": true,
             "insecure": ss.tls.allow_insecure,
         });
-        if !ss.tls.sni.trim().is_empty() {
-            t["server_name"] = json!(ss.tls.sni.trim());
+        let sni = effective_tls_sni(ib);
+        if !sni.is_empty() {
+            t["server_name"] = json!(sni);
         }
         if ib.is_quic() {
             t["alpn"] = json!(["h3"]);
@@ -785,17 +915,22 @@ fn build_singbox_outbound(
         }
         Some(t)
     } else if ss.security == "reality" {
+        let fp = if ss.reality.fingerprint.trim().is_empty() {
+            "chrome"
+        } else {
+            ss.reality.fingerprint.trim()
+        };
         Some(json!({
             "enabled": true,
             "server_name": ss.reality.sni.trim(),
             "utls": {
                 "enabled": true,
-                "fingerprint": ss.reality.fingerprint.trim()
+                "fingerprint": fp
             },
             "reality": {
                 "enabled": true,
                 "public_key": effective_reality_pubkey(ib),
-                "short_id": ss.reality.short_ids.first().cloned().unwrap_or_default()
+                "short_id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
             }
         }))
     } else {
@@ -877,6 +1012,8 @@ fn build_singbox_outbound(
         "shadowsocks" => {
             let cipher = if ps.cipher.trim().is_empty() {
                 "2022-blake3-aes-256-gcm"
+            } else if ps.cipher.trim() == "2022-blake3-chacha20-ietf-poly1305" {
+                "2022-blake3-chacha20-poly1305"
             } else {
                 ps.cipher.trim()
             };
@@ -946,6 +1083,32 @@ fn build_singbox_outbound(
         }
         _ => None,
     }
+}
+
+/// Ensures fields like `short-id`, `password`, `uuid`, `psk` in Clash YAML are never coerced
+/// to YAML numbers/booleans when hex/random strings happen to look numeric (e.g. `01234567` or `12e4`).
+fn quote_sensitive_clash_strings(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len() + 128);
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        if let Some((key, val)) = trimmed.split_once(':') {
+            let k = key.trim();
+            let v = val.trim();
+            if matches!(k, "short-id" | "password" | "uuid" | "psk" | "public-key")
+                && !v.is_empty()
+                && !v.starts_with('\'')
+                && !v.starts_with('"')
+            {
+                let escaped = v.replace('\'', "''");
+                out.push_str(&format!("{indent}{k}: '{escaped}'\n"));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn generate_subscription(
@@ -1044,6 +1207,8 @@ pub fn generate_subscription(
                 names.clone()
             };
 
+            // Zero-MMDB pure IP-CIDR + MATCH rules: works out-of-the-box on Classic Clash,
+            // Mihomo, Clash Verge, Stash, ClashX, and Shadowrocket without needing GeoIP.dat!
             let doc = json!({
                 "mixed-port": 7890,
                 "allow-lan": false,
@@ -1051,8 +1216,10 @@ pub fn generate_subscription(
                 "log-level": "info",
                 "dns": {
                     "enable": true,
+                    "ipv6": false,
                     "enhanced-mode": "fake-ip",
-                    "nameserver": ["223.5.5.5", "1.1.1.1"]
+                    "fake-ip-range": "198.18.0.1/16",
+                    "nameserver": ["223.5.5.5", "119.29.29.29", "1.1.1.1"]
                 },
                 "proxies": proxies,
                 "proxy-groups": [
@@ -1070,15 +1237,17 @@ pub fn generate_subscription(
                     }
                 ],
                 "rules": [
-                    "GEOIP,LAN,DIRECT,no-resolve",
-                    "GEOIP,CN,DIRECT",
+                    "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+                    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+                    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+                    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
                     "MATCH,🚀 Proxy"
                 ]
             });
-            // Convert via serde_yaml cleanly
             let yaml_val: YamlValue =
                 serde_yaml::to_value(&doc).unwrap_or(YamlValue::Mapping(Mapping::new()));
-            let body = serde_yaml::to_string(&yaml_val).unwrap_or_default();
+            let raw_body = serde_yaml::to_string(&yaml_val).unwrap_or_default();
+            let body = quote_sensitive_clash_strings(&raw_body);
             SubscriptionPayload {
                 content_type: "text/yaml; charset=utf-8",
                 body,

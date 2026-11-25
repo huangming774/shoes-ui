@@ -750,13 +750,16 @@ fn build_inbound_entry(
         insert(&mut server, "transport", str_val("quic"));
         let mut qmap = Mapping::new();
         apply_cert_fields(&mut qmap, &ss.tls, &ib.remark)?;
-        if !ss.tls.alpn.is_empty() {
-            insert(
-                &mut qmap,
-                "alpn_protocols",
-                Value::Sequence(ss.tls.alpn.iter().map(|a| str_val(a)).collect()),
-            );
-        }
+        let q_alpn: Vec<String> = if !ss.tls.alpn.is_empty() {
+            ss.tls.alpn.clone()
+        } else {
+            vec!["h3".to_string()]
+        };
+        insert(
+            &mut qmap,
+            "alpn_protocols",
+            Value::Sequence(q_alpn.iter().map(|a| str_val(a)).collect()),
+        );
         insert(&mut server, "quic_settings", Value::Mapping(qmap));
         insert(&mut server, "protocol", transported);
     } else if ss.security == "tls" {
@@ -959,20 +962,20 @@ pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Res
         }
     }
 
-    // Atomic replacement (on Windows std::fs::rename overwrites existing target since Rust 1.58+)
-    std::fs::rename(&tmp_path, &cfg_path).with_context(|| {
+    // Write validated YAML in-place (preserving inode so notify/Docker bind-mounts always detect edits)
+    std::fs::write(&cfg_path, yaml.as_bytes()).with_context(|| {
         format!(
-            "failed to replace config {} with {}",
-            cfg_path.display(),
-            tmp_path.display()
+            "failed to write validated config to {}",
+            cfg_path.display()
         )
     })?;
+    let _ = std::fs::remove_file(&tmp_path);
 
-    // On Unix, send SIGHUP to bypass shoes' 5-second fs-watcher debounce for instant reload
+    // On Unix, invoke POSIX shell built-in `kill -HUP` (works in minimal containers like debian-slim/alpine without procps!)
     #[cfg(unix)]
     if let Some(pid) = shoes_pid {
-        let _ = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -HUP {pid}")])
             .status();
     }
     #[cfg(not(unix))]

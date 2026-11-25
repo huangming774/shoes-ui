@@ -23,7 +23,7 @@ use crate::models::{
     CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, PanelSettings,
     RoutingRuleRecord, SubscriptionRecord,
 };
-use crate::state::AppState;
+use crate::state::{is_loopback_or_unspecified_host, AppState};
 use crate::sub_gen::{build_client_share_info, generate_subscription, SubFormat};
 use crate::yaml_gen::build_shoes_yaml;
 
@@ -138,6 +138,7 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/subscriptions/{id}", delete(api_delete_subscription))
         // Panel Settings & Account
         .route("/settings", get(api_get_settings).put(api_save_settings))
+        .route("/settings/public-host", post(api_set_public_host))
         .route("/settings/password", post(api_change_password))
         .route("/settings/backup-db", get(api_backup_db))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -154,29 +155,62 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn resolve_share_host(settings: &PanelSettings, headers: &HeaderMap, query_host: Option<&str>) -> String {
+fn strip_host_port(raw: &str) -> String {
+    let first = raw.split(',').next().unwrap_or("").trim();
+    if let Some(rest) = first.strip_prefix('[') {
+        if let Some((ipv6, _)) = rest.split_once(']') {
+            return ipv6.to_string();
+        }
+    }
+    if let Some((h, _)) = first.rsplit_once(':') {
+        if !h.contains(':') {
+            return h.to_string();
+        }
+    }
+    first.to_string()
+}
+
+fn resolve_share_host(
+    state: &AppState,
+    settings: &PanelSettings,
+    headers: &HeaderMap,
+    query_host: Option<&str>,
+) -> String {
     if let Some(h) = query_host {
         let t = h.trim();
-        if !t.is_empty() {
+        if !t.is_empty() && !is_loopback_or_unspecified_host(t) {
             return t.to_string();
         }
     }
-    if !settings.public_host.trim().is_empty() {
-        return settings.public_host.trim().to_string();
+    let configured = settings.public_host.trim();
+    if !configured.is_empty() && !is_loopback_or_unspecified_host(configured) {
+        return strip_host_port(configured);
     }
-    if let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        // Strip port from Host header (handle IPv6 [::1]:54321 and IPv4/domain example.com:54321)
-        if let Some(rest) = host_hdr.strip_prefix('[') {
-            if let Some((ipv6, _)) = rest.split_once(']') {
-                return ipv6.to_string();
-            }
+    // Check reverse-proxy X-Forwarded-Host before Host header
+    if let Some(xfh) = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok()) {
+        let h = strip_host_port(xfh);
+        if !h.is_empty() && !is_loopback_or_unspecified_host(&h) {
+            return h;
         }
-        if let Some((h, _)) = host_hdr.rsplit_once(':') {
-            if !h.contains(':') {
-                return h.to_string();
-            }
-        }
-        return host_hdr.to_string();
+    }
+    let host_from_hdr = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(strip_host_port)
+        .unwrap_or_default();
+    if !host_from_hdr.is_empty() && !is_loopback_or_unspecified_host(&host_from_hdr) {
+        return host_from_hdr;
+    }
+    // If accessed via 127.0.0.1 / SSH tunnel / Nginx proxy_pass, prefer detected server public IP!
+    let detected = state.get_detected_public_ip();
+    if !detected.is_empty() {
+        return detected;
+    }
+    if !configured.is_empty() && configured != "0.0.0.0" {
+        return strip_host_port(configured);
+    }
+    if !host_from_hdr.is_empty() && host_from_hdr != "0.0.0.0" {
+        return host_from_hdr;
     }
     "127.0.0.1".to_string()
 }
@@ -415,7 +449,7 @@ async fn api_list_inbounds(
 ) -> ApiResult {
     let inbounds = state.db.list_inbounds().map_err(internal_err)?;
     let settings = state.db.get_settings().map_err(internal_err)?;
-    let host = resolve_share_host(&settings, &headers, None);
+    let host = resolve_share_host(&state, &settings, &headers, None);
     let active_map = state.monitor.snapshot().inbound_active_conns;
 
     let enriched: Vec<Value> = inbounds
@@ -430,6 +464,7 @@ async fn api_list_inbounds(
             let mut val = serde_json::to_value(&ib).unwrap_or_else(|_| json!({}));
             val["active_connections"] = json!(active);
             val["shares"] = json!(shares);
+            val["share_host"] = json!(host);
             val["multi_user_supported"] = json!(ib.supports_multi_user());
             val
         })
@@ -595,7 +630,7 @@ async fn api_inbound_share(
         .map_err(internal_err)?
         .ok_or_else(|| bad_req("Inbound not found"))?;
     let settings = state.db.get_settings().map_err(internal_err)?;
-    let host = resolve_share_host(&settings, &headers, q.host.as_deref());
+    let host = resolve_share_host(&state, &settings, &headers, q.host.as_deref());
     let list: Vec<_> = ib
         .clients
         .iter()
@@ -883,14 +918,31 @@ async fn api_list_subscriptions(
 
     let base_url = if !settings.sub_public_url.trim().is_empty() {
         settings.sub_public_url.trim().trim_end_matches('/').to_string()
+    } else if let Some(xfh) = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("").trim())
+        .filter(|s| !s.is_empty() && !is_loopback_or_unspecified_host(&strip_host_port(s)))
+    {
+        let proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("http").trim())
+            .unwrap_or("http");
+        format!("{proto}://{xfh}")
     } else {
-        let host = resolve_share_host(&settings, &headers, None);
+        let host = resolve_share_host(&state, &settings, &headers, None);
         let scheme = if !settings.panel_cert_file.trim().is_empty() {
             "https"
         } else {
             "http"
         };
-        format!("{scheme}://{host}:{}", settings.panel_port)
+        let host_fmt = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        format!("{scheme}://{host_fmt}:{}", settings.panel_port)
     };
 
     let enriched: Vec<Value> = subs
@@ -964,6 +1016,7 @@ async fn public_subscription_handler(
     };
 
     let host = resolve_share_host(
+        &state,
         &settings,
         &headers,
         query.get("host").map(String::as_str),
@@ -989,13 +1042,33 @@ async fn public_subscription_handler(
 
 // ==================== Settings & Account ====================
 
-async fn api_get_settings(State(state): State<Arc<AppState>>) -> ApiResult {
+async fn api_get_settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     let s = state.db.get_settings().map_err(internal_err)?;
     let username = state.db.get_admin_username().unwrap_or_else(|_| "admin".to_string());
+    let effective_host = resolve_share_host(&state, &s, &headers, None);
     ok_json(json!({
         "settings": s,
-        "admin_username": username
+        "admin_username": username,
+        "effective_share_host": effective_host,
+        "detected_public_ip": state.get_detected_public_ip()
     }))
+}
+
+#[derive(Deserialize)]
+struct SetPublicHostReq {
+    public_host: String,
+}
+
+async fn api_set_public_host(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetPublicHostReq>,
+) -> ApiResult {
+    let h = strip_host_port(req.public_host.trim());
+    state
+        .db
+        .set_setting_kv("public_host", &h)
+        .map_err(bad_req)?;
+    ok_json(json!({ "public_host": h }))
 }
 
 async fn api_save_settings(

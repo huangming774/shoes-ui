@@ -11,6 +11,13 @@
             <a-button>{{ t('inbounds.resetAll') }}</a-button>
           </a-popconfirm>
           <a-button @click="loadData">↻ {{ t('app.refresh') }}</a-button>
+          <a-tag
+            :color="currentShareHost === '127.0.0.1' ? 'error' : 'geekblue'"
+            style="cursor: pointer; padding: 4px 10px; font-size: 12px"
+            @click="openHostModal"
+          >
+            🌐 节点地址: <b>{{ currentShareHost }}</b> ✎
+          </a-tag>
         </a-space>
 
         <a-space wrap>
@@ -280,6 +287,18 @@
         </a-row>
       </a-form>
     </a-modal>
+
+    <!-- Quick Public Host Edit Modal -->
+    <a-modal v-model:open="hostModalOpen" title="修改分享链接与订阅的公网 IP / 域名" @ok="savePublicHost">
+      <a-form layout="vertical">
+        <a-form-item
+          label="服务器公网 IP 或域名 (不含端口)"
+          extra="小火箭二维码、vless:// 链接和 Clash 订阅中的 server 地址均使用此值。切勿填写 127.0.0.1 或 0.0.0.0。"
+        >
+          <a-input v-model:value="editingPublicHost" placeholder="例如 203.0.113.88 或 node.example.com" />
+        </a-form-item>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
@@ -318,6 +337,10 @@ const cloneModalOpen = ref(false);
 const cloning = ref(false);
 const cloneSourceId = ref(0);
 const cloneForm = reactive({ remark: '', port: 20001, client_name: '', sub_id: 'default' });
+
+const currentShareHost = ref('...');
+const hostModalOpen = ref(false);
+const editingPublicHost = ref('');
 
 const columns = computed(() => [
   { title: t('app.enable'), key: 'enable', width: 70 },
@@ -370,14 +393,20 @@ async function loadCerts() {
 async function loadData() {
   loading.value = true;
   try {
-    const [ibs, cs, gs] = await Promise.all([
+    const [ibs, cs, gs, st] = await Promise.all([
       api.listInbounds(),
       api.listCerts().catch(() => []),
       api.listOutboundGroups().catch(() => []),
+      api.getSettings().catch(() => null),
     ]);
     inbounds.value = ibs;
     certs.value = cs;
     outboundGroups.value = gs;
+    if (st?.effective_share_host) {
+      currentShareHost.value = st.effective_share_host;
+    } else if (ibs[0]?.share_host) {
+      currentShareHost.value = ibs[0].share_host;
+    }
   } catch (e) {
     message.error(e.message);
   } finally {
@@ -529,6 +558,22 @@ async function handleResetAll() {
   try {
     await api.resetAllTraffic();
     message.success('OK');
+    await loadData();
+  } catch (e) {
+    message.error(e.message);
+  }
+}
+
+function openHostModal() {
+  editingPublicHost.value = currentShareHost.value === '127.0.0.1' ? '' : currentShareHost.value;
+  hostModalOpen.value = true;
+}
+
+async function savePublicHost() {
+  try {
+    await api.setPublicHost(editingPublicHost.value.trim());
+    hostModalOpen.value = false;
+    message.success(t('app.saveSuccess'));
     await loadData();
   } catch (e) {
     message.error(e.message);

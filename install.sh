@@ -107,10 +107,11 @@ echo "  4) Panel status"
 echo "  5) Show panel info (port / base path)"
 echo "  6) Reset admin username & password"
 echo "  7) Change panel port / base path"
-echo "  8) View panel systemd logs"
+echo "  8) Set public IP / domain for share links"
+echo "  9) View panel systemd logs"
 echo "  0) Exit"
 echo "=========================================="
-read -rp "Select [0-8]: " choice
+read -rp "Select [0-9]: " choice
 case "$choice" in
   1) systemctl start shoes-panel && systemctl status shoes-panel --no-pager ;;
   2) systemctl stop shoes-panel ;;
@@ -132,7 +133,12 @@ case "$choice" in
     /usr/local/bin/shoes-panel "${args[@]}"
     systemctl restart shoes-panel
     ;;
-  8) journalctl -u shoes-panel -n 100 -f ;;
+  8)
+    read -rp "Enter server public IP or domain (e.g. 203.0.113.88): " ph
+    /usr/local/bin/shoes-panel setting --public-host "$ph" --data-dir "$DATA_DIR"
+    systemctl restart shoes-panel
+    ;;
+  9) journalctl -u shoes-panel -n 100 -f ;;
   *) exit 0 ;;
 esac
 EOF
@@ -169,6 +175,9 @@ first_time_init() {
   local is_fresh=0
   [[ ! -f "${DATA_DIR}/panel.db" ]] && is_fresh=1
 
+  local pub_ip
+  pub_ip="$(curl -fsSL4 --max-time 4 https://api4.ipify.org 2>/dev/null || curl -fsSL4 --max-time 4 https://4.ipw.cn 2>/dev/null || hostname -I | awk '{print $1}')"
+
   "$PANEL_BIN" setting --shoes-bin "$SHOES_BIN" --data-dir "$DATA_DIR" >/dev/null
 
   if [[ $is_fresh -eq 1 ]]; then
@@ -179,23 +188,33 @@ first_time_init() {
     init_path="/$(rand_str 8)"
 
     "$PANEL_BIN" reset --username "$init_user" --password "$init_pass" --data-dir "$DATA_DIR" >/dev/null
-    "$PANEL_BIN" setting --port "$init_port" --base-path "$init_path" --shoes-bin "$SHOES_BIN" --data-dir "$DATA_DIR" >/dev/null
+    "$PANEL_BIN" setting --port "$init_port" --base-path "$init_path" --public-host "$pub_ip" --shoes-bin "$SHOES_BIN" --data-dir "$DATA_DIR" >/dev/null
+
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+      ufw allow "${init_port}/tcp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+      firewall-cmd --permanent --add-port="${init_port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
 
     systemctl restart shoes-panel
-
-    local pub_ip
-    pub_ip="$(curl -fsSL4 --max-time 4 https://api.ipify.org || hostname -I | awk '{print $1}')"
 
     echo ""
     echo -e "${GREEN}============================================================${NC}"
     echo -e "${GREEN}  Shoes Panel installed and started successfully!           ${NC}"
     echo -e "${GREEN}============================================================${NC}"
     echo -e "  Panel URL   : ${CYAN}http://${pub_ip}:${init_port}${init_path}/${NC}"
+    echo -e "  Public Host : ${GREEN}${pub_ip}${NC}"
     echo -e "  Username    : ${YELLOW}${init_user}${NC}"
     echo -e "  Password    : ${YELLOW}${init_pass}${NC}"
     echo -e "  CLI Menu    : ${CYAN}s-ui${NC}"
+    echo -e "${YELLOW}  Note: Remember to allow your Inbound ports in cloud security group / ufw!${NC}"
     echo -e "${GREEN}============================================================${NC}"
   else
+    # On upgrade, if public_host was not set yet, populate it automatically
+    if "$PANEL_BIN" info --data-dir "$DATA_DIR" | grep -q "Public host  : <auto>" && [[ -n "$pub_ip" ]]; then
+      "$PANEL_BIN" setting --public-host "$pub_ip" --data-dir "$DATA_DIR" >/dev/null
+    fi
     systemctl restart shoes-panel
     echo -e "${GREEN}Shoes Panel upgraded & restarted! Run 's-ui' to manage.${NC}"
   fi

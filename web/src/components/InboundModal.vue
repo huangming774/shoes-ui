@@ -239,7 +239,7 @@
           </a-col>
           <a-col v-if="form.stream_settings.tls.cert_mode === 'source'" :span="8">
             <a-form-item :label="t('inbounds.certSource')" required>
-              <a-select v-model:value="form.stream_settings.tls.certificate_source" placeholder="Select certificate">
+              <a-select v-model:value="form.stream_settings.tls.certificate_source" placeholder="Select certificate" @change="onCertSourceChange">
                 <a-select-option v-for="c in certs" :key="c.name" :value="c.name">
                   {{ c.name }} ({{ c.cert_type }})
                 </a-select-option>
@@ -532,6 +532,7 @@ watch(
       shortIdsStr.value = '0123456789abcdef';
       if (props.certs?.length > 0) {
         form.stream_settings.tls.certificate_source = props.certs[0].name;
+        onCertSourceChange(props.certs[0].name);
       }
       try {
         const [{ port }, { uuid }, rk, rnd] = await Promise.all([
@@ -583,6 +584,17 @@ async function onProtocolChange(proto) {
 function onNetworkChange(net) {
   if (net === 'quic') {
     form.stream_settings.security = 'tls';
+  }
+}
+
+function onCertSourceChange(certName) {
+  const matched = (props.certs || []).find((c) => c.name === certName);
+  if (!matched) return;
+  if (
+    matched.cert_type !== 'acme' &&
+    ((matched.remark || '').toLowerCase().includes('self') || certName.toLowerCase().startsWith('self'))
+  ) {
+    form.stream_settings.tls.allow_insecure = true;
   }
 }
 

@@ -103,6 +103,7 @@ export const api = {
 
   getSettings: () => apiFetch('/settings'),
   saveSettings: (payload) => apiFetch('/settings', { method: 'PUT', body: payload }),
+  setPublicHost: (public_host) => apiFetch('/settings/public-host', { method: 'POST', body: { public_host } }),
   changePassword: (payload) => apiFetch('/settings/password', { method: 'POST', body: payload }),
   backupDbUrl: () => `${getApiBase()}/settings/backup-db`,
 };

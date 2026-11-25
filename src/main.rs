@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
     let mut port_arg: Option<u16> = None;
     let mut base_path_arg: Option<String> = None;
     let mut shoes_bin_arg: Option<String> = None;
+    let mut public_host_arg: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -116,6 +117,10 @@ async fn main() -> Result<()> {
             }
             "--shoes-bin" if i + 1 < args.len() => {
                 shoes_bin_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--public-host" if i + 1 < args.len() => {
+                public_host_arg = Some(args[i + 1].clone());
                 i += 2;
             }
             "--help" | "-h" => {
@@ -158,6 +163,10 @@ async fn main() -> Result<()> {
                 db.set_setting_kv("shoes_bin_path", &bin)?;
                 println!("Updated shoes_bin_path = {bin}");
             }
+            if let Some(ph) = public_host_arg {
+                db.set_setting_kv("public_host", ph.trim())?;
+                println!("Updated public_host = {}", ph.trim());
+            }
             return Ok(());
         }
         "info" => {
@@ -168,14 +177,26 @@ async fn main() -> Result<()> {
             } else {
                 "http"
             };
+            let disp_host = if s.public_host.trim().is_empty() {
+                "<auto>"
+            } else {
+                s.public_host.trim()
+            };
             println!("==========================================");
             println!("shoes-panel current configuration:");
             println!("  Admin user   : {u}");
             println!("  Listen       : {}:{}", s.panel_listen, s.panel_port);
             println!("  Base path    : {}", s.panel_base_path);
+            println!("  Public host  : {disp_host}");
             println!(
-                "  URL          : {scheme}://127.0.0.1:{}{}",
-                s.panel_port, s.panel_base_path
+                "  URL          : {scheme}://{}:{}{}",
+                if s.public_host.trim().is_empty() {
+                    "127.0.0.1"
+                } else {
+                    s.public_host.trim()
+                },
+                s.panel_port,
+                s.panel_base_path
             );
             println!("  shoes binary : {}", s.shoes_bin_path);
             println!("  shoes config : {}", s.shoes_config_path);
@@ -195,6 +216,9 @@ async fn main() -> Result<()> {
     }
     if let Some(bin) = shoes_bin_arg {
         db.set_setting_kv("shoes_bin_path", &bin)?;
+    }
+    if let Some(ph) = public_host_arg {
+        db.set_setting_kv("public_host", ph.trim())?;
     }
 
     let settings = db.get_settings()?;
@@ -433,11 +457,50 @@ mod tests {
         let clash_sub = sub_gen::generate_subscription(
             &inbounds,
             "default",
-            "proxy.example.com",
+            "203.0.113.88",
             sub_gen::SubFormat::ClashYaml,
         );
         assert!(clash_sub.body.contains("VLESS-Reality"));
         assert!(clash_sub.body.contains("Hy2-Node"));
+        assert!(clash_sub.body.contains("server: 203.0.113.88"));
+        assert!(!clash_sub.body.contains("GEOIP,LAN"));
+        assert!(clash_sub.body.contains("short-id: '0123456789abcdef'"));
+
+        // Verify Shadowrocket / standard URI never percent-encodes '-', '_', '.' in UUID, pbk, or sni
+        let raw_sub = sub_gen::generate_subscription(
+            &inbounds,
+            "default",
+            "203.0.113.88",
+            sub_gen::SubFormat::RawUris,
+        );
+        let vless_uri = raw_sub
+            .body
+            .lines()
+            .find(|l| l.starts_with("vless://"))
+            .expect("vless URI missing");
+        let user_part = vless_uri
+            .strip_prefix("vless://")
+            .unwrap()
+            .split('@')
+            .next()
+            .unwrap();
+        assert_eq!(
+            user_part.len(),
+            36,
+            "VLESS UUID must be raw 36-char UUID, got: {vless_uri}"
+        );
+        assert!(
+            !user_part.contains('%'),
+            "VLESS UUID must not contain percent-encoding: {vless_uri}"
+        );
+        assert!(
+            vless_uri.contains("sni=www.microsoft.com"),
+            "SNI dots must not be percent-encoded: {vless_uri}"
+        );
+        assert!(
+            !vless_uri.contains("%5F") && !vless_uri.contains("%2D"),
+            "pbk/UUID must not encode '-' or '_': {vless_uri}"
+        );
 
         let sb_sub = sub_gen::generate_subscription(
             &inbounds,
