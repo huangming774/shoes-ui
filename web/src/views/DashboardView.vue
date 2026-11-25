@@ -1,225 +1,173 @@
 <template>
-  <div style="display: flex; flex-direction: column; gap: 16px">
-    <!-- Top 4 System Resource Gauges -->
-    <a-row :gutter="[16, 16]">
-      <a-col :xs="24" :sm="12" :lg="6">
-        <a-card size="small" class="stat-card">
-          <div class="gauge-wrap">
-            <a-progress
-              type="dashboard"
-              :percent="Math.round(sys.cpu_usage || 0)"
-              :size="96"
-              :stroke-color="gaugeColor(sys.cpu_usage)"
-            />
-            <div>
-              <div class="stat-label">{{ t('dashboard.cpu') }}</div>
-              <div class="stat-sub">{{ sys.cpu_cores || 1 }} {{ t('dashboard.cores') }}</div>
-            </div>
-          </div>
-        </a-card>
-      </a-col>
-
-      <a-col :xs="24" :sm="12" :lg="6">
-        <a-card size="small" class="stat-card">
-          <div class="gauge-wrap">
-            <a-progress
-              type="dashboard"
-              :percent="pct(sys.mem_used, sys.mem_total)"
-              :size="96"
-              :stroke-color="gaugeColor(pct(sys.mem_used, sys.mem_total))"
-            />
-            <div>
-              <div class="stat-label">{{ t('dashboard.memory') }}</div>
-              <div class="stat-sub">{{ formatBytes(sys.mem_used) }} / {{ formatBytes(sys.mem_total) }}</div>
-            </div>
-          </div>
-        </a-card>
-      </a-col>
-
-      <a-col :xs="24" :sm="12" :lg="6">
-        <a-card size="small" class="stat-card">
-          <div class="gauge-wrap">
-            <a-progress
-              type="dashboard"
-              :percent="pct(sys.swap_used, sys.swap_total)"
-              :size="96"
-              :stroke-color="gaugeColor(pct(sys.swap_used, sys.swap_total))"
-            />
-            <div>
-              <div class="stat-label">{{ t('dashboard.swap') }}</div>
-              <div class="stat-sub">{{ formatBytes(sys.swap_used) }} / {{ formatBytes(sys.swap_total) }}</div>
-            </div>
-          </div>
-        </a-card>
-      </a-col>
-
-      <a-col :xs="24" :sm="12" :lg="6">
-        <a-card size="small" class="stat-card">
-          <div class="gauge-wrap">
-            <a-progress
-              type="dashboard"
-              :percent="pct(sys.disk_used, sys.disk_total)"
-              :size="96"
-              :stroke-color="gaugeColor(pct(sys.disk_used, sys.disk_total))"
-            />
-            <div>
-              <div class="stat-label">{{ t('dashboard.disk') }}</div>
-              <div class="stat-sub">{{ formatBytes(sys.disk_used) }} / {{ formatBytes(sys.disk_total) }}</div>
-            </div>
-          </div>
-        </a-card>
-      </a-col>
-    </a-row>
-
-    <!-- Shoes Core Service Control & Live Throughput -->
-    <a-row :gutter="[16, 16]">
-      <a-col :xs="24" :lg="13">
-        <a-card :title="t('dashboard.shoesService')" size="small">
-          <template #extra>
-            <a-tag :color="shoes.running ? 'success' : 'error'">
-              {{ shoes.running ? '● ' + t('dashboard.running') : '○ ' + t('dashboard.stopped') }}
-            </a-tag>
-          </template>
-
-          <a-alert
-            v-if="!shoes.bin_exists"
-            type="warning"
-            show-icon
-            :message="t('dashboard.binMissing')"
-            style="margin-bottom: 12px"
+  <div class="dashboard">
+    <div class="resource-grid">
+      <a-card v-for="resource in resources" :key="resource.title" size="small" class="resource-card">
+        <div class="resource-copy">
+          <h2>{{ resource.title }}</h2>
+          <p>{{ resource.detail }}</p>
+        </div>
+        <div class="resource-gauge" :style="{ '--gauge-color': gaugeColor(resource.percent) }">
+          <a-progress
+            type="circle"
+            :percent="resource.percent"
+            :size="54"
+            :stroke-width="7"
+            stroke-color="var(--gauge-color)"
+            trail-color="var(--panel-line)"
+            :show-info="false"
+            aria-hidden="true"
           />
-          <a-alert
-            v-else-if="shoes.last_error"
-            type="error"
-            show-icon
-            :message="shoes.last_error"
-            style="margin-bottom: 12px"
-          />
+          <span>{{ resource.percent }}%</span>
+        </div>
+      </a-card>
+    </div>
 
-          <a-descriptions :column="{ xs: 1, sm: 2 }" size="small" bordered>
-            <a-descriptions-item :label="t('dashboard.version')">
-              <code>{{ shoes.version || '-' }}</code>
-            </a-descriptions-item>
-            <a-descriptions-item :label="t('dashboard.pid')">
-              {{ shoes.pid || '-' }}
-            </a-descriptions-item>
-            <a-descriptions-item :label="t('dashboard.shoesMem')">
-              {{ sys.shoes_rss_bytes ? formatBytes(sys.shoes_rss_bytes) : '-' }}
-            </a-descriptions-item>
-            <a-descriptions-item :label="t('dashboard.clashApi')">
-              <a-badge :status="sys.clash_online ? 'success' : 'default'" :text="sys.clash_online ? 'Online' : 'Offline'" />
-            </a-descriptions-item>
-            <a-descriptions-item :label="t('dashboard.inboundsCount')">
-              <b>{{ totals.inbounds_enabled || 0 }}</b> / {{ totals.inbounds_total || 0 }}
-            </a-descriptions-item>
-            <a-descriptions-item :label="t('dashboard.clientsCount')">
-              <b>{{ totals.clients_total || 0 }}</b>
-            </a-descriptions-item>
-          </a-descriptions>
+    <div class="dashboard-details">
+      <a-card size="small" class="dashboard-section service-card">
+        <template #title><h2>{{ t('dashboard.shoesService') }}</h2></template>
+        <template #extra>
+          <span class="panel-status" :class="{ 'panel-status--running': shoes.running }">
+            {{ t(shoes.running ? 'dashboard.running' : 'dashboard.stopped') }}
+          </span>
+        </template>
 
-          <a-space wrap style="margin-top: 14px">
-            <a-button v-if="!shoes.running" type="primary" :loading="opLoading" @click="doOp('start')">
-              ▶ {{ t('dashboard.start') }}
-            </a-button>
-            <a-button v-else danger :loading="opLoading" @click="doOp('stop')">
-              ■ {{ t('dashboard.stop') }}
-            </a-button>
-            <a-button :loading="opLoading" @click="doOp('restart')">
-              ↻ {{ t('dashboard.restart') }}
-            </a-button>
-            <a-button type="dashed" :loading="opLoading" @click="doOp('reload')">
-              ⚡ {{ t('dashboard.reload') }}
-            </a-button>
-            <a-button @click="openYamlPreview">
-              📄 {{ t('dashboard.previewYaml') }}
-            </a-button>
-          </a-space>
-        </a-card>
-      </a-col>
+        <a-alert
+          v-if="!shoes.bin_exists"
+          type="warning"
+          show-icon
+          :message="t('dashboard.binMissing')"
+        />
+        <a-alert v-else-if="shoes.last_error" type="error" show-icon :message="shoes.last_error" />
 
-      <a-col :xs="24" :lg="11">
-        <a-card :title="t('dashboard.netSpeed')" size="small">
-          <a-row :gutter="[12, 12]">
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.proxyNet') }} ↑</div>
-                <div class="metric-val" style="color: #1677ff">{{ formatSpeed(sys.proxy_up_speed) }}</div>
-              </div>
-            </a-col>
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.proxyNet') }} ↓</div>
-                <div class="metric-val" style="color: #52c41a">{{ formatSpeed(sys.proxy_down_speed) }}</div>
-              </div>
-            </a-col>
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.totalTraffic') }} ↑</div>
-                <div class="metric-val">{{ formatBytes(totals.up_bytes) }}</div>
-              </div>
-            </a-col>
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.totalTraffic') }} ↓</div>
-                <div class="metric-val">{{ formatBytes(totals.down_bytes) }}</div>
-              </div>
-            </a-col>
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.hostNet') }}</div>
-                <div style="font-size: 13px; font-weight: 600">
-                  ↑ {{ formatSpeed(sys.net_tx_speed) }} · ↓ {{ formatSpeed(sys.net_rx_speed) }}
-                </div>
-              </div>
-            </a-col>
-            <a-col :span="12">
-              <div class="metric-tile">
-                <div class="metric-caption">{{ t('dashboard.activeConns') }}</div>
-                <div class="metric-val" style="color: #722ed1">{{ sys.active_connections || 0 }}</div>
-              </div>
-            </a-col>
-          </a-row>
-        </a-card>
-      </a-col>
-    </a-row>
+        <dl class="detail-list">
+          <div>
+            <dt>{{ t('dashboard.version') }}</dt>
+            <dd><code>{{ shoes.version || '—' }}</code></dd>
+          </div>
+          <div>
+            <dt>{{ t('dashboard.pid') }}</dt>
+            <dd>{{ shoes.pid || '—' }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('dashboard.shoesMem') }}</dt>
+            <dd>{{ sys.shoes_rss_bytes ? formatBytes(sys.shoes_rss_bytes) : '—' }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('dashboard.clashApi') }}</dt>
+            <dd><a-badge :status="sys.clash_online ? 'success' : 'default'" :text="sys.clash_online ? 'Online' : 'Offline'" /></dd>
+          </div>
+          <div>
+            <dt>{{ t('dashboard.inboundsCount') }}</dt>
+            <dd>{{ totals.inbounds_enabled || 0 }} / {{ totals.inbounds_total || 0 }}</dd>
+          </div>
+          <div>
+            <dt>{{ t('dashboard.clientsCount') }}</dt>
+            <dd>{{ totals.clients_total || 0 }}</dd>
+          </div>
+        </dl>
 
-    <!-- System Info -->
-    <a-card :title="t('dashboard.sysInfo')" size="small">
-      <a-descriptions :column="{ xs: 1, sm: 2, md: 4 }" size="small">
-        <a-descriptions-item :label="t('dashboard.os')">
-          {{ sys.os_name || '-' }} {{ sys.kernel_version ? `(${sys.kernel_version})` : '' }}
-        </a-descriptions-item>
-        <a-descriptions-item :label="t('dashboard.arch')">
-          <a-tag>{{ sys.arch || '-' }}</a-tag>
-        </a-descriptions-item>
-        <a-descriptions-item :label="t('dashboard.hostUptime')">
-          {{ formatDuration(sys.host_uptime_secs, locale === 'zh') }}
-        </a-descriptions-item>
-        <a-descriptions-item :label="t('dashboard.panelUptime')">
-          {{ formatDuration(sys.panel_uptime_secs, locale === 'zh') }}
-        </a-descriptions-item>
-      </a-descriptions>
+        <div class="service-actions">
+          <a-button
+            v-if="!shoes.running"
+            type="primary"
+            :loading="opLoading === 'start'"
+            :disabled="Boolean(opLoading && opLoading !== 'start')"
+            @click="doOp('start')"
+          >
+            <template #icon><CaretRightOutlined /></template>
+            {{ t('dashboard.start') }}
+          </a-button>
+          <a-button
+            v-else
+            danger
+            :loading="opLoading === 'stop'"
+            :disabled="Boolean(opLoading && opLoading !== 'stop')"
+            @click="doOp('stop')"
+          >
+            <template #icon><PauseOutlined /></template>
+            {{ t('dashboard.stop') }}
+          </a-button>
+          <a-button :loading="opLoading === 'restart'" :disabled="Boolean(opLoading && opLoading !== 'restart')" @click="doOp('restart')">
+            <template #icon><RedoOutlined /></template>
+            {{ t('dashboard.restart') }}
+          </a-button>
+          <a-button :loading="opLoading === 'reload'" :disabled="Boolean(opLoading && opLoading !== 'reload')" @click="doOp('reload')">
+            <template #icon><ThunderboltOutlined /></template>
+            {{ t('dashboard.reload') }}
+          </a-button>
+          <a-button @click="openYamlPreview">
+            <template #icon><FileTextOutlined /></template>
+            {{ t('dashboard.previewYaml') }}
+          </a-button>
+        </div>
+      </a-card>
+
+      <a-card size="small" class="dashboard-section">
+        <template #title><h2>{{ t('dashboard.netSpeed') }}</h2></template>
+        <div class="throughput-grid">
+          <section v-for="metric in throughput" :key="metric.title" class="throughput-tile">
+            <h3>{{ metric.title }}</h3>
+            <dl class="throughput-pair">
+              <div>
+                <dt><ArrowUpOutlined aria-hidden="true" /> {{ t('dashboard.upload') }}</dt>
+                <dd>{{ metric.up }}</dd>
+              </div>
+              <div>
+                <dt><ArrowDownOutlined aria-hidden="true" /> {{ t('dashboard.download') }}</dt>
+                <dd>{{ metric.down }}</dd>
+              </div>
+            </dl>
+          </section>
+          <section class="throughput-tile">
+            <h3>{{ t('dashboard.activeConns') }}</h3>
+            <p class="connection-count">{{ sys.active_connections || 0 }}</p>
+          </section>
+        </div>
+      </a-card>
+    </div>
+
+    <a-card size="small" class="dashboard-section">
+      <template #title><h2>{{ t('dashboard.sysInfo') }}</h2></template>
+      <dl class="detail-list host-details">
+        <div>
+          <dt>{{ t('dashboard.os') }}</dt>
+          <dd>{{ sys.os_name || '—' }} {{ sys.kernel_version ? `(${sys.kernel_version})` : '' }}</dd>
+        </div>
+        <div>
+          <dt>{{ t('dashboard.arch') }}</dt>
+          <dd>{{ sys.arch || '—' }}</dd>
+        </div>
+        <div>
+          <dt>{{ t('dashboard.hostUptime') }}</dt>
+          <dd>{{ formatDuration(sys.host_uptime_secs, locale === 'zh') }}</dd>
+        </div>
+        <div>
+          <dt>{{ t('dashboard.panelUptime') }}</dt>
+          <dd>{{ formatDuration(sys.panel_uptime_secs, locale === 'zh') }}</dd>
+        </div>
+      </dl>
     </a-card>
 
-    <!-- YAML Preview Modal -->
-    <a-modal
-      v-model:open="yamlModalOpen"
-      :title="yamlPath || 'shoes.config.yaml'"
-      width="760px"
-      :footer="null"
-    >
-      <div style="display: flex; justify-content: flex-end; margin-bottom: 8px">
-        <a-button size="small" type="primary" @click="copyYaml">Copy YAML</a-button>
+    <a-modal v-model:open="yamlModalOpen" :title="yamlPath || 'shoes.config.yaml'" width="760px" :footer="null">
+      <div class="yaml-actions">
+        <a-button size="small" type="primary" @click="copyYaml">{{ t('dashboard.copyYaml') }}</a-button>
       </div>
-      <pre
-        style="max-height: 62vh; overflow: auto; padding: 14px; border-radius: 8px; background: rgba(127,127,127,0.12); font-size: 12px; margin: 0"
-      >{{ yamlContent }}</pre>
+      <pre class="yaml-preview">{{ yamlContent }}</pre>
     </a-modal>
   </div>
 </template>
 
 <script setup>
 import { computed, ref } from 'vue';
+import {
+  ArrowDownOutlined,
+  ArrowUpOutlined,
+  CaretRightOutlined,
+  FileTextOutlined,
+  PauseOutlined,
+  RedoOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons-vue';
 import { message } from 'ant-design-vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
@@ -235,7 +183,48 @@ const sys = computed(() => props.statusData?.system || {});
 const shoes = computed(() => props.statusData?.shoes || {});
 const totals = computed(() => props.statusData?.totals || {});
 
-const opLoading = ref(false);
+const resources = computed(() => [
+  {
+    title: t('dashboard.cpu'),
+    detail: `${sys.value.cpu_cores || 1} ${t('dashboard.cores')}`,
+    percent: Math.round(sys.value.cpu_usage || 0),
+  },
+  {
+    title: t('dashboard.memory'),
+    detail: `${formatBytes(sys.value.mem_used)} / ${formatBytes(sys.value.mem_total)}`,
+    percent: pct(sys.value.mem_used, sys.value.mem_total),
+  },
+  {
+    title: t('dashboard.swap'),
+    detail: `${formatBytes(sys.value.swap_used)} / ${formatBytes(sys.value.swap_total)}`,
+    percent: pct(sys.value.swap_used, sys.value.swap_total),
+  },
+  {
+    title: t('dashboard.disk'),
+    detail: `${formatBytes(sys.value.disk_used)} / ${formatBytes(sys.value.disk_total)}`,
+    percent: pct(sys.value.disk_used, sys.value.disk_total),
+  },
+]);
+
+const throughput = computed(() => [
+  {
+    title: t('dashboard.proxyNet'),
+    up: formatSpeed(sys.value.proxy_up_speed),
+    down: formatSpeed(sys.value.proxy_down_speed),
+  },
+  {
+    title: t('dashboard.totalTraffic'),
+    up: formatBytes(totals.value.up_bytes),
+    down: formatBytes(totals.value.down_bytes),
+  },
+  {
+    title: t('dashboard.hostNet'),
+    up: formatSpeed(sys.value.net_tx_speed),
+    down: formatSpeed(sys.value.net_rx_speed),
+  },
+]);
+
+const opLoading = ref('');
 const yamlModalOpen = ref(false);
 const yamlContent = ref('');
 const yamlPath = ref('');
@@ -246,13 +235,14 @@ function pct(used, total) {
 }
 
 function gaugeColor(p) {
-  if (p >= 85) return '#ff4d4f';
-  if (p >= 65) return '#faad14';
-  return '#1677ff';
+  if (p >= 85) return 'var(--panel-danger)';
+  if (p >= 65) return 'var(--panel-warning)';
+  return 'var(--panel-accent)';
 }
 
 async function doOp(action) {
-  opLoading.value = true;
+  if (opLoading.value) return;
+  opLoading.value = action;
   try {
     if (action === 'start') await api.shoesStart();
     else if (action === 'stop') await api.shoesStop();
@@ -263,7 +253,7 @@ async function doOp(action) {
   } catch (e) {
     message.error(e.message);
   } finally {
-    opLoading.value = false;
+    opLoading.value = '';
   }
 }
 
@@ -285,35 +275,224 @@ async function copyYaml() {
 </script>
 
 <style scoped>
-.stat-card {
-  border-radius: 12px;
+.dashboard {
+  display: grid;
+  gap: var(--panel-gap);
+  font-variant-numeric: tabular-nums;
 }
-.gauge-wrap {
+
+.resource-grid,
+.dashboard-details {
+  display: grid;
+  gap: var(--panel-gap);
+}
+
+.resource-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.dashboard-details {
+  grid-template-columns: minmax(0, 1.12fr) minmax(0, 1fr);
+}
+
+.dashboard-section :deep(.ant-card-body),
+.resource-card :deep(.ant-card-body) {
+  padding: var(--panel-space-5);
+}
+
+.resource-card :deep(.ant-card-body) {
   display: flex;
   align-items: center;
-  gap: 16px;
+  justify-content: space-between;
+  gap: var(--panel-space-3);
+  min-block-size: 6.25rem;
 }
-.stat-label {
-  font-weight: 600;
-  font-size: 15px;
+
+.resource-copy {
+  min-inline-size: 0;
 }
-.stat-sub {
-  font-size: 12px;
-  opacity: 0.7;
-  margin-top: 4px;
+
+.resource-copy h2,
+.dashboard-section h2 {
+  margin: 0;
+  color: var(--panel-text);
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
 }
-.metric-tile {
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: rgba(127, 127, 127, 0.07);
+
+.resource-copy p {
+  margin: 0.25rem 0 0;
+  color: var(--panel-muted);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
-.metric-caption {
-  font-size: 12px;
-  opacity: 0.7;
-  margin-bottom: 4px;
+
+.resource-gauge {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
 }
-.metric-val {
-  font-size: 17px;
+
+.resource-gauge :deep(.ant-progress) {
+  line-height: 0;
+}
+
+.resource-gauge > span {
+  position: absolute;
+  color: var(--gauge-color);
+  font-size: 0.8125rem;
   font-weight: 700;
+}
+
+.resource-gauge :deep(.ant-progress-circle-path) {
+  transition: stroke-dashoffset var(--panel-motion-view) var(--panel-ease),
+    stroke var(--panel-motion-mid) var(--panel-ease);
+}
+
+.dashboard-section :deep(.ant-card-head) {
+  padding-inline: var(--panel-space-5);
+}
+
+.dashboard-section :deep(.ant-card-head-wrapper) {
+  gap: var(--panel-space-2);
+}
+
+.service-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.service-card :deep(.ant-card-body) {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-space-4);
+}
+
+.detail-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--panel-line);
+  border: 1px solid var(--panel-line);
+  border-radius: var(--panel-control-radius);
+  overflow: hidden;
+}
+
+.detail-list > div {
+  padding: var(--panel-space-3);
+  background: var(--panel-inset);
+}
+
+.detail-list dt,
+.throughput-pair dt {
+  color: var(--panel-muted);
+  font-size: 0.8125rem;
+}
+
+.detail-list dd {
+  margin: 0.25rem 0 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.service-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--panel-space-2);
+  margin-block-start: auto;
+}
+
+.service-actions :deep(.ant-btn) {
+  min-block-size: 2.75rem;
+  height: auto;
+  white-space: normal;
+}
+
+.throughput-grid,
+.throughput-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--panel-space-2);
+}
+
+.throughput-tile {
+  padding: var(--panel-space-3);
+  background: var(--panel-inset);
+  border-radius: var(--panel-control-radius);
+}
+
+.throughput-tile h3 {
+  margin: 0 0 var(--panel-space-2);
+  color: var(--panel-text);
+  font-size: 0.875rem;
+  font-weight: 650;
+}
+
+.throughput-pair {
+  margin: 0;
+}
+
+.throughput-pair dt .anticon {
+  color: var(--panel-accent);
+}
+
+.throughput-pair > div + div dt .anticon {
+  color: var(--panel-success);
+}
+
+.throughput-pair dd,
+.connection-count {
+  margin: 0.125rem 0 0;
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.connection-count {
+  font-size: 1.375rem;
+}
+
+.host-details {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.yaml-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-block-end: var(--panel-space-2);
+}
+
+.yaml-preview {
+  max-block-size: 62vh;
+  overflow: auto;
+  padding: var(--panel-space-4);
+  border-radius: var(--panel-control-radius);
+  background: var(--panel-inset);
+  font-size: 0.8125rem;
+  margin: 0;
+}
+
+@container panel (max-width: 53rem) {
+  .resource-grid,
+  .host-details {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dashboard-details {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@container panel (max-width: 25rem) {
+  .resource-grid,
+  .throughput-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

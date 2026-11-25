@@ -1,0 +1,445 @@
+:root {
+  color-scheme: light;
+  --panel-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --panel-space-2: 0.5rem;
+  --panel-space-3: 0.75rem;
+  --panel-space-4: 1rem;
+  --panel-space-5: 1.25rem;
+  --panel-space-6: 1.5rem;
+  --panel-space-8: 2rem;
+  --panel-gutter: clamp(1rem, 3vw, 2.5rem);
+  --panel-gap: clamp(0.75rem, 1.6vw, 1.25rem);
+  --panel-radius: 1rem;
+  --panel-control-radius: 0.625rem;
+  --panel-motion-fast: 120ms;
+  --panel-motion-mid: 180ms;
+  --panel-motion-view: 220ms;
+  --panel-ease: cubic-bezier(0.2, 0.65, 0.3, 1);
+  --panel-canvas: #eef2f7;
+  --panel-glow: #e2ebfa;
+  --panel-surface: #fff;
+  --panel-inset: #f2f5fa;
+  --panel-rail: #f8fafd;
+  --panel-glass: rgb(248 250 253 / 88%);
+  --panel-line: #dce4ef;
+  --panel-text: #182336;
+  --panel-muted: #4e5f76;
+  --panel-accent: #0860cb;
+  --panel-accent-inset: #e6f0ff;
+  --panel-success: #147449;
+  --panel-success-inset: #e4f4eb;
+  --panel-warning: #a34c06;
+  --panel-danger: #c43e49;
+  --panel-shadow: 0 1px 2px rgb(25 43 72 / 4%), 0 6px 20px rgb(25 43 72 / 4%);
+  --panel-lift: 0 8px 28px rgb(25 43 72 / 8%);
+}
+
+:root[data-panel-theme='dark'] {
+  color-scheme: dark;
+  --panel-canvas: #101722;
+  --panel-glow: #182638;
+  --panel-surface: #17202d;
+  --panel-inset: #131c29;
+  --panel-rail: #141d2a;
+  --panel-glass: rgb(20 29 42 / 89%);
+  --panel-line: #2a3748;
+  --panel-text: #edf2fa;
+  --panel-muted: #a4b2c7;
+  --panel-accent: #83b8ff;
+  --panel-accent-inset: #213755;
+  --panel-success: #69d9a5;
+  --panel-success-inset: #18352e;
+  --panel-warning: #ffb975;
+  --panel-danger: #ff8f99;
+  --panel-shadow: 0 1px 2px rgb(0 0 0 / 12%), 0 6px 20px rgb(0 0 0 / 9%);
+  --panel-lift: 0 8px 28px rgb(0 0 0 / 22%);
+}
+
+body {
+  margin: 0;
+  background: var(--panel-canvas);
+  color: var(--panel-text);
+  font-family: var(--panel-font);
+}
+
+.panel-startup {
+  min-block-size: 100dvh;
+  display: grid;
+  place-items: center;
+}
+
+.panel-shell {
+  display: grid;
+  grid-template-columns: 14rem minmax(0, 1fr);
+  min-block-size: 100dvh;
+}
+
+.panel-shell--compact {
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+}
+
+.panel-sidebar {
+  background: var(--panel-rail);
+  border-inline-end: 1px solid var(--panel-line);
+}
+
+.panel-sidebar__inner {
+  position: sticky;
+  inset-block-start: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-space-5);
+  block-size: 100dvh;
+  overflow: auto;
+  padding: var(--panel-space-5) var(--panel-space-3) var(--panel-space-4);
+}
+
+.panel-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--panel-space-3);
+  padding-inline: var(--panel-space-2);
+  white-space: nowrap;
+}
+
+.panel-brand__mark {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 2.25rem;
+  inline-size: 2.25rem;
+  block-size: 2.25rem;
+  border-radius: var(--panel-control-radius);
+  background: linear-gradient(145deg, #378cff, #125bbb);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 24%), 0 3px 8px rgb(18 91 187 / 20%);
+  color: white;
+  font-size: 1.125rem;
+}
+
+.panel-brand__name {
+  font-size: 1rem;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+}
+
+.panel-menu.ant-menu {
+  inline-size: 100%;
+  background: transparent;
+  border-inline-end: 0;
+}
+
+.panel-menu.ant-menu .ant-menu-item {
+  margin: 0 0 0.25rem;
+  padding-inline: var(--panel-space-3) !important;
+  inline-size: 100%;
+  min-block-size: 2.75rem;
+  line-height: 2.75rem;
+  border-radius: var(--panel-control-radius);
+  color: var(--panel-muted);
+}
+
+.panel-menu.ant-menu .ant-menu-item-selected {
+  background: var(--panel-accent-inset);
+  color: var(--panel-accent);
+  font-weight: 650;
+}
+
+.panel-menu.ant-menu .ant-menu-item .anticon {
+  font-size: 1.0625rem;
+}
+
+.panel-menu.ant-menu.ant-menu-inline-collapsed .ant-menu-item {
+  display: grid;
+  place-items: center;
+  padding-inline: 0 !important;
+}
+
+.panel-menu.ant-menu-inline-collapsed .ant-menu-title-content {
+  position: absolute;
+}
+
+.panel-sidebar__toggle.ant-btn {
+  min-block-size: 2.75rem;
+  margin-block-start: auto;
+  text-align: start;
+  color: var(--panel-muted);
+}
+
+.panel-shell--compact .panel-brand {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.panel-shell--compact .panel-sidebar__toggle {
+  text-align: center;
+}
+
+.panel-workspace {
+  min-inline-size: 0;
+  background: radial-gradient(85rem 35rem at 100% 0%, var(--panel-glow), transparent 75%), var(--panel-canvas);
+}
+
+.panel-toolbar {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 10;
+  background: var(--panel-rail);
+  border-block-end: 1px solid var(--panel-line);
+}
+
+@supports (backdrop-filter: blur(1px)) {
+  .panel-toolbar {
+    background: var(--panel-glass);
+    backdrop-filter: blur(14px);
+  }
+}
+
+.panel-toolbar__inner,
+.panel-content {
+  max-inline-size: 100rem;
+  margin-inline: auto;
+  padding-inline: var(--panel-gutter);
+}
+
+.panel-toolbar__inner,
+.panel-toolbar__context,
+.panel-toolbar__actions {
+  display: flex;
+  align-items: center;
+}
+
+.panel-toolbar__inner {
+  min-block-size: 4.5rem;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--panel-space-2) var(--panel-space-5);
+  padding-block: var(--panel-space-3);
+}
+
+.panel-toolbar__context,
+.panel-toolbar__actions {
+  gap: var(--panel-space-2);
+}
+
+.panel-toolbar__context {
+  min-inline-size: 0;
+  gap: var(--panel-space-3);
+}
+
+.panel-toolbar h1 {
+  margin: 0;
+  color: var(--panel-text);
+  font-size: clamp(1.25rem, 1.45vw + 0.55rem, 1.875rem);
+  font-weight: 700;
+  letter-spacing: -0.035em;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.panel-toolbar__actions {
+  min-inline-size: 0;
+  flex-wrap: wrap;
+}
+
+.panel-toolbar .ant-btn,
+.login-topbar .ant-btn,
+.panel-language .ant-radio-button-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 2.75rem;
+  height: 2.75rem;
+}
+
+.panel-toolbar .ant-btn,
+.login-topbar .ant-btn {
+  padding-inline: var(--panel-space-3);
+  background: var(--panel-surface);
+  border-color: var(--panel-line);
+  box-shadow: none;
+}
+
+.panel-toolbar .ant-btn:hover,
+.login-topbar .ant-btn:hover {
+  background: var(--panel-accent-inset);
+}
+
+.panel-toolbar .ant-btn .anticon {
+  font-size: 1rem;
+}
+
+.panel-toolbar__username {
+  display: inline-block;
+  max-inline-size: 8ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel-language.ant-radio-group {
+  display: inline-flex;
+  border-radius: var(--panel-control-radius);
+}
+
+.panel-language .ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled) {
+  color: var(--panel-accent);
+  background: var(--panel-accent-inset);
+  font-weight: 650;
+}
+
+.panel-status {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: var(--panel-space-2);
+  padding: 0.3125rem var(--panel-space-3);
+  border-radius: 100vw;
+  background: var(--panel-inset);
+  color: var(--panel-muted);
+  font-size: 0.8125rem;
+  font-weight: 620;
+  white-space: nowrap;
+}
+
+.panel-status::before {
+  content: '';
+  flex: none;
+  inline-size: 0.4375rem;
+  block-size: 0.4375rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.panel-status--running {
+  background: var(--panel-success-inset);
+  color: var(--panel-success);
+}
+
+.panel-content {
+  padding-block: var(--panel-gutter) max(var(--panel-gutter), env(safe-area-inset-bottom));
+  container: panel / inline-size;
+}
+
+.panel-view {
+  min-inline-size: 0;
+  animation: panel-enter var(--panel-motion-view) var(--panel-ease) backwards;
+}
+
+@keyframes panel-enter {
+  from { opacity: 0.65; transform: translateY(0.25rem); }
+  to { opacity: 1; transform: none; }
+}
+
+.panel-view .ant-card {
+  border-radius: var(--panel-radius);
+  box-shadow: var(--panel-shadow);
+}
+
+.panel-view .ant-card .ant-card-head {
+  min-block-size: 3.25rem;
+  padding-inline: var(--panel-space-4);
+}
+
+.panel-view .ant-card .ant-card-head-title {
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.panel-view .ant-card.ant-card-small > .ant-card-body {
+  padding: var(--panel-space-4);
+  min-inline-size: 0;
+}
+
+.panel-view .ant-table-wrapper {
+  overflow-x: auto;
+}
+
+.panel-view .ant-table-thead > tr > th {
+  background: var(--panel-inset);
+  color: var(--panel-muted);
+  font-weight: 650;
+}
+
+.panel-placeholder {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--panel-gap);
+}
+
+.panel-placeholder .ant-card-body {
+  padding: var(--panel-space-5);
+}
+
+:where(.panel-shell, .login-bg) .ant-btn:active:not(:disabled):not(.ant-btn-loading) {
+  transform: scale(0.98);
+}
+
+:where(.panel-shell, .login-bg, .ant-drawer, .ant-modal-root) :focus-visible {
+  outline: 2px solid var(--panel-accent);
+  outline-offset: 2px;
+}
+
+@container panel (max-width: 53rem) {
+  .panel-placeholder {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container panel (max-width: 25rem) {
+  .panel-placeholder {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 48rem) {
+  .panel-shell,
+  .panel-shell--compact {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .panel-toolbar__inner {
+    min-block-size: 0;
+  }
+
+  .panel-toolbar__username {
+    display: none;
+  }
+}
+
+@media (max-width: 38rem) {
+  .panel-toolbar__context {
+    flex: 1 1 100%;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .panel-toolbar {
+    background: var(--panel-rail);
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --panel-motion-fast: 1ms;
+    --panel-motion-mid: 1ms;
+    --panel-motion-view: 1ms;
+  }
+
+  .panel-view {
+    animation: none;
+  }
+
+  :where(.panel-shell, .login-bg, .ant-drawer, .ant-modal-root, .ant-dropdown, .ant-message, .ant-select-dropdown, .ant-popover, .ant-tooltip) *,
+  :where(.panel-shell, .login-bg, .ant-drawer, .ant-modal-root) *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+  }
+
+  :where(.panel-shell, .login-bg) .ant-btn:active:not(:disabled):not(.ant-btn-loading) {
+    transform: none;
+  }
+}

@@ -2,37 +2,38 @@
   <div class="login-bg">
     <div class="login-topbar">
       <a-space>
-        <a-button size="small" @click="emit('toggleTheme')">
-          {{ isDark ? '☀️ ' + t('app.themeLight') : '🌙 ' + t('app.themeDark') }}
+        <a-button @click="emit('toggleTheme')">
+          <template #icon><BulbFilled v-if="isDark" /><BulbOutlined v-else /></template>
+          {{ t(isDark ? 'app.themeLight' : 'app.themeDark') }}
         </a-button>
-        <a-radio-group :value="locale" size="small" button-style="solid" @change="(e) => setLocale(e.target.value)">
+        <a-radio-group :value="locale" class="panel-language" aria-label="Language / 语言" @change="(e) => setLocale(e.target.value)">
           <a-radio-button value="zh">中文</a-radio-button>
           <a-radio-button value="en">EN</a-radio-button>
         </a-radio-group>
       </a-space>
     </div>
 
-    <a-card class="login-card" :bordered="false">
-      <div style="text-align: center; margin-bottom: 24px">
-        <div class="brand-badge">⚡ SHOES PANEL</div>
-        <h2 style="margin: 10px 0 4px; font-weight: 700">{{ t('app.loginTitle') }}</h2>
-        <div style="opacity: 0.65; font-size: 13px">{{ t('app.subtitle') }}</div>
-      </div>
+    <a-card class="login-card">
+      <header class="login-heading">
+        <span class="panel-brand__mark" aria-hidden="true"><ThunderboltFilled /></span>
+        <h1>{{ t('app.loginTitle') }}</h1>
+        <p>{{ t('app.subtitle') }}</p>
+      </header>
 
-      <a-form layout="vertical" @submit.prevent="onSubmit">
-        <a-form-item :label="t('app.username')">
-          <a-input v-model:value="username" size="large" autocomplete="username" @pressEnter="onSubmit" />
+      <a-form layout="vertical" @submit="onSubmit">
+        <a-form-item :label="t('app.username')" html-for="panel-login-username">
+          <a-input id="panel-login-username" v-model:value="username" size="large" autocomplete="username" />
         </a-form-item>
-        <a-form-item :label="t('app.password')">
-          <a-input-password v-model:value="password" size="large" autocomplete="current-password" @pressEnter="onSubmit" />
+        <a-form-item :label="t('app.password')" html-for="panel-login-password">
+          <a-input-password id="panel-login-password" v-model:value="password" size="large" autocomplete="current-password" />
         </a-form-item>
         <a-button
           type="primary"
           size="large"
           block
           :loading="loading"
-          style="margin-top: 8px; height: 42px; font-weight: 600"
-          @click="onSubmit"
+          html-type="submit"
+          class="login-submit"
         >
           {{ t('app.loginBtn') }}
         </a-button>
@@ -44,6 +45,7 @@
 <script setup>
 import { ref } from 'vue';
 import { message } from 'ant-design-vue';
+import { BulbFilled, BulbOutlined, ThunderboltFilled } from '@ant-design/icons-vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
 import { setLocale } from '../i18n';
@@ -57,7 +59,7 @@ const password = ref('');
 const loading = ref(false);
 
 async function onSubmit() {
-  if (!username.value || !password.value) return;
+  if (loading.value || !username.value || !password.value) return;
   loading.value = true;
   try {
     const res = await api.login(username.value, password.value);
@@ -76,34 +78,48 @@ async function onSubmit() {
 
 <style scoped>
 .login-bg {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  position: relative;
-  background: radial-gradient(circle at 20% 20%, rgba(22, 119, 255, 0.16), transparent 45%),
-    radial-gradient(circle at 80% 80%, rgba(114, 46, 209, 0.16), transparent 45%);
+  min-block-size: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  padding: var(--panel-gutter);
+  gap: var(--panel-space-6);
+  background: radial-gradient(52rem 38rem at 48% 20%, var(--panel-glow), transparent 80%);
 }
 .login-topbar {
-  position: absolute;
-  top: 20px;
-  right: 24px;
+  justify-self: end;
 }
 .login-card {
-  width: 100%;
-  max-width: 400px;
-  border-radius: 16px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+  place-self: center;
+  inline-size: min(100%, 26rem);
+  border-radius: var(--panel-radius);
+  box-shadow: var(--panel-lift);
+  animation: panel-enter var(--panel-motion-view) var(--panel-ease) backwards;
 }
-.brand-badge {
-  display: inline-block;
-  padding: 4px 12px;
-  border-radius: 999px;
-  font-size: 12px;
+
+.login-card :deep(.ant-card-body) {
+  padding: clamp(var(--panel-space-4), 5vw, var(--panel-space-8));
+}
+
+.login-heading {
+  margin-block-end: var(--panel-space-6);
+}
+
+.login-heading h1 {
+  margin: var(--panel-space-3) 0 0.25rem;
+  font-size: clamp(1.375rem, 3vw, 1.75rem);
   font-weight: 700;
-  letter-spacing: 0.8px;
-  color: #1677ff;
-  background: rgba(22, 119, 255, 0.12);
+  letter-spacing: -0.03em;
+  line-height: 1.25;
+}
+
+.login-heading p {
+  margin: 0;
+  color: var(--panel-muted);
+  line-height: 1.5;
+}
+
+.login-submit {
+  min-block-size: 2.75rem;
+  font-weight: 650;
 }
 </style>
