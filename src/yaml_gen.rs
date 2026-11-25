@@ -81,7 +81,7 @@ pub fn build_shoes_yaml(
     // 5. Enabled Inbound Server entries
     for ib in inbounds.iter().filter(|i| i.enable) {
         if let Some(entry) =
-            build_inbound_entry(ib, has_panel_routing, &enabled_group_names)
+            build_inbound_entry(data_dir, ib, has_panel_routing, &enabled_group_names)
                 .with_context(|| format!("inbound '{}' (port {})", ib.remark, ib.port))?
         {
             top_entries.push(entry);
@@ -473,6 +473,7 @@ fn apply_outbound_to_rule(
 }
 
 fn build_inbound_entry(
+    data_dir: &Path,
     ib: &Inbound,
     has_panel_routing: bool,
     group_names: &HashSet<String>,
@@ -665,10 +666,7 @@ fn build_inbound_entry(
         if !ss.ws.path.trim().is_empty() {
             insert(&mut target, "matching_path", str_val(ss.ws.path.trim()));
         }
-        let mut headers = ss.ws.headers.clone();
-        if !ss.ws.host.trim().is_empty() {
-            headers.entry("Host".to_string()).or_insert_with(|| ss.ws.host.trim().to_string());
-        }
+        let headers = ss.ws.matching_headers();
         if !headers.is_empty() {
             let mut hmap = Mapping::new();
             for (k, v) in headers {
@@ -749,7 +747,13 @@ fn build_inbound_entry(
     if is_quic {
         insert(&mut server, "transport", str_val("quic"));
         let mut qmap = Mapping::new();
-        apply_cert_fields(&mut qmap, &ss.tls, &ib.remark)?;
+        if ib.uses_auto_quic_cert() {
+            let dir = auto_quic_cert_dir(data_dir);
+            insert(&mut qmap, "cert", str_val(&dir.join("cert.pem").to_string_lossy()));
+            insert(&mut qmap, "key", str_val(&dir.join("key.pem").to_string_lossy()));
+        } else {
+            apply_cert_fields(&mut qmap, &ss.tls, &ib.remark)?;
+        }
         let q_alpn: Vec<String> = if !ss.tls.alpn.is_empty() {
             ss.tls.alpn.clone()
         } else {
@@ -765,6 +769,9 @@ fn build_inbound_entry(
     } else if ss.security == "tls" {
         let mut target = Mapping::new();
         apply_cert_fields(&mut target, &ss.tls, &ib.remark)?;
+        if ib.protocol == "naiveproxy" && !ss.tls.alpn.is_empty() && !ss.tls.alpn.iter().any(|a| a == "h2") {
+            return Err(anyhow!("NaiveProxy requires h2 in TLS ALPN"));
+        }
         let alpn: Vec<String> = if !ss.tls.alpn.is_empty() {
             ss.tls.alpn.clone()
         } else if ib.protocol == "naiveproxy" {
@@ -813,6 +820,9 @@ fn build_inbound_entry(
         } else {
             ss.reality.dest.trim().to_string()
         };
+        if dest.parse::<std::net::SocketAddr>().is_ok() || dest.parse::<std::net::IpAddr>().is_ok() {
+            return Err(anyhow!("REALITY destination must use a DNS hostname, such as example.com:443"));
+        }
         let mut rtarget = Mapping::new();
         insert(
             &mut rtarget,
@@ -916,32 +926,67 @@ fn apply_cert_fields(
     Ok(())
 }
 
-/// Generates YAML from current DB state, validates with `shoes check` if binary exists,
-/// and atomically replaces `shoes_config_path` so `shoes` hot-reloads cleanly.
-pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Result<String> {
-    let settings = db.get_settings()?;
+fn auto_quic_cert_dir(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("certs").join("auto-quic")
+}
+
+fn ensure_auto_quic_cert(data_dir: &Path) -> Result<()> {
+    use std::io::Write;
+    let dir = auto_quic_cert_dir(data_dir);
+    let complete = || dir.join("cert.pem").is_file() && dir.join("key.pem").is_file();
+    if dir.exists() {
+        anyhow::ensure!(complete(), "Incomplete automatic QUIC certificate in {}", dir.display());
+        return Ok(());
+    }
+    let parent = data_dir.join("certs");
+    std::fs::create_dir_all(&parent)?;
+    let staging = tempfile::tempdir_in(parent)?;
+    let (cert, key) = crate::crypto_util::generate_self_signed_cert(&[])?;
+    let mut private = tempfile::NamedTempFile::new_in(staging.path())?;
+    private.write_all(key.as_bytes())?;
+    drop(private.persist(staging.path().join("key.pem"))?);
+    std::fs::write(staging.path().join("cert.pem"), cert)?;
+    if let Err(e) = std::fs::rename(staging.path(), &dir) {
+        if !complete() {
+            return Err(e).context("Could not install automatic QUIC certificate");
+        }
+    }
+    Ok(())
+}
+
+/// Render and check the candidate without modifying the active configuration.
+pub async fn validated_config(db: &Database, settings: &PanelSettings) -> Result<String> {
     let certs = db.list_certificates()?;
     let groups = db.list_outbound_groups()?;
     let rules = db.list_routing_rules()?;
     let inbounds = db.list_inbounds()?;
 
-    let yaml = build_shoes_yaml(&db.data_dir, &settings, &certs, &groups, &rules, &inbounds)?;
+    let yaml = build_shoes_yaml(&db.data_dir, settings, &certs, &groups, &rules, &inbounds)?;
 
-    let cfg_path = std::path::PathBuf::from(&settings.shoes_config_path);
-    if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if inbounds.iter().any(|ib| ib.enable && ib.uses_auto_quic_cert()
+        && ib.protocol_settings.raw_override_yaml.trim().is_empty()
+        && ib.clients.iter().any(|c| c.enable)) {
+        ensure_auto_quic_cert(&db.data_dir)?;
     }
 
-    let tmp_path = cfg_path.with_extension("yaml.tmp");
-    std::fs::write(&tmp_path, yaml.as_bytes())
-        .with_context(|| format!("failed to write temporary config {}", tmp_path.display()))?;
-
-    // Validate with `shoes check <tmp_path>` if the binary exists on disk
-    let bin_path = std::path::PathBuf::from(settings.shoes_bin_path.trim());
+    let cfg_path = Path::new(settings.shoes_config_path.trim());
+    let parent = cfg_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let bin_path = Path::new(settings.shoes_bin_path.trim());
     if bin_path.exists() {
+        use std::io::Write;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".shoes-check-")
+            .suffix(".yaml")
+            .tempfile_in(parent)?;
+        tmp.write_all(yaml.as_bytes())?;
+        let tmp_path = tmp.into_temp_path();
         let output = tokio::process::Command::new(&bin_path)
             .arg("check")
-            .arg(&tmp_path)
+            .arg(tmp_path.as_os_str())
             .output()
             .await
             .with_context(|| format!("failed to execute '{} check'", bin_path.display()))?;
@@ -949,7 +994,6 @@ pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Res
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let _ = std::fs::remove_file(&tmp_path);
             return Err(anyhow!(
                 "shoes config validation failed:\n{}{}",
                 stderr.trim(),
@@ -962,24 +1006,29 @@ pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Res
         }
     }
 
-    // Write validated YAML in-place (preserving inode so notify/Docker bind-mounts always detect edits)
-    std::fs::write(&cfg_path, yaml.as_bytes()).with_context(|| {
-        format!(
-            "failed to write validated config to {}",
-            cfg_path.display()
-        )
-    })?;
-    let _ = std::fs::remove_file(&tmp_path);
+    Ok(yaml)
+}
 
-    // On Unix, invoke POSIX shell built-in `kill -HUP` (works in minimal containers like debian-slim/alpine without procps!)
+pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Result<String> {
+    let settings = db.get_settings()?;
+    let yaml = validated_config(db, &settings).await?;
+    // Preserve the inode for file watchers and Docker bind mounts.
+    std::fs::write(&settings.shoes_config_path, &yaml)
+        .with_context(|| format!("failed to write config to {}", settings.shoes_config_path))?;
+
+    // Windows uses the core's file watcher. Unix also supports an explicit reload.
     #[cfg(unix)]
     if let Some(pid) = shoes_pid {
-        let _ = std::process::Command::new("sh")
+        let status = std::process::Command::new("sh")
             .args(["-c", &format!("kill -HUP {pid}")])
-            .status();
+            .status()
+            .context("failed to signal Shoes to reload")?;
+        anyhow::ensure!(
+            status.success(),
+            "Failed to signal Shoes PID {pid} to reload"
+        );
     }
     #[cfg(not(unix))]
     let _ = shoes_pid;
-
     Ok(yaml)
 }

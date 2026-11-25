@@ -111,8 +111,8 @@ impl RuntimeMonitor {
     }
 
     fn clash_base_and_secret(&self) -> Result<(String, String)> {
-        let s = self.db.get_settings()?;
-        let addr = s.clash_api_addr.trim();
+        let (addr, secret) = self.db.clash_api_settings()?;
+        let addr = addr.trim();
         if addr.is_empty() {
             return Err(anyhow!("Clash API address is not configured"));
         }
@@ -121,7 +121,7 @@ impl RuntimeMonitor {
         } else {
             format!("http://{addr}")
         };
-        Ok((base, s.clash_api_secret))
+        Ok((base, secret))
     }
 
     pub async fn fetch_connections_raw(&self) -> Result<Value> {

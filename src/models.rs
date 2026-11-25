@@ -21,6 +21,15 @@ pub fn default_sub_id() -> String {
     "default".to_string()
 }
 
+#[derive(Debug, Serialize)]
+pub struct InboundTotals {
+    pub up_bytes: i64,
+    pub down_bytes: i64,
+    pub inbounds_total: i64,
+    pub inbounds_enabled: i64,
+    pub clients_total: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inbound {
     #[serde(default)]
@@ -62,6 +71,14 @@ impl Inbound {
     /// Whether this protocol supports multiple users on a single port in upstream `shoes`.
     pub fn supports_multi_user(&self) -> bool {
         matches!(self.protocol.as_str(), "anytls" | "naiveproxy")
+    }
+
+    pub fn uses_auto_quic_cert(&self) -> bool {
+        let tls = &self.stream_settings.tls;
+        matches!(self.protocol.as_str(), "tuic" | "hysteria2")
+            && (tls.cert_mode == "auto"
+                || (tls.cert_mode == "source" && tls.certificate_source.trim().is_empty()
+                    && tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty()))
     }
 
     pub fn is_quic(&self) -> bool {
@@ -177,7 +194,7 @@ pub struct TlsSettings {
     #[serde(default = "default_true")]
     pub allow_any_sni: bool,
     #[serde(default = "default_cert_mode")]
-    pub cert_mode: String, // "source" | "files"
+    pub cert_mode: String, // "source" | "files" | "auto" (native QUIC)
     #[serde(default)]
     pub certificate_source: String,
     #[serde(default)]
@@ -281,6 +298,23 @@ pub struct WsSettings {
     pub max_early_data: usize,
     #[serde(default)]
     pub early_data_header_name: String,
+}
+
+impl WsSettings {
+    pub fn host_header(&self) -> &str {
+        self.headers.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.trim())
+            .unwrap_or(self.host.trim())
+    }
+
+    pub fn matching_headers(&self) -> BTreeMap<String, String> {
+        let mut headers = self.headers.clone();
+        if !self.host.trim().is_empty() && !headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+            headers.insert("Host".into(), self.host.trim().into());
+        }
+        headers
+    }
 }
 
 fn default_ws_path() -> String {
@@ -499,4 +533,26 @@ pub struct PanelSettings {
     pub shoes_auto_start: bool,
     pub shoes_extra_yaml: String,
     pub session_ttl_hours: u64,
+}
+
+impl PanelSettings {
+    pub fn listen_addr(&self) -> anyhow::Result<std::net::SocketAddr> {
+        use anyhow::Context;
+        let host = self.panel_listen.trim();
+        if let Ok(ip) = host.parse() {
+            return Ok(std::net::SocketAddr::new(ip, self.panel_port));
+        }
+        // Preserve bracketed IPv6 addresses, including numeric scope IDs.
+        format!("{host}:{}", self.panel_port)
+            .parse()
+            .with_context(|| format!("Invalid panel listen IP '{host}'"))
+    }
+
+    pub fn scheme(&self) -> &'static str {
+        if self.panel_cert_file.trim().is_empty() || self.panel_key_file.trim().is_empty() {
+            "http"
+        } else {
+            "https"
+        }
+    }
 }

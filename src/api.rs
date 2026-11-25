@@ -282,22 +282,12 @@ async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiRe
 async fn api_status(State(state): State<Arc<AppState>>) -> ApiResult {
     let sys = state.monitor.snapshot();
     let shoes = state.proc_mgr.status().await;
-    let inbounds = state.db.list_inbounds().map_err(internal_err)?;
-    let up_total: i64 = inbounds.iter().map(|i| i.up_bytes).sum();
-    let down_total: i64 = inbounds.iter().map(|i| i.down_bytes).sum();
-    let inbounds_enabled = inbounds.iter().filter(|i| i.enable).count();
-    let clients_total: usize = inbounds.iter().map(|i| i.clients.len()).sum();
+    let totals = state.db.inbound_totals().map_err(internal_err)?;
 
     ok_json(json!({
         "system": sys,
         "shoes": shoes,
-        "totals": {
-            "up_bytes": up_total,
-            "down_bytes": down_total,
-            "inbounds_total": inbounds.len(),
-            "inbounds_enabled": inbounds_enabled,
-            "clients_total": clients_total
-        }
+        "totals": totals
     }))
 }
 
@@ -480,7 +470,7 @@ async fn api_create_inbound(
     if let Err(e) = state.proc_mgr.reload_config().await {
         // Roll back invalid inbound so DB and live config stay consistent
         let _ = state.db.delete_inbound(created.id);
-        return Err(bad_req(e));
+        return Err(bad_req(format!("{e:#}")));
     }
     ok_json(created)
 }
@@ -499,7 +489,7 @@ async fn api_update_inbound(
     if let Err(e) = state.proc_mgr.reload_config().await {
         // Restore previous valid inbound configuration
         let _ = state.db.update_inbound(id, prev);
-        return Err(bad_req(e));
+        return Err(bad_req(format!("{e:#}")));
     }
     ok_json(updated)
 }
@@ -912,8 +902,7 @@ async fn api_list_subscriptions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> ApiResult {
-    let subs = state.db.list_subscriptions().map_err(internal_err)?;
-    let inbounds = state.db.list_inbounds().map_err(internal_err)?;
+    let subs = state.db.subscriptions_with_counts().map_err(internal_err)?;
     let settings = state.db.get_settings().map_err(internal_err)?;
 
     let base_url = if !settings.sub_public_url.trim().is_empty() {
@@ -932,33 +921,18 @@ async fn api_list_subscriptions(
         format!("{proto}://{xfh}")
     } else {
         let host = resolve_share_host(&state, &settings, &headers, None);
-        let scheme = if !settings.panel_cert_file.trim().is_empty() {
-            "https"
-        } else {
-            "http"
-        };
+        let scheme = state.listener_scheme;
         let host_fmt = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]")
         } else {
             host
         };
-        format!("{scheme}://{host_fmt}:{}", settings.panel_port)
+        format!("{scheme}://{host_fmt}:{}", state.listener_port)
     };
 
     let enriched: Vec<Value> = subs
         .into_iter()
-        .map(|s| {
-            let match_all = s.sub_id.eq_ignore_ascii_case("all") || s.sub_id == "*";
-            let node_count: usize = inbounds
-                .iter()
-                .filter(|i| i.enable)
-                .map(|i| {
-                    i.clients
-                        .iter()
-                        .filter(|c| c.enable && (match_all || c.sub_id == s.sub_id))
-                        .count()
-                })
-                .sum();
+        .map(|(s, node_count)| {
             let sub_url = format!("{base_url}/sub/{}", s.token);
             let mut v = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
             v["node_count"] = json!(node_count);
@@ -1075,10 +1049,17 @@ async fn api_save_settings(
     State(state): State<Arc<AppState>>,
     Json(s): Json<PanelSettings>,
 ) -> ApiResult {
-    state.db.save_settings(&s).map_err(bad_req)?;
-    state.set_base_path(&s.panel_base_path);
-    let _ = state.proc_mgr.reload_config().await;
-    ok_json(state.db.get_settings().map_err(internal_err)?)
+    // Finish applying or rolling back even if the browser disconnects.
+    let saved = tokio::spawn(async move {
+        let _operation = state.proc_mgr.operation.lock().await;
+        state.proc_mgr.apply_settings(&s).await?;
+        state.set_base_path(&s.panel_base_path);
+        state.db.get_settings()
+    })
+    .await
+    .map_err(internal_err)?
+    .map_err(|e| bad_req(format!("{e:#}")))?;
+    ok_json(saved)
 }
 
 #[derive(Deserialize)]
@@ -1107,10 +1088,14 @@ async fn api_change_password(
 async fn api_backup_db(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    let db_file = state.db.data_dir.join("panel.db");
-    let bytes = std::fs::read(&db_file).map_err(internal_err)?;
+    let db = state.db.clone();
+    let bytes = tokio::task::spawn_blocking(move || db.backup_snapshot())
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "no-store")
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(
             header::CONTENT_DISPOSITION,

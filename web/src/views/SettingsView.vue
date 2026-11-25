@@ -1,7 +1,12 @@
 <template>
   <div style="display: flex; flex-direction: column; gap: 16px">
     <a-card :title="t('settings.panelSection')" size="small">
-      <a-form layout="vertical">
+      <a-alert v-if="loadError" type="error" :message="loadError" show-icon>
+        <template #action>
+          <a-button size="small" @click="loadSettings">{{ t('app.refresh') }}</a-button>
+        </template>
+      </a-alert>
+      <a-form layout="vertical" :disabled="!loaded || saving">
         <a-row :gutter="12">
           <a-col :xs="24" :md="6">
             <a-form-item :label="t('settings.listenIp')">
@@ -32,6 +37,10 @@
             </a-form-item>
           </a-col>
         </a-row>
+
+        <a-form-item :label="t('settings.sessionTtl')">
+          <a-input-number v-model:value="form.session_ttl_hours" :min="1" :precision="0" />
+        </a-form-item>
 
         <a-divider orientation="left">{{ t('settings.shareSection') }}</a-divider>
         <a-row :gutter="12">
@@ -88,20 +97,20 @@
           />
         </a-form-item>
 
-        <a-space>
-          <a-button type="primary" :loading="saving" @click="saveAllSettings">
-            {{ t('app.save') }}
-          </a-button>
-          <a-button @click="downloadBackup">
-            💾 {{ t('settings.backupDb') }}
-          </a-button>
-        </a-space>
       </a-form>
+      <a-space>
+        <a-button type="primary" :disabled="!loaded" :loading="saving" @click="saveAllSettings">
+          {{ t('app.save') }}
+        </a-button>
+        <a-button @click="downloadBackup">
+          💾 {{ t('settings.backupDb') }}
+        </a-button>
+      </a-space>
     </a-card>
 
     <!-- Admin Credentials -->
     <a-card :title="t('settings.accountSection')" size="small">
-      <a-form layout="vertical">
+      <a-form layout="vertical" :disabled="!loaded">
         <a-row :gutter="12">
           <a-col :xs="24" :md="8">
             <a-form-item :label="t('settings.currPwd')" required>
@@ -135,6 +144,8 @@ import { api } from '../api';
 
 const emit = defineEmits(['loggedOut']);
 const { t } = useI18n();
+const loaded = ref(false);
+const loadError = ref('');
 const saving = ref(false);
 const updatingPwd = ref(false);
 
@@ -162,22 +173,27 @@ const pwdForm = reactive({
 });
 
 async function loadSettings() {
+  loaded.value = false;
+  loadError.value = '';
   try {
     const res = await api.getSettings();
     Object.assign(form, res.settings);
     pwdForm.new_username = res.admin_username || 'admin';
+    loaded.value = true;
   } catch (e) {
-    message.error(e.message);
+    loadError.value = e.message;
   }
 }
 
 onMounted(loadSettings);
 
 async function saveAllSettings() {
+  if (!loaded.value || saving.value) return;
   saving.value = true;
   try {
     const prevBase = window.__SHOES_BASE__ || '/';
     const saved = await api.saveSettings({ ...form });
+    Object.assign(form, saved);
     message.success(t('app.saveSuccess'));
     if (saved.panel_base_path !== prevBase) {
       const target = saved.panel_base_path === '/' ? '/' : `${saved.panel_base_path}/`;

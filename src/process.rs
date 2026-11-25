@@ -14,7 +14,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db::Database;
-use crate::yaml_gen::sync_and_apply_config;
+use crate::models::PanelSettings;
+use crate::yaml_gen::{sync_and_apply_config, validated_config};
 
 const MAX_LOG_LINES: usize = 1000;
 
@@ -53,6 +54,7 @@ impl Default for LogBuffer {
 
 pub struct ShoesProcessManager {
     db: Arc<Database>,
+    pub(crate) operation: AsyncMutex<()>,
     child: AsyncMutex<Option<Child>>,
     started_at: Mutex<Option<i64>>,
     last_error: Mutex<Option<String>>,
@@ -65,6 +67,7 @@ impl ShoesProcessManager {
     pub fn new(db: Arc<Database>) -> Arc<Self> {
         let mgr = Arc::new(Self {
             db,
+            operation: AsyncMutex::new(()),
             child: AsyncMutex::new(None),
             started_at: Mutex::new(None),
             last_error: Mutex::new(None),
@@ -188,12 +191,23 @@ impl ShoesProcessManager {
     }
 
     pub async fn start(&self) -> Result<ProcessStatus> {
+        let _operation = self.operation.lock().await;
+        self.start_locked().await
+    }
+
+    async fn start_locked(&self) -> Result<ProcessStatus> {
         self.desired_running.store(true, Ordering::SeqCst);
         if self.current_pid().await.is_some() {
             return Ok(self.status().await);
         }
 
         let settings = self.db.get_settings()?;
+        sync_and_apply_config(&self.db, None).await?;
+        self.launch(&settings).await?;
+        Ok(self.status().await)
+    }
+
+    async fn launch(&self, settings: &PanelSettings) -> Result<()> {
         let bin = PathBuf::from(settings.shoes_bin_path.trim());
         if !bin.exists() {
             let err = format!(
@@ -204,9 +218,6 @@ impl ShoesProcessManager {
             Self::push_log(&self.logs, "panel", err.clone());
             return Err(anyhow!(err));
         }
-
-        // Always sync and validate config before starting
-        sync_and_apply_config(&self.db, None).await?;
 
         let cfg_path = PathBuf::from(settings.shoes_config_path.trim());
         let mut cmd = Command::new(&bin);
@@ -258,30 +269,39 @@ impl ShoesProcessManager {
             return Err(anyhow!(msg));
         }
 
-        Ok(self.status().await)
+        Ok(())
     }
 
     pub async fn stop(&self) -> Result<ProcessStatus> {
+        let _operation = self.operation.lock().await;
         self.desired_running.store(false, Ordering::SeqCst);
-        let mut guard = self.child.lock().await;
-        if let Some(mut child) = guard.take() {
-            let pid = child.id().unwrap_or(0);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Self::push_log(&self.logs, "panel", format!("Stopped shoes (PID {pid})"));
-        }
-        *self.started_at.lock() = None;
-        drop(guard);
+        self.stop_child().await?;
         Ok(self.status().await)
     }
 
+    async fn stop_child(&self) -> Result<()> {
+        let mut guard = self.child.lock().await;
+        if let Some(child) = guard.as_mut() {
+            let pid = child.id().unwrap_or(0);
+            if child.try_wait()?.is_none() {
+                child.kill().await?;
+            }
+            *guard = None;
+            Self::push_log(&self.logs, "panel", format!("Stopped shoes (PID {pid})"));
+        }
+        *self.started_at.lock() = None;
+        Ok(())
+    }
+
     pub async fn restart(&self) -> Result<ProcessStatus> {
-        let _ = self.stop().await;
+        let _operation = self.operation.lock().await;
+        self.stop_child().await?;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        self.start().await
+        self.start_locked().await
     }
 
     pub async fn reload_config(&self) -> Result<String> {
+        let _operation = self.operation.lock().await;
         let pid = self.current_pid().await;
         let yaml = sync_and_apply_config(&self.db, pid).await?;
         Self::push_log(
@@ -296,11 +316,97 @@ impl ShoesProcessManager {
         Ok(yaml)
     }
 
+    // Caller holds operation until the new base path has also been published.
+    pub(crate) async fn apply_settings(&self, candidate: &PanelSettings) -> Result<()> {
+        crate::db::validated_base_path(&candidate.panel_base_path)?;
+        candidate.listen_addr()?;
+        anyhow::ensure!(candidate.panel_port > 0, "Panel port must be positive");
+        anyhow::ensure!(
+            candidate.session_ttl_hours > 0,
+            "Session duration must be at least one hour"
+        );
+        let cert = candidate.panel_cert_file.trim();
+        let key = candidate.panel_key_file.trim();
+        anyhow::ensure!(
+            cert.is_empty() == key.is_empty(),
+            "Provide both the panel TLS certificate and key, or clear both"
+        );
+
+        let old = self.db.get_settings()?;
+        if !cert.is_empty() && (cert != old.panel_cert_file || key != old.panel_key_file) {
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .context("Failed to load panel TLS certificate and key")?;
+        }
+        let yaml = validated_config(&self.db, candidate).await?;
+        let path = std::path::Path::new(candidate.shoes_config_path.trim());
+        let previous = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
+        };
+        let changed = previous.as_deref() != Some(yaml.as_bytes());
+        // Controller credentials and some extra YAML settings are startup-only in Shoes.
+        // A settings save that changes the rendered config must use the new config at launch.
+        let restart = self.current_pid().await.is_some()
+            && (changed
+                || old.shoes_config_path != candidate.shoes_config_path.trim()
+                || old.shoes_bin_path != candidate.shoes_bin_path.trim());
+        if restart {
+            anyhow::ensure!(
+                std::path::Path::new(candidate.shoes_bin_path.trim()).is_file(),
+                "Shoes executable not found"
+            );
+            self.stop_child().await?;
+        }
+
+        let applied = async {
+            if changed {
+                std::fs::write(path, &yaml)
+                    .with_context(|| format!("Cannot write {}", path.display()))?;
+            }
+            if restart {
+                self.launch(candidate).await?;
+            }
+            self.db.save_settings(candidate)
+        }
+        .await;
+        if let Err(error) = applied {
+            let restored: Result<()> = async {
+                if restart {
+                    self.stop_child().await?;
+                }
+                if changed {
+                    if let Some(bytes) = previous {
+                        if std::fs::read(path).ok().as_ref() != Some(&bytes) {
+                            std::fs::write(path, bytes)?;
+                        }
+                    } else if path.exists() {
+                        std::fs::remove_file(path)?;
+                    }
+                }
+                if restart {
+                    self.launch(&old).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(rollback) = restored {
+                anyhow::bail!(
+                    "{error:#}; restoring the previous configuration failed: {rollback:#}"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn spawn_watchdog(mgr: Arc<Self>) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(4));
             loop {
                 interval.tick().await;
+                let _operation = mgr.operation.lock().await;
                 if !mgr.desired_running.load(Ordering::SeqCst) {
                     continue;
                 }
@@ -318,7 +424,7 @@ impl ShoesProcessManager {
                         "Watchdog detected shoes is not running; attempting automatic restart..."
                             .to_string(),
                     );
-                    if let Err(e) = mgr.start().await {
+                    if let Err(e) = mgr.start_locked().await {
                         *mgr.last_error.lock() = Some(e.to_string());
                     }
                 }

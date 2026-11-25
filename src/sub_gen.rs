@@ -141,6 +141,9 @@ fn effective_reality_pubkey(ib: &Inbound) -> String {
 /// Resolves effective TLS SNI: if user left SNI empty on a self-signed (`allow_insecure`) inbound,
 /// fallback to `"localhost"` (which matches our generated self-signed cert SAN) so QUIC/TLS clients don't fail on empty SNI.
 fn effective_tls_sni(ib: &Inbound) -> String {
+    if ib.uses_auto_quic_cert() {
+        return "localhost".into();
+    }
     let sni = ib.stream_settings.tls.sni.trim();
     if !sni.is_empty() {
         sni.to_string()
@@ -169,6 +172,14 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
     let addr = format_host(host);
     let port = ib.port;
     let tag = enc_fragment(name);
+
+    if !can_export_transport(ib)
+        || (ss.network == "ws" && ss.ws.headers.keys().any(|key| !key.eq_ignore_ascii_case("host")))
+        || (ss.security == "reality" && matches!(ib.protocol.as_str(), "vmess" | "naiveproxy"))
+        || (ss.security == "tls" && matches!(ib.protocol.as_str(), "socks" | "mixed"))
+    {
+        return String::new();
+    }
 
     match ib.protocol.as_str() {
         "vless" => {
@@ -231,8 +242,8 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 params.push("headerType=none".to_string());
             } else if net == "ws" {
                 params.push(format!("path={}", enc_path_param(ss.ws.path.trim())));
-                if !ss.ws.host.trim().is_empty() {
-                    params.push(format!("host={}", enc_query(ss.ws.host.trim())));
+                if !ss.ws.host_header().is_empty() {
+                    params.push(format!("host={}", enc_query(ss.ws.host_header())));
                 }
             } else if net == "xhttp" {
                 params.push(format!("path={}", enc_path_param(ss.xhttp.path.trim())));
@@ -241,6 +252,10 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 }
                 if !ss.xhttp.mode.trim().is_empty() {
                     params.push(format!("mode={}", enc_query(ss.xhttp.mode.trim())));
+                }
+                if !ss.xhttp.headers.is_empty() {
+                    let extra = json!({ "headers": ss.xhttp.headers }).to_string();
+                    params.push(format!("extra={}", utf8_percent_encode(&extra, percent_encoding::NON_ALPHANUMERIC)));
                 }
             }
 
@@ -255,13 +270,13 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
         }
         "vmess" => {
             let cipher = match ps.cipher.trim() {
-                "" | "any" => "auto",
+                "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
             };
             let net = if ss.network == "ws" { "ws" } else { "tcp" };
             let tls_str = if ss.security == "tls" { "tls" } else { "" };
             let host_hdr = if net == "ws" {
-                ss.ws.host.trim()
+                ss.ws.host_header()
             } else {
                 ""
             };
@@ -326,11 +341,13 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 if ss.tls.allow_insecure {
                     params.push("allowInsecure=1".to_string());
                 }
+            } else {
+                params.push("security=none".to_string());
             }
             if ss.network == "ws" {
                 params.push(format!("path={}", enc_path_param(ss.ws.path.trim())));
-                if !ss.ws.host.trim().is_empty() {
-                    params.push(format!("host={}", enc_query(ss.ws.host.trim())));
+                if !ss.ws.host_header().is_empty() {
+                    params.push(format!("host={}", enc_query(ss.ws.host_header())));
                 }
             }
             format!(
@@ -462,7 +479,7 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
         }
         "snell" => {
             format!(
-                "{} = snell, {}, {}, psk={}, version=4, reuse=true",
+                "{} = snell, {}, {}, psk={}, version=3, reuse=true",
                 name,
                 host.trim(),
                 port,
@@ -561,18 +578,37 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
     };
 
     let transported = if !ib.is_quic() && ss.network == "ws" {
-        json!({
-            "type": "websocket",
-            "matching_path": ss.ws.path.trim(),
-            "protocol": inner
-        })
+        let mut ws = json!({"type": "websocket", "protocol": inner});
+        if !ss.ws.path.trim().is_empty() {
+            ws["matching_path"] = json!(ss.ws.path.trim());
+        }
+        let headers = ss.ws.matching_headers();
+        if !headers.is_empty() {
+            ws["matching_headers"] = json!(headers);
+        }
+        if ss.ws.max_early_data > 0 {
+            ws["max_early_data"] = json!(ss.ws.max_early_data);
+            if !ss.ws.early_data_header_name.trim().is_empty() {
+                ws["early_data_header_name"] = json!(ss.ws.early_data_header_name.trim());
+            }
+        }
+        ws
     } else if !ib.is_quic() && ss.network == "xhttp" {
-        json!({
+        let mut xhttp = json!({
             "type": "xhttp",
-            "path": ss.xhttp.path.trim(),
             "mode": if ss.xhttp.mode.trim().is_empty() { "auto" } else { ss.xhttp.mode.trim() },
             "protocol": inner
-        })
+        });
+        if !ss.xhttp.path.trim().is_empty() {
+            xhttp["path"] = json!(ss.xhttp.path.trim());
+        }
+        if !ss.xhttp.host.trim().is_empty() {
+            xhttp["host"] = json!(ss.xhttp.host.trim());
+        }
+        if !ss.xhttp.headers.is_empty() {
+            xhttp["headers"] = json!(ss.xhttp.headers);
+        }
+        xhttp
     } else {
         inner
     };
@@ -585,7 +621,9 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         json!({
             "name": name,
             "address": target_addr,
+            "transport": "quic",
             "quic_settings": {
+                "alpn_protocols": if ss.tls.alpn.is_empty() { json!(["h3"]) } else { json!(ss.tls.alpn) },
                 "sni_hostname": sni,
                 "verify": !ss.tls.allow_insecure
             },
@@ -600,7 +638,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision;
-        json!({
+        let mut hop = json!({
             "name": name,
             "address": target_addr,
             "protocol": {
@@ -611,14 +649,18 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
                 "vision": vision,
                 "protocol": transported
             }
-        })
+        });
+        if !ss.reality.mldsa65_verify.trim().is_empty() {
+            hop["protocol"]["mldsa65_verify"] = json!(ss.reality.mldsa65_verify.trim());
+        }
+        hop
     } else if ss.security == "tls" {
         let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision;
         let mut sni = effective_tls_sni(ib);
         if sni.is_empty() {
             sni = host.trim().to_string();
         }
-        json!({
+        let mut hop = json!({
             "name": name,
             "address": target_addr,
             "protocol": {
@@ -628,7 +670,13 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
                 "vision": vision,
                 "protocol": transported
             }
-        })
+        });
+        if ib.protocol == "naiveproxy" {
+            hop["protocol"]["alpn_protocols"] = json!(["h2"]);
+        } else if !ss.tls.alpn.is_empty() {
+            hop["protocol"]["alpn_protocols"] = json!(ss.tls.alpn);
+        }
+        hop
     } else {
         json!({
             "name": name,
@@ -653,17 +701,33 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
     serde_yaml::to_string(&full).unwrap_or_default()
 }
 
+// These formats encode transports per protocol. A plain TCP node cannot reach a
+// listener that expects a WebSocket, XHTTP, QUIC, or TLS handshake first.
+fn can_export_transport(ib: &Inbound) -> bool {
+    let ss = &ib.stream_settings;
+    match ib.protocol.as_str() {
+        "tuic" | "hysteria2" => true,
+        "shadowsocks" | "snell" => ss.network == "tcp" && ss.security == "none",
+        "vless" => matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp"),
+        "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
+        _ => ss.network == "tcp",
+    }
+}
+
 fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Option<JsonValue> {
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let server = host.trim();
     let port = ib.port;
 
-    match ib.protocol.as_str() {
+    if !can_export_transport(ib) {
+        return None;
+    }
+    if ib.protocol == "trojan" && ss.security == "none" {
+        return None;
+    }
+    let mut obj = match ib.protocol.as_str() {
         "vless" => {
-            if ss.network == "xhttp" {
-                return None;
-            }
             let mut obj = json!({
                 "name": name,
                 "type": "vless",
@@ -673,23 +737,10 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "udp": ps.udp_enabled,
                 "network": if ss.network == "ws" { "ws" } else { "tcp" },
             });
-            if ss.security == "reality" {
-                let fp = if ss.reality.fingerprint.trim().is_empty() {
-                    "chrome"
-                } else {
-                    ss.reality.fingerprint.trim()
-                };
-                obj["tls"] = json!(true);
-                obj["servername"] = json!(ss.reality.sni.trim());
-                obj["client-fingerprint"] = json!(fp);
-                if ss.network == "tcp" && ss.reality.vision {
-                    obj["flow"] = json!("xtls-rprx-vision");
-                }
-                obj["reality-opts"] = json!({
-                    "public-key": effective_reality_pubkey(ib),
-                    "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
-                });
-            } else if ss.security == "tls" {
+            if ss.security == "reality" && ss.network == "tcp" && ss.reality.vision {
+                obj["flow"] = json!("xtls-rprx-vision");
+            }
+            if ss.security == "tls" {
                 obj["tls"] = json!(true);
                 let sni = effective_tls_sni(ib);
                 if !sni.is_empty() {
@@ -703,18 +754,20 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                     obj["flow"] = json!("xtls-rprx-vision");
                 }
             }
-            if ss.network == "ws" {
-                let mut ws_opts = json!({ "path": ss.ws.path.trim() });
-                if !ss.ws.host.trim().is_empty() {
-                    ws_opts["headers"] = json!({ "Host": ss.ws.host.trim() });
-                }
-                obj["ws-opts"] = ws_opts;
+            if ss.network == "xhttp" {
+                obj["network"] = json!("xhttp");
+                obj["xhttp-opts"] = json!({
+                    "path": ss.xhttp.path.trim(),
+                    "host": ss.xhttp.host.trim(),
+                    "mode": ss.xhttp.mode.trim(),
+                    "headers": ss.xhttp.headers,
+                });
             }
             Some(obj)
         }
         "vmess" => {
             let cipher = match ps.cipher.trim() {
-                "" | "any" => "auto",
+                "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
             };
             let mut obj = json!({
@@ -736,13 +789,6 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                     obj["servername"] = json!(sni);
                 }
             }
-            if ss.network == "ws" {
-                let mut ws_opts = json!({ "path": ss.ws.path.trim() });
-                if !ss.ws.host.trim().is_empty() {
-                    ws_opts["headers"] = json!({ "Host": ss.ws.host.trim() });
-                }
-                obj["ws-opts"] = ws_opts;
-            }
             Some(obj)
         }
         "trojan" => {
@@ -755,27 +801,12 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "udp": true,
                 "network": if ss.network == "ws" { "ws" } else { "tcp" },
             });
-            if ss.security == "reality" {
-                let fp = if ss.reality.fingerprint.trim().is_empty() {
-                    "chrome"
-                } else {
-                    ss.reality.fingerprint.trim()
-                };
-                obj["sni"] = json!(ss.reality.sni.trim());
-                obj["client-fingerprint"] = json!(fp);
-                obj["reality-opts"] = json!({
-                    "public-key": effective_reality_pubkey(ib),
-                    "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
-                });
-            } else {
+            if ss.security == "tls" {
                 obj["skip-cert-verify"] = json!(ss.tls.allow_insecure);
                 let sni = effective_tls_sni(ib);
                 if !sni.is_empty() {
                     obj["sni"] = json!(sni);
                 }
-            }
-            if ss.network == "ws" {
-                obj["ws-opts"] = json!({ "path": ss.ws.path.trim() });
             }
             Some(obj)
         }
@@ -853,7 +884,7 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             "server": server,
             "port": port,
             "psk": c.password.trim(),
-            "version": 4,
+            "version": 3,
             "udp": ps.udp_enabled,
         })),
         "socks" | "mixed" => {
@@ -885,7 +916,41 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             Some(obj)
         }
         _ => None,
+    }?;
+    if ss.security == "reality" {
+        let sni_key = if matches!(ib.protocol.as_str(), "vless" | "vmess") { "servername" } else { "sni" };
+        obj[sni_key] = json!(ss.reality.sni.trim());
+        obj["tls"] = json!(true);
+        let fp = ss.reality.fingerprint.trim();
+        obj["client-fingerprint"] = json!(if fp.is_empty() { "chrome" } else { fp });
+        obj["reality-opts"] = json!({
+            "public-key": effective_reality_pubkey(ib),
+            "short-id": ss.reality.short_ids.first().map(|s| s.trim()).unwrap_or("")
+        });
     }
+    if ss.network == "ws" {
+        let mut ws_opts = json!({ "path": ss.ws.path.trim() });
+        let headers = ss.ws.matching_headers();
+        if !headers.is_empty() {
+            ws_opts["headers"] = json!(headers);
+        }
+        if ss.ws.max_early_data > 0 {
+            ws_opts["max-early-data"] = json!(ss.ws.max_early_data);
+            if !ss.ws.early_data_header_name.trim().is_empty() {
+                ws_opts["early-data-header-name"] = json!(ss.ws.early_data_header_name.trim());
+            }
+        }
+        obj["ws-opts"] = ws_opts;
+    }
+    if ss.security == "tls" && matches!(ib.protocol.as_str(), "socks" | "mixed" | "http") {
+        obj["tls"] = json!(true);
+        obj["skip-cert-verify"] = json!(ss.tls.allow_insecure);
+        let sni = effective_tls_sni(ib);
+        if !sni.is_empty() {
+            obj["sni"] = json!(sni);
+        }
+    }
+    Some(obj)
 }
 
 fn build_singbox_outbound(
@@ -937,7 +1002,13 @@ fn build_singbox_outbound(
         None
     };
 
-    match ib.protocol.as_str() {
+    if !can_export_transport(ib) {
+        return None;
+    }
+    if ib.protocol == "socks" && ss.security != "none" {
+        return None;
+    }
+    let mut obj = match ib.protocol.as_str() {
         "vless" => {
             if ss.network == "xhttp" {
                 return None;
@@ -958,17 +1029,11 @@ fn build_singbox_outbound(
             if let Some(t) = tls_block {
                 obj["tls"] = t;
             }
-            if ss.network == "ws" {
-                obj["transport"] = json!({
-                    "type": "ws",
-                    "path": ss.ws.path.trim(),
-                });
-            }
             Some(obj)
         }
         "vmess" => {
             let cipher = match ps.cipher.trim() {
-                "" | "any" => "auto",
+                "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
             };
             let mut obj = json!({
@@ -982,12 +1047,6 @@ fn build_singbox_outbound(
             if let Some(t) = tls_block {
                 obj["tls"] = t;
             }
-            if ss.network == "ws" {
-                obj["transport"] = json!({
-                    "type": "ws",
-                    "path": ss.ws.path.trim(),
-                });
-            }
             Some(obj)
         }
         "trojan" => {
@@ -1000,12 +1059,6 @@ fn build_singbox_outbound(
             });
             if let Some(t) = tls_block {
                 obj["tls"] = t;
-            }
-            if ss.network == "ws" {
-                obj["transport"] = json!({
-                    "type": "ws",
-                    "path": ss.ws.path.trim(),
-                });
             }
             Some(obj)
         }
@@ -1068,6 +1121,19 @@ fn build_singbox_outbound(
             }
             Some(obj)
         }
+        "http" | "mixed" if ib.protocol == "http" || ss.security == "tls" => {
+            let mut obj = json!({
+                "tag": name, "type": "http", "server": server, "server_port": port,
+            });
+            if let Some(t) = tls_block {
+                obj["tls"] = t;
+            }
+            if !c.username.trim().is_empty() {
+                obj["username"] = json!(c.username.trim());
+                obj["password"] = json!(c.password.trim());
+            }
+            Some(obj)
+        }
         "socks" | "mixed" => {
             let mut obj = json!({
                 "tag": name,
@@ -1082,7 +1148,24 @@ fn build_singbox_outbound(
             Some(obj)
         }
         _ => None,
+    }?;
+    if ss.network == "ws" {
+        obj["transport"] = json!({
+            "type": "ws",
+            "path": ss.ws.path.trim(),
+        });
+        let headers = ss.ws.matching_headers();
+        if !headers.is_empty() {
+            obj["transport"]["headers"] = json!(headers);
+        }
+        if ss.ws.max_early_data > 0 {
+            obj["transport"]["max_early_data"] = json!(ss.ws.max_early_data);
+            if !ss.ws.early_data_header_name.trim().is_empty() {
+                obj["transport"]["early_data_header_name"] = json!(ss.ws.early_data_header_name.trim());
+            }
+        }
     }
+    Some(obj)
 }
 
 /// Ensures fields like `short-id`, `password`, `uuid`, `psk` in Clash YAML are never coerced

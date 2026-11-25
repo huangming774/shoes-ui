@@ -232,6 +232,7 @@
           <a-col :span="8">
             <a-form-item label="Mode">
               <a-select v-model:value="form.stream_settings.tls.cert_mode">
+                <a-select-option v-if="isQuicProtocol" value="auto">{{ t('inbounds.certModeAuto') }}</a-select-option>
                 <a-select-option value="source">{{ t('inbounds.certModeSource') }}</a-select-option>
                 <a-select-option value="files">{{ t('inbounds.certModeFiles') }}</a-select-option>
               </a-select>
@@ -246,13 +247,14 @@
               </a-select>
             </a-form-item>
           </a-col>
-          <a-col :span="8">
+          <a-col v-if="form.stream_settings.tls.cert_mode !== 'auto'" :span="8">
             <a-form-item :label="t('inbounds.sni')">
               <a-input v-model:value="form.stream_settings.tls.sni" placeholder="proxy.example.com" />
             </a-form-item>
           </a-col>
         </a-row>
 
+        <a-alert v-if="form.stream_settings.tls.cert_mode === 'auto'" type="info" show-icon :message="t('inbounds.autoCertTrust')" />
         <a-row v-if="form.stream_settings.tls.cert_mode === 'files'" :gutter="12">
           <a-col :span="12">
             <a-form-item :label="t('inbounds.certFile')" required>
@@ -520,6 +522,7 @@ watch(
     if (props.record && props.record.id > 0) {
       const cloned = JSON.parse(JSON.stringify(props.record));
       Object.assign(form, blankInbound(), cloned);
+      if (isQuicProtocol.value) selectAutoCertIfEmpty();
       quotaGb.value = form.total_quota_bytes > 0 ? +(form.total_quota_bytes / 1073741824).toFixed(2) : 0;
       expiryDayjs.value = form.expiry_time > 0 ? dayjs(form.expiry_time) : null;
       alpnStr.value = (form.stream_settings.tls.alpn || []).join(',');
@@ -552,13 +555,25 @@ watch(
   }
 );
 
+function selectAutoCertIfEmpty() {
+  const tls = form.stream_settings.tls;
+  if (tls.cert_mode === 'source' && !tls.certificate_source && !tls.cert_file && !tls.key_file) {
+    tls.cert_mode = 'auto';
+  }
+}
+
 async function onProtocolChange(proto) {
   form.remark = `${proto.toUpperCase()}-${form.port}`;
   if (['hysteria2', 'tuic'].includes(proto)) {
+    selectAutoCertIfEmpty();
     form.stream_settings.network = 'quic';
     form.stream_settings.security = 'tls';
   } else {
-    if (form.stream_settings.network === 'quic') form.stream_settings.network = 'tcp';
+    if (form.stream_settings.tls.cert_mode === 'auto') form.stream_settings.tls.cert_mode = 'source';
+    const network = form.stream_settings.network;
+    if (network === 'quic' || (network === 'ws' && !supportsWs.value) || (network === 'xhttp' && !supportsXhttp.value)) {
+      form.stream_settings.network = 'tcp';
+    }
     if (proto === 'vless') {
       form.stream_settings.security = 'reality';
     } else if (['trojan', 'anytls', 'naiveproxy'].includes(proto)) {

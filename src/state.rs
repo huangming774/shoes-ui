@@ -13,6 +13,8 @@ pub struct AppState {
     pub proc_mgr: Arc<ShoesProcessManager>,
     pub monitor: Arc<RuntimeMonitor>,
     pub sessions: SessionStore,
+    pub listener_scheme: &'static str,
+    pub listener_port: u16,
     pub base_path: RwLock<String>,
     pub detected_public_ip: RwLock<String>,
 }
@@ -22,17 +24,16 @@ impl AppState {
         db: Arc<Database>,
         proc_mgr: Arc<ShoesProcessManager>,
         monitor: Arc<RuntimeMonitor>,
+        settings: &crate::models::PanelSettings,
     ) -> Arc<Self> {
-        let bp = db
-            .get_settings()
-            .map(|s| normalize_base_path(&s.panel_base_path))
-            .unwrap_or_else(|_| "/".to_string());
         let st = Arc::new(Self {
             db,
             proc_mgr,
             monitor,
             sessions: SessionStore::default(),
-            base_path: RwLock::new(bp),
+            base_path: RwLock::new(settings.panel_base_path.clone()),
+            listener_scheme: settings.scheme(),
+            listener_port: settings.panel_port,
             detected_public_ip: RwLock::new(String::new()),
         });
         Self::spawn_public_ip_detector(st.clone());

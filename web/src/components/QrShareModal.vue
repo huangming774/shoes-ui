@@ -20,7 +20,7 @@
             <img :src="qrDataUrls[idx]" alt="QR Code" style="width: 220px; height: 220px; display: block" />
           </div>
 
-          <div style="width: 100%">
+          <div v-if="item.uri" style="width: 100%">
             <div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 600">
               <span>URI / Share Link</span>
               <a-button size="small" type="primary" @click="doCopy(item.uri)">

@@ -23,7 +23,8 @@ impl Default for SessionStore {
 impl SessionStore {
     pub fn create_session(&self, username: &str, ttl_hours: u64) -> String {
         let now = Utc::now().timestamp_millis();
-        let expires = now + (ttl_hours.max(1) as i64) * 3600 * 1000;
+        let lifetime_ms = ttl_hours.max(1).saturating_mul(3_600_000);
+        let expires = now.saturating_add(i64::try_from(lifetime_ms).unwrap_or(i64::MAX));
         let token = generate_random_alnum(40);
         let mut guard = self.sessions.lock();
         guard.retain(|_, (_, exp)| *exp > now);

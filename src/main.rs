@@ -15,14 +15,13 @@ use axum::{
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
 use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer};
 
 use crate::api::build_inner_router;
-use crate::db::{normalize_base_path, Database};
+use crate::db::{validated_base_path, Database};
 use crate::monitor::RuntimeMonitor;
 use crate::process::ShoesProcessManager;
 use crate::state::AppState;
@@ -150,12 +149,15 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         "setting" => {
+            let base_path = base_path_arg
+                .as_deref()
+                .map(validated_base_path)
+                .transpose()?;
             if let Some(p) = port_arg {
                 db.set_setting_kv("panel_port", &p.to_string())?;
                 println!("Updated panel_port = {p}");
             }
-            if let Some(bp) = base_path_arg {
-                let norm = normalize_base_path(&bp);
+            if let Some(norm) = base_path {
                 db.set_setting_kv("panel_base_path", &norm)?;
                 println!("Updated panel_base_path = {norm}");
             }
@@ -172,11 +174,7 @@ async fn main() -> Result<()> {
         "info" => {
             let s = db.get_settings()?;
             let u = db.get_admin_username()?;
-            let scheme = if !s.panel_cert_file.is_empty() {
-                "https"
-            } else {
-                "http"
-            };
+            let scheme = s.scheme();
             let disp_host = if s.public_host.trim().is_empty() {
                 "<auto>"
             } else {
@@ -222,12 +220,14 @@ async fn main() -> Result<()> {
     }
 
     let settings = db.get_settings()?;
+    let addr = settings.listen_addr()?;
+    let scheme = settings.scheme();
     let proc_mgr = ShoesProcessManager::new(db.clone());
     let monitor = RuntimeMonitor::new(db.clone(), proc_mgr.clone());
-    let state = AppState::new(db.clone(), proc_mgr.clone(), monitor);
+    let state = AppState::new(db.clone(), proc_mgr.clone(), monitor, &settings);
 
     // Ensure initial shoes.config.yaml is generated and optionally auto-start shoes
-    if let Err(e) = yaml_gen::sync_and_apply_config(&db, None).await {
+    if let Err(e) = proc_mgr.reload_config().await {
         tracing::warn!("Initial shoes config sync note: {e}");
     }
     if settings.shoes_auto_start && PathBuf::from(settings.shoes_bin_path.trim()).exists() {
@@ -248,7 +248,10 @@ async fn main() -> Result<()> {
         async move {
             let path = req.uri().path().to_string();
             // Always allow public /sub/{token} at root regardless of panel_base_path
-            if path.starts_with("/sub/") {
+            if path
+                .strip_prefix("/sub/")
+                .is_some_and(|token| !token.is_empty() && !token.contains('/'))
+            {
                 return inner.oneshot(req).await;
             }
             let bp = st.get_base_path();
@@ -278,19 +281,6 @@ async fn main() -> Result<()> {
             Ok((StatusCode::NOT_FOUND, "404 Not Found").into_response())
         }
     });
-
-    let bind_str = format!("{}:{}", settings.panel_listen.trim(), settings.panel_port);
-    let addr: SocketAddr = bind_str
-        .parse()
-        .with_context(|| format!("invalid panel bind address '{bind_str}'"))?;
-
-    let scheme =
-        if !settings.panel_cert_file.trim().is_empty() && !settings.panel_key_file.trim().is_empty()
-        {
-            "https"
-        } else {
-            "http"
-        };
 
     tracing::info!(
         "shoes-panel listening on {}://{}{}",
@@ -325,6 +315,192 @@ mod tests {
     use super::*;
     use crate::db::default_client_for_inbound;
     use crate::models::*;
+
+    #[tokio::test]
+    async fn native_quic_generates_and_reuses_a_certificate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+        for (protocol, port) in [("tuic", 21000), ("hysteria2", 21001)] {
+            let ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+                "protocol": protocol, "remark": protocol, "port": port
+            }))?)?;
+            assert!(ib.uses_auto_quic_cert());
+        }
+        let settings = db.get_settings()?;
+        let yaml = yaml_gen::validated_config(&db, &settings).await?;
+        let docs: Vec<serde_yaml::Value> = serde_yaml::from_str(&yaml)?;
+        let cert = dir.path().join("certs/auto-quic/cert.pem");
+        let pem = std::fs::read(&cert)?;
+        let servers: Vec<_> = docs.iter().filter(|v| v["transport"] == "quic").collect();
+        assert_eq!(servers.len(), 2);
+        for server in servers {
+            assert_eq!(PathBuf::from(server["quic_settings"]["cert"].as_str().unwrap()), cert);
+            assert!(PathBuf::from(server["quic_settings"]["key"].as_str().unwrap()).is_file());
+        }
+        yaml_gen::validated_config(&db, &settings).await?;
+        assert_eq!(std::fs::read(cert)?, pem);
+        Ok(())
+    }
+
+    #[test]
+    fn vmess_ws_without_tls_keeps_host_in_client_exports() -> anyhow::Result<()> {
+        let ib: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "vmess", "remark": "ws", "port": 20000,
+            "stream_settings": {"network": "ws", "security": "none",
+                "ws": {"path": "/chat", "host": "ws.example.test"}},
+            "clients": [{"name": "test", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?;
+        let share = sub_gen::build_client_share_info(&ib, &ib.clients[0], "127.0.0.1");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&share.shoes_client_yaml)?;
+        let protocol = &doc[0]["rules"][0]["client_chain"]["protocol"];
+        assert_eq!(protocol["type"], "websocket");
+        assert_eq!(protocol["matching_headers"]["Host"], "ws.example.test");
+        assert_eq!(protocol["matching_path"], "/chat");
+        let sub = sub_gen::generate_subscription(&[ib], "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson);
+        let doc: serde_json::Value = serde_json::from_str(&sub.body)?;
+        let node = doc["outbounds"].as_array().unwrap().iter().find(|v| v["type"] == "vmess").unwrap();
+        assert_eq!(node["transport"]["headers"]["Host"], "ws.example.test");
+        assert!(node.get("tls").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn xhttp_exports_preserve_handshake_fields() -> anyhow::Result<()> {
+        let mut ib: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "vless", "remark": "node", "port": 21000,
+            "stream_settings": {"network": "xhttp", "security": "tls",
+                "xhttp": {"host": "edge.test", "path": "/data", "mode": "packet-up",
+                    "headers": {"X-Route": "edge"}},
+                "tls": {"alpn": ["h2"]}},
+            "clients": [{"name": "user", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?;
+        let share = sub_gen::build_client_share_info(&ib, &ib.clients[0], "localhost");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&share.shoes_client_yaml)?;
+        let tls = &doc[0]["rules"][0]["client_chain"]["protocol"];
+        assert_eq!(tls["alpn_protocols"][0], "h2");
+        let xhttp = &tls["protocol"];
+        assert_eq!(xhttp["host"], "edge.test");
+        assert_eq!(xhttp["headers"]["X-Route"], "edge");
+        assert_eq!(xhttp["path"], "/data");
+        assert_eq!(xhttp["mode"], "packet-up");
+        assert!(share.uri.contains("extra="));
+        let clash = sub_gen::generate_subscription(std::slice::from_ref(&ib), "*", "localhost", sub_gen::SubFormat::ClashYaml);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&clash.body)?;
+        assert_eq!(doc["proxies"][0]["xhttp-opts"]["headers"]["X-Route"], "edge");
+
+        ib.protocol = "shadowsocks".into();
+        assert!(sub_gen::build_uri(&ib, &ib.clients[0], "localhost", "node").is_empty());
+        let clash = sub_gen::generate_subscription(&[ib], "*", "localhost", sub_gen::SubFormat::ClashYaml);
+        let doc: serde_yaml::Value = serde_yaml::from_str(&clash.body)?;
+        assert!(doc["proxies"].as_sequence().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reality_dest_is_rejected_before_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("test.db"), dir.path())?;
+        let mut ib: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "vless", "remark": "node", "port": 21000,
+            "stream_settings": {"network": "tcp", "security": "reality",
+                "reality": {"sni": "localhost", "private_key": "test"}},
+            "clients": [{"name": "user"}]
+        }))?;
+        for dest in ["127.0.0.1:443", "[::1]:443"] {
+            ib.stream_settings.reality.dest = dest.into();
+            let result = yaml_gen::build_shoes_yaml(dir.path(), &db.get_settings()?, &[], &[], &[], std::slice::from_ref(&ib));
+            assert!(format!("{:#}", result.unwrap_err()).contains("DNS hostname"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backup_contains_committed_wal_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("live.db"), tmp.path()).unwrap();
+        db.set_setting_kv("public_host", "updated.example").unwrap();
+
+        let backup = tmp.path().join("download.db");
+        std::fs::write(&backup, db.backup_snapshot().unwrap()).unwrap();
+        let copy = rusqlite::Connection::open(&backup).unwrap();
+        let integrity: String = copy
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let host: String = copy
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'public_host'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(host, "updated.example");
+    }
+
+    #[test]
+    fn reserved_paths_and_ipv6_listener() {
+        for path in ["/sub", "sub/", "/sub/team"] {
+            assert!(validated_base_path(path).is_err());
+        }
+        assert_eq!(
+            validated_base_path("sub-panel/team/").unwrap(),
+            "/sub-panel/team"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("test.db"), tmp.path()).unwrap();
+        let mut s = db.get_settings().unwrap();
+        s.panel_port = 54321;
+        for host in ["::1", "[::1]"] {
+            s.panel_listen = host.into();
+            assert_eq!(s.listen_addr().unwrap().to_string(), "[::1]:54321");
+        }
+        s.panel_cert_file = "cert.pem".into();
+        assert_eq!(s.scheme(), "http");
+        s.panel_key_file = "key.pem".into();
+        assert_eq!(s.scheme(), "https");
+    }
+
+    #[tokio::test]
+    async fn failed_settings_save_preserves_database_and_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("panel.db");
+        let db = Arc::new(Database::open(&file, tmp.path()).unwrap());
+        db.set_setting_kv(
+            "shoes_bin_path",
+            tmp.path().join("absent").to_str().unwrap(),
+        )
+        .unwrap();
+        let manager = ShoesProcessManager::new(db.clone());
+        let initial = db.get_settings().unwrap();
+        manager.apply_settings(&initial).await.unwrap();
+        let old_yaml = std::fs::read(&initial.shoes_config_path).unwrap();
+
+        let mut candidate = initial.clone();
+        candidate.panel_base_path = "/new".into();
+        candidate.shoes_extra_yaml = "- [".into();
+        assert!(manager.apply_settings(&candidate).await.is_err());
+        assert_eq!(std::fs::read(&initial.shoes_config_path).unwrap(), old_yaml);
+        assert_eq!(
+            db.get_settings().unwrap().panel_base_path,
+            initial.panel_base_path
+        );
+
+        // A late database error must also roll back the previously written YAML.
+        rusqlite::Connection::open(file)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_save BEFORE UPDATE ON settings WHEN NEW.key='public_host'
+             BEGIN SELECT RAISE(ABORT, 'simulated save failure'); END;",
+            )
+            .unwrap();
+        candidate.shoes_extra_yaml = "- global_settings: {}".into();
+        assert!(manager.apply_settings(&candidate).await.is_err());
+        assert_eq!(std::fs::read(&initial.shoes_config_path).unwrap(), old_yaml);
+        assert_eq!(
+            db.get_settings().unwrap().panel_base_path,
+            initial.panel_base_path
+        );
+    }
 
     #[test]
     fn test_yaml_and_subscription_generation_all_protocols() {

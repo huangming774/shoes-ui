@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::crypto_util::{generate_random_alnum, generate_uuid, hash_password, verify_password};
 use crate::models::{
-    CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, PanelSettings,
+    CertificateRecord, ClientRecord, Inbound, InboundTotals, OutboundGroupRecord, PanelSettings,
     RoutingRuleRecord, StreamSettings, SubscriptionRecord,
 };
 
@@ -42,7 +42,7 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,9 +170,35 @@ impl Database {
             )?;
         }
 
-        drop(conn);
-        // Ensure default settings exist
-        let _ = self.get_settings()?;
+        // Seed missing keys on first startup and when opening an older database.
+        let port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "54321".into());
+        let bin = Self::default_shoes_bin_path(&self.data_dir);
+        let config = self.data_dir.join("shoes.config.yaml");
+        let secret = generate_random_alnum(32);
+        let tx = conn.transaction()?;
+        {
+            let mut insert =
+                tx.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)")?;
+            for (key, value) in [
+                ("panel_listen", "0.0.0.0"),
+                ("panel_port", port.as_str()),
+                ("panel_base_path", "/"),
+                ("panel_cert_file", ""),
+                ("panel_key_file", ""),
+                ("public_host", ""),
+                ("sub_public_url", ""),
+                ("shoes_bin_path", bin.as_str()),
+                ("shoes_config_path", config.to_string_lossy().as_ref()),
+                ("clash_api_addr", "127.0.0.1:19090"),
+                ("clash_api_secret", secret.as_str()),
+                ("shoes_auto_start", "true"),
+                ("shoes_extra_yaml", ""),
+                ("session_ttl_hours", "168"),
+            ] {
+                insert.execute(params![key, value])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -275,52 +301,47 @@ impl Database {
             map.insert(k, v);
         }
 
-        let default_cfg_path = self
-            .data_dir
-            .join("shoes.config.yaml")
-            .to_string_lossy()
-            .to_string();
-        let default_secret = generate_random_alnum(32);
-        let default_bin = Self::default_shoes_bin_path(&self.data_dir);
-
-        let get_or_init = |k: &str, def: &str| -> Result<String> {
-            if let Some(v) = map.get(k) {
-                Ok(v.clone())
-            } else {
-                conn.execute(
-                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-                    params![k, def],
-                )?;
-                Ok(def.to_string())
-            }
+        let mut get = |key: &str| {
+            map.remove(key)
+                .with_context(|| format!("Missing panel setting '{key}'"))
         };
-
-        let env_port = std::env::var("PANEL_PORT").unwrap_or_else(|_| "54321".to_string());
         let settings = PanelSettings {
-            panel_listen: get_or_init("panel_listen", "0.0.0.0")?,
-            panel_port: get_or_init("panel_port", &env_port)?
-                .parse()
-                .unwrap_or(54321),
-            panel_base_path: normalize_base_path(&get_or_init("panel_base_path", "/")?),
-            panel_cert_file: get_or_init("panel_cert_file", "")?,
-            panel_key_file: get_or_init("panel_key_file", "")?,
-            public_host: get_or_init("public_host", "")?,
-            sub_public_url: get_or_init("sub_public_url", "")?,
-            shoes_bin_path: get_or_init("shoes_bin_path", &default_bin)?,
-            shoes_config_path: get_or_init("shoes_config_path", &default_cfg_path)?,
-            clash_api_addr: get_or_init("clash_api_addr", "127.0.0.1:19090")?,
-            clash_api_secret: get_or_init("clash_api_secret", &default_secret)?,
-            shoes_auto_start: get_or_init("shoes_auto_start", "true")? == "true",
-            shoes_extra_yaml: get_or_init("shoes_extra_yaml", "")?,
-            session_ttl_hours: get_or_init("session_ttl_hours", "168")?
-                .parse()
-                .unwrap_or(168),
+            panel_listen: get("panel_listen")?,
+            panel_port: get("panel_port")?.parse().unwrap_or(54321),
+            panel_base_path: normalize_base_path(&get("panel_base_path")?),
+            panel_cert_file: get("panel_cert_file")?,
+            panel_key_file: get("panel_key_file")?,
+            public_host: get("public_host")?,
+            sub_public_url: get("sub_public_url")?,
+            shoes_bin_path: get("shoes_bin_path")?,
+            shoes_config_path: get("shoes_config_path")?,
+            clash_api_addr: get("clash_api_addr")?,
+            clash_api_secret: get("clash_api_secret")?,
+            shoes_auto_start: get("shoes_auto_start")? == "true",
+            shoes_extra_yaml: get("shoes_extra_yaml")?,
+            session_ttl_hours: get("session_ttl_hours")?.parse().unwrap_or(168),
         };
         Ok(settings)
     }
 
-    pub fn save_settings(&self, s: &PanelSettings) -> Result<()> {
+    pub fn clash_api_settings(&self) -> Result<(String, String)> {
         let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT addr.value, secret.value FROM settings AS addr, settings AS secret
+             WHERE addr.key = 'clash_api_addr' AND secret.key = 'clash_api_secret'",
+        )?;
+        Ok(stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?)
+    }
+
+    pub fn backup_snapshot(&self) -> Result<Vec<u8>> {
+        let conn = self.conn.lock();
+        let snapshot = conn.serialize(rusqlite::DatabaseName::Main)?;
+        Ok(snapshot.to_vec())
+    }
+
+    pub fn save_settings(&self, s: &PanelSettings) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
         let pairs = [
             ("panel_listen", s.panel_listen.trim().to_string()),
             ("panel_port", s.panel_port.to_string()),
@@ -341,12 +362,13 @@ impl Database {
             ("session_ttl_hours", s.session_ttl_hours.max(1).to_string()),
         ];
         for (k, v) in pairs {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![k, v],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -362,16 +384,49 @@ impl Database {
 
     // ==================== Inbounds & Clients (Two-Layer Model) ====================
 
-    pub fn list_inbounds(&self) -> Result<Vec<Inbound>> {
+    pub fn inbound_totals(&self) -> Result<InboundTotals> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, tag, remark, enable, listen, port, protocol, protocol_settings,
+        let mut stmt = conn.prepare_cached(
+            "SELECT COALESCE(SUM(up_bytes), 0), COALESCE(SUM(down_bytes), 0),
+                    COUNT(*), COUNT(CASE WHEN enable <> 0 THEN 1 END),
+                    (SELECT COUNT(*) FROM clients)
+             FROM inbounds",
+        )?;
+        Ok(stmt.query_row([], |r| {
+            Ok(InboundTotals {
+                up_bytes: r.get(0)?,
+                down_bytes: r.get(1)?,
+                inbounds_total: r.get(2)?,
+                inbounds_enabled: r.get(3)?,
+                clients_total: r.get(4)?,
+            })
+        })?)
+    }
+
+    pub fn list_inbounds(&self) -> Result<Vec<Inbound>> {
+        self.read_inbounds(None)
+    }
+
+    pub fn get_inbound(&self, id: i64) -> Result<Option<Inbound>> {
+        Ok(self.read_inbounds(Some(id))?.pop())
+    }
+
+    fn read_inbounds(&self, id: Option<i64>) -> Result<Vec<Inbound>> {
+        let (inbound_filter, client_filter) = if id.is_some() {
+            ("WHERE id = ?1", "WHERE inbound_id = ?1")
+        } else {
+            ("", "")
+        };
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let mut inbounds: Vec<Inbound> = tx
+            .prepare_cached(&format!(
+                "SELECT id, tag, remark, enable, listen, port, protocol, protocol_settings,
                     stream_settings, up_bytes, down_bytes, total_quota_bytes, expiry_time,
                     auto_reset_day, last_reset_month, created_at, updated_at
-             FROM inbounds ORDER BY id ASC",
-        )?;
-        let mut inbounds: Vec<Inbound> = stmt
-            .query_map([], |r| {
+             FROM inbounds {inbound_filter} ORDER BY id ASC"
+            ))?
+            .query_map(rusqlite::params_from_iter(id), |r| {
                 let ps_str: String = r.get(7)?;
                 let ss_str: String = r.get(8)?;
                 Ok(Inbound {
@@ -397,13 +452,13 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut cstmt = conn.prepare(
-            "SELECT id, inbound_id, name, enable, uuid, password, username, flow, sub_id,
+        let clients: Vec<ClientRecord> = tx
+            .prepare_cached(&format!(
+                "SELECT id, inbound_id, name, enable, uuid, password, username, flow, sub_id,
                     up_bytes, down_bytes, total_quota_bytes, expiry_time, comment, created_at
-             FROM clients ORDER BY id ASC",
-        )?;
-        let clients: Vec<ClientRecord> = cstmt
-            .query_map([], |r| {
+             FROM clients {client_filter} ORDER BY id ASC"
+            ))?
+            .query_map(rusqlite::params_from_iter(id), |r| {
                 Ok(ClientRecord {
                     id: r.get(0)?,
                     inbound_id: r.get(1)?,
@@ -424,6 +479,8 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        tx.commit()?;
+        drop(conn);
         let mut by_inbound: HashMap<i64, Vec<ClientRecord>> = HashMap::new();
         for c in clients {
             by_inbound.entry(c.inbound_id).or_default().push(c);
@@ -443,10 +500,6 @@ impl Database {
             ib.clients = list;
         }
         Ok(inbounds)
-    }
-
-    pub fn get_inbound(&self, id: i64) -> Result<Option<Inbound>> {
-        Ok(self.list_inbounds()?.into_iter().find(|i| i.id == id))
     }
 
     fn ensure_subscription_for_sub_id(conn: &Connection, sub_id: &str) -> Result<()> {
@@ -1195,21 +1248,23 @@ impl Database {
 
     // ==================== Subscriptions ====================
 
+    fn subscription_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
+        Ok(SubscriptionRecord {
+            id: r.get(0)?,
+            sub_id: r.get(1)?,
+            token: r.get(2)?,
+            name: r.get(3)?,
+            enable: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
+        })
+    }
+
     pub fn list_subscriptions(&self) -> Result<Vec<SubscriptionRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, sub_id, token, name, enable, created_at FROM subscriptions ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(SubscriptionRecord {
-                id: r.get(0)?,
-                sub_id: r.get(1)?,
-                token: r.get(2)?,
-                name: r.get(3)?,
-                enable: r.get::<_, i64>(4)? != 0,
-                created_at: r.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map([], Self::subscription_from_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -1218,19 +1273,32 @@ impl Database {
         conn.query_row(
             "SELECT id, sub_id, token, name, enable, created_at FROM subscriptions WHERE token = ?1 AND enable = 1",
             params![token],
-            |r| {
-                Ok(SubscriptionRecord {
-                    id: r.get(0)?,
-                    sub_id: r.get(1)?,
-                    token: r.get(2)?,
-                    name: r.get(3)?,
-                    enable: r.get::<_, i64>(4)? != 0,
-                    created_at: r.get(5)?,
-                })
-            },
+            Self::subscription_from_row,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn subscriptions_with_counts(&self) -> Result<Vec<(SubscriptionRecord, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "WITH counts AS (
+                 SELECT c.sub_id, COUNT(*) AS nodes
+                 FROM clients c JOIN inbounds i ON i.id = c.inbound_id
+                 WHERE c.enable <> 0 AND i.enable <> 0
+                 GROUP BY c.sub_id
+             )
+             SELECT s.id, s.sub_id, s.token, s.name, s.enable, s.created_at,
+                    CASE WHEN s.sub_id = 'all' COLLATE NOCASE OR s.sub_id = '*'
+                         THEN (SELECT COALESCE(SUM(nodes), 0) FROM counts)
+                         ELSE COALESCE(counts.nodes, 0) END
+             FROM subscriptions s LEFT JOIN counts ON counts.sub_id = s.sub_id
+             ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((Self::subscription_from_row(row)?, row.get(6)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn save_subscription(&self, s: SubscriptionRecord) -> Result<SubscriptionRecord> {
@@ -1300,6 +1368,18 @@ pub fn normalize_base_path(p: &str) -> String {
     }
 }
 
+pub fn validated_base_path(path: &str) -> Result<String> {
+    let path = normalize_base_path(path);
+    if path == "/sub" || path.starts_with("/sub/") {
+        anyhow::bail!("The /sub path is reserved for public subscriptions");
+    }
+    let url = url::Url::parse(&format!("http://localhost{path}"))?;
+    if url.path() != path || url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("Panel base path must be a URL path without dot segments, query or fragment");
+    }
+    Ok(path)
+}
+
 pub fn default_client_for_inbound(ib: &Inbound, idx: usize) -> ClientRecord {
     let vision = (ib.stream_settings.security == "reality" && ib.stream_settings.reality.vision)
         || (ib.stream_settings.security == "tls" && ib.stream_settings.tls.vision);
@@ -1338,5 +1418,106 @@ pub fn default_client_for_inbound(ib: &Inbound, idx: usize) -> ClientRecord {
         expiry_time: ib.expiry_time,
         comment: String::new(),
         created_at: Utc::now().timestamp_millis(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, to_value};
+
+    #[test]
+    fn subscription_counts_include_only_enabled_nodes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+        db.conn.lock().execute_batch(
+            "INSERT INTO subscriptions(sub_id, token, name, enable, created_at)
+             VALUES ('aLl','all-token','',1,0), ('*','star-token','',1,0),
+                    ('team','team-token','',0,0), ('TEAM','upper-token','',1,0);
+             INSERT INTO inbounds
+               (id,tag,remark,port,enable,protocol,protocol_settings,stream_settings,created_at,updated_at)
+             VALUES (1,'a','',1001,1,'anytls','{}','{}',0,0),
+                    (2,'b','',1002,0,'anytls','{}','{}',0,0);
+             INSERT INTO clients(inbound_id,name,sub_id,enable,created_at)
+             VALUES (1,'one','team',1,0), (1,'two','team',1,0), (1,'three','other',1,0),
+                    (1,'disabled','team',0,0), (2,'disabled inbound','team',1,0);",
+        )?;
+        let counts: Vec<_> = db
+            .subscriptions_with_counts()?
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(counts, [0, 3, 3, 2, 0]);
+        db.conn.lock().execute("DELETE FROM clients", [])?;
+        assert!(db.subscriptions_with_counts()?.iter().all(|(_, n)| *n == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn clash_settings_are_live_and_missing_defaults_are_seeded_on_open() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("panel.db");
+        let db = Database::open(&file, dir.path())?;
+        let (addr, secret) = db.clash_api_settings()?;
+        assert_eq!(addr, "127.0.0.1:19090");
+        assert!(!secret.is_empty());
+        db.set_setting_kv("clash_api_secret", "changed")?;
+        db.set_setting_kv("clash_api_addr", "")?;
+        assert_eq!(db.clash_api_settings()?, (String::new(), "changed".into()));
+        db.conn
+            .lock()
+            .execute("DELETE FROM settings WHERE key='clash_api_addr'", [])?;
+        drop(db);
+        let reopened = Database::open(&file, dir.path())?;
+        assert_eq!(reopened.clash_api_settings()?, (addr, "changed".into()));
+        assert_eq!(reopened.get_settings()?.clash_api_secret, "changed");
+        Ok(())
+    }
+
+    #[test]
+    fn status_totals_and_single_inbound_match_list_semantics() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+        assert_eq!(
+            to_value(db.inbound_totals()?)?,
+            json!({
+                "up_bytes": 0, "down_bytes": 0, "inbounds_total": 0,
+                "inbounds_enabled": 0, "clients_total": 0
+            })
+        );
+        db.conn.lock().execute_batch(
+            "INSERT INTO inbounds
+               (id, tag, remark, port, enable, protocol, protocol_settings, stream_settings,
+                up_bytes, down_bytes, total_quota_bytes, expiry_time, created_at, updated_at)
+             VALUES (1,'a','',1001,0,'vless','{}','{}',12,8,1000,900,0,0),
+                    (2,'b','',1002,1,'anytls','{}','{}',20,30,2000,800,0,0);
+             INSERT INTO clients (id,inbound_id,name,enable,up_bytes,created_at)
+             VALUES (10,2,'first',0,7,0), (11,1,'single',1,3,0), (12,2,'last',1,9,0);",
+        )?;
+        assert_eq!(
+            to_value(db.inbound_totals()?)?,
+            json!({
+                "up_bytes": 32, "down_bytes": 38, "inbounds_total": 2,
+                "inbounds_enabled": 1, "clients_total": 3
+            })
+        );
+        let list = db.list_inbounds()?;
+        for inbound in &list {
+            assert_eq!(to_value(db.get_inbound(inbound.id)?)?, to_value(inbound)?);
+        }
+        assert!(db.get_inbound(999)?.is_none());
+        let single = &list[0].clients[0];
+        assert_eq!(
+            (
+                single.up_bytes,
+                single.down_bytes,
+                single.total_quota_bytes,
+                single.expiry_time
+            ),
+            (12, 8, 1000, 900)
+        );
+        let multi: Vec<_> = list[1].clients.iter().map(|c| (c.id, c.up_bytes)).collect();
+        assert_eq!(multi, [(10, 7), (12, 9)]);
+        Ok(())
     }
 }
