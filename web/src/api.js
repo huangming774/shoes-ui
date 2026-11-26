@@ -63,6 +63,11 @@ export const api = {
 
   listInbounds: () => apiFetch('/inbounds'),
   createInbound: (payload) => apiFetch('/inbounds', { method: 'POST', body: payload }),
+  batchInbounds: (payload) => apiFetch('/inbounds/batch', { method: 'POST', body: payload }),
+  importInboundsPreview: (input) =>
+    apiFetch('/inbounds/import/preview', { method: 'POST', body: { input } }),
+  importInboundsApply: (payload) =>
+    apiFetch('/inbounds/import/apply', { method: 'POST', body: payload }),
   updateInbound: (id, payload) => apiFetch(`/inbounds/${id}`, { method: 'PUT', body: payload }),
   toggleInbound: (id, enable) => apiFetch(`/inbounds/${id}/toggle`, { method: 'POST', body: { enable } }),
   cloneInbound: (id, payload = {}) => apiFetch(`/inbounds/${id}/clone`, { method: 'POST', body: payload }),
@@ -91,6 +96,9 @@ export const api = {
       `/keygen/vless-encryption?auth=${encodeURIComponent(auth)}&mode=${encodeURIComponent(mode)}&rtt=${encodeURIComponent(rtt)}&lifetime=${encodeURIComponent(lifetime)}`
     ),
   genMldsa65: () => apiFetch('/keygen/mldsa65'),
+  genMtlsClient: (cn = '') =>
+    apiFetch(`/keygen/mtls-client${cn ? `?cn=${encodeURIComponent(cn)}` : ''}`),
+  probeReality: (payload) => apiFetch('/tools/probe-reality', { method: 'POST', body: payload }),
 
   listCerts: () => apiFetch('/certificates'),
   acmeMeta: (directory_url = '') =>
@@ -107,6 +115,7 @@ export const api = {
 
   listOutboundGroups: () => apiFetch('/outbound-groups'),
   saveOutboundGroup: (payload) => apiFetch('/outbound-groups', { method: 'POST', body: payload }),
+  parseOutboundUri: (uris) => apiFetch('/outbound-groups/parse-uri', { method: 'POST', body: { uris } }),
   deleteOutboundGroup: (id) => apiFetch(`/outbound-groups/${id}`, { method: 'DELETE' }),
 
   listDnsGroups: () => apiFetch('/dns-groups'),
@@ -124,6 +133,10 @@ export const api = {
 
   listSubscriptions: () => apiFetch('/subscriptions'),
   saveSubscription: (payload) => apiFetch('/subscriptions', { method: 'POST', body: payload }),
+  getSubTemplate: () => apiFetch('/subscriptions/template'),
+  saveSubTemplate: (payload) => apiFetch('/subscriptions/template', { method: 'PUT', body: payload }),
+  previewSubTemplate: (payload) =>
+    apiFetch('/subscriptions/preview-template', { method: 'POST', body: payload }),
   rotateSubscription: (id) => apiFetch(`/subscriptions/${id}/rotate`, { method: 'POST' }),
   deleteSubscription: (id) => apiFetch(`/subscriptions/${id}`, { method: 'DELETE' }),
 

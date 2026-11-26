@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use crate::db::Database;
 use crate::models::{
     CertificateRecord, ClientRecord, CoreGlobalSettings, DnsGroupRecord, DnsServerItem, Inbound,
-    OutboundGroupRecord, OutboundMember, PanelSettings, RoutingRuleRecord, RuleSourceGroupRecord,
-    DEFAULT_LETSENCRYPT_DIR,
+    OutboundGroupRecord, OutboundHop, OutboundMember, PanelSettings, RoutingRuleRecord,
+    RuleSourceGroupRecord, SudokuMaskSettings, DEFAULT_LETSENCRYPT_DIR,
 };
 
 fn str_val(s: &str) -> Value {
@@ -183,8 +183,61 @@ pub fn build_shoes_yaml_full(
         )?);
     }
 
-    // 5. Enabled Inbound Server entries
-    for ib in inbounds.iter().filter(|i| i.enable) {
+    // 5. Enabled Inbound Server entries (with automatic multi-SNI multiplexing on shared TCP ports)
+    let enabled_inbounds: Vec<&Inbound> = inbounds.iter().filter(|i| i.enable).collect();
+    let mut sni_group_counts: std::collections::HashMap<(String, u16), usize> =
+        std::collections::HashMap::new();
+    for ib in &enabled_inbounds {
+        if ib.can_share_sni_port() {
+            let listen = if ib.listen.trim().is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                ib.listen.trim().to_string()
+            };
+            *sni_group_counts.entry((listen, ib.port)).or_insert(0) += 1;
+        }
+    }
+
+    let mut emitted_shared_keys: HashSet<(String, u16)> = HashSet::new();
+    for ib in &enabled_inbounds {
+        if ib.can_share_sni_port() {
+            let listen = if ib.listen.trim().is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                ib.listen.trim().to_string()
+            };
+            let key = (listen, ib.port);
+            if sni_group_counts.get(&key).copied().unwrap_or(0) >= 2 {
+                if emitted_shared_keys.insert(key.clone()) {
+                    let members: Vec<&Inbound> = enabled_inbounds
+                        .iter()
+                        .copied()
+                        .filter(|other| {
+                            other.can_share_sni_port()
+                                && other.port == key.1
+                                && (if other.listen.trim().is_empty() {
+                                    "0.0.0.0"
+                                } else {
+                                    other.listen.trim()
+                                }) == key.0
+                        })
+                        .collect();
+                    if let Some(entry) = build_shared_sni_server_entry(
+                        &members,
+                        has_panel_routing,
+                        &enabled_group_names,
+                        &enabled_dns_names,
+                        &acme_cert_names,
+                    )
+                    .with_context(|| format!("shared SNI listener on {}:{}", key.0, key.1))?
+                    {
+                        top_entries.push(entry);
+                    }
+                }
+                continue;
+            }
+        }
+
         if let Some(entry) = build_inbound_entry(
             data_dir,
             ib,
@@ -454,44 +507,208 @@ fn build_shoes_h2mux_value(mux: &crate::models::H2MuxSettings) -> Value {
     Value::Mapping(m)
 }
 
-fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
-    let mut wrapper = Mapping::new();
-    if m.protocol == "group" {
-        // Reference another client_group by name
+const VALID_TLS_KX_GROUPS: &[&str] = &[
+    "X25519MLKEM768",
+    "SecP256r1MLKEM768",
+    "X25519",
+    "SecP256r1",
+    "SecP384r1",
+];
+
+pub fn validate_key_exchange_groups(
+    groups: &[String],
+    vision: bool,
+    zero_rtt: bool,
+) -> Result<Option<Vec<Value>>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut all_hybrid = true;
+    for raw in groups {
+        let g = raw.trim();
+        if g.is_empty() {
+            continue;
+        }
+        if !VALID_TLS_KX_GROUPS.contains(&g) {
+            return Err(anyhow!(
+                "Unsupported TLS key_exchange_group '{g}'. Allowed: {}",
+                VALID_TLS_KX_GROUPS.join(", ")
+            ));
+        }
+        if !seen.insert(g.to_string()) {
+            continue;
+        }
+        if !matches!(g, "X25519MLKEM768" | "SecP256r1MLKEM768") {
+            all_hybrid = false;
+        }
+        out.push(str_val(g));
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    if all_hybrid && vision {
+        return Err(anyhow!(
+            "Hybrid-only key_exchange_groups cannot be combined with TLS Vision (add X25519 fallback or disable Vision)"
+        ));
+    }
+    if all_hybrid && zero_rtt {
+        return Err(anyhow!(
+            "Hybrid-only key_exchange_groups cannot be combined with TUIC 0-RTT handshake"
+        ));
+    }
+    Ok(Some(out))
+}
+
+fn normalize_fingerprints(raw_fps: &[String]) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for raw in raw_fps {
+        for part in raw.split([',', '\n', ';']) {
+            let mut s = part.trim();
+            if s.is_empty() {
+                continue;
+            }
+            for prefix in ["SHA256 Fingerprint=", "sha256:", "SHA256:", "sha-256:"] {
+                if let Some(rest) = s.strip_prefix(prefix) {
+                    s = rest.trim();
+                }
+            }
+            let hex_only: String = s.chars().filter(|c| !matches!(c, ':' | ' ' | '-')).collect();
+            if hex_only.len() % 2 != 0
+                || hex_only.is_empty()
+                || !hex_only.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Err(anyhow!(
+                    "Invalid TLS certificate fingerprint '{part}': expected hex SHA-256 bytes (e.g. AA:BB:...)"
+                ));
+            }
+            let upper = hex_only.to_ascii_uppercase();
+            let colon = upper
+                .as_bytes()
+                .chunks(2)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(":");
+            out.push(str_val(&colon));
+        }
+    }
+    Ok(out)
+}
+
+fn apply_mtls_fields(
+    target: &mut Mapping,
+    ca_certs: &[String],
+    fingerprints: &[String],
+) -> Result<()> {
+    let cas: Vec<Value> = ca_certs
+        .iter()
+        .flat_map(|s| split_items(s))
+        .map(|p| str_val(&p.replace('\\', "/")))
+        .collect();
+    if !cas.is_empty() {
+        insert(target, "client_ca_certs", Value::Sequence(cas));
+    }
+    let fps = normalize_fingerprints(fingerprints)?;
+    if !fps.is_empty() {
+        insert(target, "client_fingerprints", Value::Sequence(fps));
+    }
+    Ok(())
+}
+
+pub fn wrap_sudoku_mask(inner: Value, mask: &SudokuMaskSettings) -> Result<Value> {
+    if !mask.enabled {
+        return Ok(inner);
+    }
+    let mut sm = Mapping::new();
+    insert(&mut sm, "type", str_val("sudoku_mask"));
+    if !mask.password.is_empty() {
+        insert(&mut sm, "password", str_val(&mask.password));
+    }
+    let ascii = mask.ascii.trim();
+    if !ascii.is_empty() {
+        let lower = ascii.to_ascii_lowercase();
+        if !matches!(
+            lower.as_str(),
+            "prefer_entropy" | "entropy" | "prefer_ascii" | "ascii"
+        ) {
+            return Err(anyhow!(
+                "Invalid Sudoku ascii mode '{ascii}' (expected prefer_entropy, entropy, prefer_ascii, or ascii)"
+            ));
+        }
+        insert(&mut sm, "ascii", str_val(&lower));
+    }
+    let tables: Vec<String> = mask
+        .custom_tables
+        .iter()
+        .flat_map(|s| split_items(s))
+        .collect();
+    if !tables.is_empty() {
         insert(
-            &mut wrapper,
-            "chain",
-            Value::Sequence(vec![str_val(m.address.trim())]),
+            &mut sm,
+            "custom_tables",
+            Value::Sequence(tables.into_iter().map(|t| str_val(&t)).collect()),
         );
-        return Ok(Value::Mapping(wrapper));
+    } else if !mask.custom_table.trim().is_empty() {
+        insert(&mut sm, "custom_table", str_val(mask.custom_table.trim()));
+    }
+    if mask.padding_min > 0 {
+        insert(&mut sm, "padding_min", num_u64(mask.padding_min.min(100) as u64));
+    }
+    if mask.padding_max > 0 {
+        let pmax = mask.padding_max.min(100).max(mask.padding_min.min(100));
+        insert(&mut sm, "padding_max", num_u64(pmax as u64));
+    }
+    insert(&mut sm, "protocol", inner);
+    Ok(Value::Mapping(sm))
+}
+
+fn build_outbound_hop_value(
+    hop_cfg: &OutboundHop,
+    hop_name: Option<&str>,
+    label: &str,
+    hop_index: usize,
+) -> Result<Value> {
+    let proto = hop_cfg.protocol.trim().to_ascii_lowercase();
+    if proto == "group" {
+        let target_group = hop_cfg.address.trim();
+        if target_group.is_empty() {
+            return Err(anyhow!("{label}: group reference hop requires group name"));
+        }
+        return Ok(str_val(target_group));
     }
 
     let mut hop = Mapping::new();
-    if !m.name.trim().is_empty() {
-        insert(&mut hop, "name", str_val(m.name.trim()));
+    if let Some(n) = hop_name.filter(|s| !s.trim().is_empty()) {
+        insert(&mut hop, "name", str_val(n.trim()));
     }
-    if !m.bind_interface.trim().is_empty() {
-        insert(&mut hop, "bind_interface", str_val(m.bind_interface.trim()));
+    if !hop_cfg.bind_interface.trim().is_empty() {
+        insert(
+            &mut hop,
+            "bind_interface",
+            str_val(hop_cfg.bind_interface.trim()),
+        );
     }
 
-    if m.protocol == "direct" {
+    if proto == "direct" {
         let mut p = Mapping::new();
         insert(&mut p, "type", str_val("direct"));
         insert(&mut hop, "protocol", Value::Mapping(p));
-    } else if m.protocol == "wireguard" {
-        if m.address.trim().is_empty() {
+        return Ok(Value::Mapping(hop));
+    }
+
+    if proto == "wireguard" {
+        if hop_index > 0 {
             return Err(anyhow!(
-                "WireGuard outbound '{}' requires peer endpoint (host:port)",
-                m.name
+                "{label}: WireGuard outbound can only be used as hop 1 (entry hop)"
             ));
         }
-        if m.wg_private_key.trim().is_empty() || m.wg_public_key.trim().is_empty() {
+        if hop_cfg.address.trim().is_empty() {
+            return Err(anyhow!("{label}: WireGuard requires peer endpoint (host:port)"));
+        }
+        if hop_cfg.wg_private_key.trim().is_empty() || hop_cfg.wg_public_key.trim().is_empty() {
             return Err(anyhow!(
-                "WireGuard outbound '{}' requires both private_key and peer public_key",
-                m.name
+                "{label}: WireGuard requires both private_key and peer public_key"
             ));
         }
-        let addrs: Vec<String> = m
+        let addrs: Vec<String> = hop_cfg
             .wg_addresses
             .iter()
             .map(|s| s.trim().to_string())
@@ -499,28 +716,26 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             .collect();
         if addrs.is_empty() {
             return Err(anyhow!(
-                "WireGuard outbound '{}' requires at least one tunnel interface address (e.g. 172.16.0.2/32)",
-                m.name
+                "{label}: WireGuard requires at least one tunnel interface address (e.g. 172.16.0.2/32)"
             ));
         }
-        if m.tls || m.h2mux.enabled {
+        if hop_cfg.effective_security() != "none" || hop_cfg.h2mux.enabled || hop_cfg.sudoku.enabled {
             return Err(anyhow!(
-                "WireGuard outbound '{}' cannot be wrapped with TLS or H2Mux",
-                m.name
+                "{label}: WireGuard outbound cannot be wrapped with TLS, ShadowTLS, H2Mux, or Sudoku mask"
             ));
         }
 
-        insert(&mut hop, "address", str_val(m.address.trim()));
+        insert(&mut hop, "address", str_val(hop_cfg.address.trim()));
 
         let mut wg = Mapping::new();
         insert(&mut wg, "type", str_val("wireguard"));
-        insert(&mut wg, "private_key", str_val(m.wg_private_key.trim()));
-        insert(&mut wg, "public_key", str_val(m.wg_public_key.trim()));
-        if !m.wg_preshared_key.trim().is_empty() {
+        insert(&mut wg, "private_key", str_val(hop_cfg.wg_private_key.trim()));
+        insert(&mut wg, "public_key", str_val(hop_cfg.wg_public_key.trim()));
+        if !hop_cfg.wg_preshared_key.trim().is_empty() {
             insert(
                 &mut wg,
                 "pre_shared_key",
-                str_val(m.wg_preshared_key.trim()),
+                str_val(hop_cfg.wg_preshared_key.trim()),
             );
         }
         insert(
@@ -528,7 +743,7 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             "addresses",
             Value::Sequence(addrs.into_iter().map(|s| str_val(&s)).collect()),
         );
-        let allowed: Vec<String> = m
+        let allowed: Vec<String> = hop_cfg
             .wg_allowed_ips
             .iter()
             .map(|s| s.trim().to_string())
@@ -544,28 +759,25 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             "allowed_ips",
             Value::Sequence(allowed.into_iter().map(|s| str_val(&s)).collect()),
         );
-        if m.wg_mtu > 0 {
-            if !(1280..=1420).contains(&m.wg_mtu) {
-                return Err(anyhow!(
-                    "WireGuard outbound '{}' MTU must be between 1280 and 1420",
-                    m.name
-                ));
+        if hop_cfg.wg_mtu > 0 {
+            if !(1280..=1420).contains(&hop_cfg.wg_mtu) {
+                return Err(anyhow!("{label}: WireGuard MTU must be between 1280 and 1420"));
             }
-            insert(&mut wg, "mtu", num_u64(m.wg_mtu as u64));
+            insert(&mut wg, "mtu", num_u64(hop_cfg.wg_mtu as u64));
         }
-        if m.wg_keepalive > 0 {
+        if hop_cfg.wg_keepalive > 0 {
             insert(
                 &mut wg,
                 "persistent_keepalive",
-                num_u64(m.wg_keepalive as u64),
+                num_u64(hop_cfg.wg_keepalive as u64),
             );
         }
-        if m.wg_tcp_buffer_size.is_some() || m.wg_tcp_memory_bytes.is_some() {
+        if hop_cfg.wg_tcp_buffer_size.is_some() || hop_cfg.wg_tcp_memory_bytes.is_some() {
             let mut rl = Mapping::new();
-            if let Some(buf) = m.wg_tcp_buffer_size.filter(|&v| v > 0) {
+            if let Some(buf) = hop_cfg.wg_tcp_buffer_size.filter(|&v| v > 0) {
                 insert(&mut rl, "tcp_buffer_size", num_u64(buf as u64));
             }
-            if let Some(mem) = m.wg_tcp_memory_bytes.filter(|&v| v > 0) {
+            if let Some(mem) = hop_cfg.wg_tcp_memory_bytes.filter(|&v| v > 0) {
                 insert(&mut rl, "tcp_memory_bytes", num_u64(mem));
             }
             if !rl.is_empty() {
@@ -573,118 +785,369 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             }
         }
         insert(&mut hop, "protocol", Value::Mapping(wg));
-    } else {
-        if m.address.trim().is_empty() {
+        return Ok(Value::Mapping(hop));
+    }
+
+    if hop_cfg.address.trim().is_empty() {
+        return Err(anyhow!("{label}: server address (host:port) is required"));
+    }
+    insert(&mut hop, "address", str_val(hop_cfg.address.trim()));
+
+    // Native QUIC outbound protocols (Hysteria2 & TUIC v5)
+    if matches!(proto.as_str(), "hysteria2" | "tuic") {
+        if hop_index > 0 {
             return Err(anyhow!(
-                "Outbound member '{}' requires server address (host:port)",
-                m.name
+                "{label}: native QUIC protocol '{proto}' can only be used as hop 1 (entry hop)"
             ));
         }
-        insert(&mut hop, "address", str_val(m.address.trim()));
-
+        if hop_cfg.sudoku.enabled {
+            return Err(anyhow!(
+                "{label}: Sudoku TCP mask cannot be used on QUIC protocol '{proto}'"
+            ));
+        }
+        insert(&mut hop, "transport", str_val("quic"));
         let mut inner = Mapping::new();
-        match m.protocol.as_str() {
-            "socks" | "socks5" => {
-                insert(&mut inner, "type", str_val("socks"));
-                if !m.username.trim().is_empty() {
-                    insert(&mut inner, "username", str_val(m.username.trim()));
-                }
-                if !m.password.trim().is_empty() {
-                    insert(&mut inner, "password", str_val(m.password.trim()));
-                }
+        if proto == "hysteria2" {
+            if hop_cfg.password.trim().is_empty() {
+                return Err(anyhow!("{label}: Hysteria2 outbound requires password"));
             }
-            "http" => {
-                insert(&mut inner, "type", str_val("http"));
-                if !m.username.trim().is_empty() {
-                    insert(&mut inner, "username", str_val(m.username.trim()));
-                }
-                if !m.password.trim().is_empty() {
-                    insert(&mut inner, "password", str_val(m.password.trim()));
-                }
+            insert(&mut inner, "type", str_val("hysteria2"));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+            if !hop_cfg.hy2_obfs_password.trim().is_empty() {
+                let mut obfs = Mapping::new();
+                insert(&mut obfs, "type", str_val("salamander"));
+                insert(&mut obfs, "password", str_val(hop_cfg.hy2_obfs_password.trim()));
+                insert(&mut inner, "obfs", Value::Mapping(obfs));
             }
-            "shadowsocks" | "ss" => {
-                insert(&mut inner, "type", str_val("shadowsocks"));
-                let cipher = if m.cipher.trim().is_empty() {
-                    "aes-256-gcm"
-                } else {
-                    m.cipher.trim()
-                };
-                insert(&mut inner, "cipher", str_val(cipher));
-                insert(&mut inner, "password", str_val(m.password.trim()));
+            if !hop_cfg.hy2_hopping_ports.trim().is_empty() {
+                let mut hmap = Mapping::new();
+                insert(&mut hmap, "ports", str_val(hop_cfg.hy2_hopping_ports.trim()));
+                insert(&mut hmap, "interval_secs", num_u64(30));
+                insert(&mut inner, "hopping", Value::Mapping(hmap));
             }
-            "vless" => {
-                insert(&mut inner, "type", str_val("vless"));
-                insert(&mut inner, "user_id", str_val(m.uuid.trim()));
-                if m.h2mux.enabled {
-                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
-                }
+        } else {
+            if hop_cfg.uuid.trim().is_empty() || hop_cfg.password.trim().is_empty() {
+                return Err(anyhow!("{label}: TUIC outbound requires uuid and password"));
             }
-            "vmess" => {
-                insert(&mut inner, "type", str_val("vmess"));
-                let cipher = if m.cipher.trim().is_empty() || m.cipher == "auto" {
-                    "aes-128-gcm"
-                } else {
-                    m.cipher.trim()
-                };
-                insert(&mut inner, "cipher", str_val(cipher));
-                insert(&mut inner, "user_id", str_val(m.uuid.trim()));
-                if m.h2mux.enabled {
-                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
-                }
-            }
-            "trojan" => {
-                insert(&mut inner, "type", str_val("trojan"));
-                insert(&mut inner, "password", str_val(m.password.trim()));
-                if m.h2mux.enabled {
-                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
-                }
-            }
-            other => return Err(anyhow!("Unsupported outbound member protocol '{other}'")),
+            insert(&mut inner, "type", str_val("tuic"));
+            insert(&mut inner, "uuid", str_val(hop_cfg.uuid.trim()));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+            let mode = match hop_cfg.tuic_udp_mode.trim().to_ascii_lowercase().as_str() {
+                "quic" => "quic",
+                _ => "native",
+            };
+            insert(&mut inner, "udp_relay_mode", str_val(mode));
         }
-        if m.h2mux.enabled && !matches!(m.protocol.as_str(), "vless" | "vmess" | "trojan") {
-            return Err(anyhow!(
-                "Outbound member '{}': Shoes client H2Mux only supports VLESS, VMess, and Trojan",
-                m.name
-            ));
-        }
+        insert(&mut hop, "protocol", Value::Mapping(inner));
 
-        if m.shadowtls && m.tls {
-            return Err(anyhow!(
-                "Outbound member '{}' cannot enable both TLS and ShadowTLS at the same time",
-                m.name
-            ));
+        let mut qmap = Mapping::new();
+        insert(&mut qmap, "verify", bool_val(hop_cfg.verify));
+        if !hop_cfg.sni.trim().is_empty() {
+            insert(&mut qmap, "sni_hostname", str_val(hop_cfg.sni.trim()));
         }
-        let final_proto = if m.shadowtls {
-            if m.shadowtls_password.trim().is_empty() {
-                return Err(anyhow!(
-                    "Outbound member '{}' with ShadowTLS v3 requires shadowtls_password",
-                    m.name
-                ));
+        if !hop_cfg.alpn.is_empty() {
+            insert(
+                &mut qmap,
+                "alpn_protocols",
+                Value::Sequence(hop_cfg.alpn.iter().map(|a| str_val(a.trim())).collect()),
+            );
+        }
+        if !hop_cfg.tls_cert.trim().is_empty() && !hop_cfg.tls_key.trim().is_empty() {
+            insert(&mut qmap, "cert", str_val(&hop_cfg.tls_cert.trim().replace('\\', "/")));
+            insert(&mut qmap, "key", str_val(&hop_cfg.tls_key.trim().replace('\\', "/")));
+        }
+        let sfps = normalize_fingerprints(&hop_cfg.server_fingerprints)?;
+        if !sfps.is_empty() {
+            insert(&mut qmap, "server_fingerprints", Value::Sequence(sfps));
+        }
+        if hop_index == 0 {
+            if let Some(kx) = validate_key_exchange_groups(&hop_cfg.key_exchange_groups, false, false)? {
+                insert(&mut qmap, "key_exchange_groups", Value::Sequence(kx));
+            }
+        }
+        insert(&mut hop, "quic_settings", Value::Mapping(qmap));
+        return Ok(Value::Mapping(hop));
+    }
+
+    // Standard TCP-based outbound protocols
+    let has_vless_enc = proto == "vless" && !hop_cfg.vless_encryption.trim().is_empty();
+    let mut inner = Mapping::new();
+    match proto.as_str() {
+        "socks" | "socks5" => {
+            insert(&mut inner, "type", str_val("socks"));
+            if !hop_cfg.username.trim().is_empty() {
+                insert(&mut inner, "username", str_val(hop_cfg.username.trim()));
+            }
+            if !hop_cfg.password.trim().is_empty() {
+                insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+            }
+        }
+        "http" => {
+            insert(&mut inner, "type", str_val("http"));
+            if !hop_cfg.username.trim().is_empty() {
+                insert(&mut inner, "username", str_val(hop_cfg.username.trim()));
+            }
+            if !hop_cfg.password.trim().is_empty() {
+                insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+            }
+        }
+        "shadowsocks" | "ss" => {
+            insert(&mut inner, "type", str_val("shadowsocks"));
+            let cipher = if hop_cfg.cipher.trim().is_empty() {
+                "aes-256-gcm"
+            } else {
+                hop_cfg.cipher.trim()
+            };
+            insert(&mut inner, "cipher", str_val(cipher));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+        }
+        "snell" => {
+            insert(&mut inner, "type", str_val("snell"));
+            let cipher = if hop_cfg.cipher.trim().is_empty() {
+                "aes-128-gcm"
+            } else {
+                hop_cfg.cipher.trim()
+            };
+            insert(&mut inner, "cipher", str_val(cipher));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+        }
+        "vless" => {
+            insert(&mut inner, "type", str_val("vless"));
+            insert(&mut inner, "user_id", str_val(hop_cfg.uuid.trim()));
+            if has_vless_enc {
+                insert(
+                    &mut inner,
+                    "encryption",
+                    str_val(hop_cfg.vless_encryption.trim()),
+                );
+                if hop_cfg.vision {
+                    insert(&mut inner, "vision", bool_val(true));
+                }
+            }
+            if hop_cfg.h2mux.enabled {
+                insert(&mut inner, "h2mux", build_shoes_h2mux_value(&hop_cfg.h2mux));
+            }
+        }
+        "vmess" => {
+            insert(&mut inner, "type", str_val("vmess"));
+            let cipher = if hop_cfg.cipher.trim().is_empty() || hop_cfg.cipher == "auto" {
+                "aes-128-gcm"
+            } else {
+                hop_cfg.cipher.trim()
+            };
+            insert(&mut inner, "cipher", str_val(cipher));
+            insert(&mut inner, "user_id", str_val(hop_cfg.uuid.trim()));
+            if hop_cfg.h2mux.enabled {
+                insert(&mut inner, "h2mux", build_shoes_h2mux_value(&hop_cfg.h2mux));
+            }
+        }
+        "trojan" => {
+            insert(&mut inner, "type", str_val("trojan"));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+            if hop_cfg.h2mux.enabled {
+                insert(&mut inner, "h2mux", build_shoes_h2mux_value(&hop_cfg.h2mux));
+            }
+        }
+        "anytls" => {
+            insert(&mut inner, "type", str_val("anytls"));
+            insert(&mut inner, "password", str_val(hop_cfg.password.trim()));
+        }
+        other => return Err(anyhow!("{label}: unsupported outbound protocol '{other}'")),
+    }
+
+    if hop_cfg.h2mux.enabled && !matches!(proto.as_str(), "vless" | "vmess" | "trojan") {
+        return Err(anyhow!(
+            "{label}: Shoes client H2Mux only supports VLESS, VMess, and Trojan"
+        ));
+    }
+
+    // Optional stream transport (WebSocket / XHTTP)
+    let net = hop_cfg.network.trim().to_ascii_lowercase();
+    let transported = if net == "ws" {
+        let mut ws = Mapping::new();
+        insert(&mut ws, "type", str_val("websocket"));
+        if !hop_cfg.ws_path.trim().is_empty() {
+            insert(&mut ws, "matching_path", str_val(hop_cfg.ws_path.trim()));
+        }
+        if !hop_cfg.ws_host.trim().is_empty() {
+            let mut hdrs = Mapping::new();
+            insert(&mut hdrs, "Host", str_val(hop_cfg.ws_host.trim()));
+            insert(&mut ws, "matching_headers", Value::Mapping(hdrs));
+        }
+        insert(&mut ws, "protocol", Value::Mapping(inner));
+        Value::Mapping(ws)
+    } else if net == "xhttp" {
+        let mut xh = Mapping::new();
+        insert(&mut xh, "type", str_val("xhttp"));
+        if !hop_cfg.xhttp_path.trim().is_empty() {
+            insert(&mut xh, "path", str_val(hop_cfg.xhttp_path.trim()));
+        }
+        if !hop_cfg.xhttp_host.trim().is_empty() {
+            insert(&mut xh, "host", str_val(hop_cfg.xhttp_host.trim()));
+        }
+        if !hop_cfg.xhttp_mode.trim().is_empty() {
+            insert(&mut xh, "mode", str_val(hop_cfg.xhttp_mode.trim()));
+        }
+        insert(&mut xh, "protocol", Value::Mapping(inner));
+        Value::Mapping(xh)
+    } else {
+        Value::Mapping(inner)
+    };
+
+    // Security layer (TLS / REALITY / ShadowTLS v3 / None)
+    if hop_cfg.shadowtls && hop_cfg.tls && hop_cfg.security.trim().is_empty() {
+        return Err(anyhow!(
+            "{label}: cannot enable both TLS and ShadowTLS at the same time"
+        ));
+    }
+    let sec = hop_cfg.effective_security();
+    let secured = match sec {
+        "shadowtls" => {
+            if hop_cfg.shadowtls_password.trim().is_empty() {
+                return Err(anyhow!("{label}: ShadowTLS v3 requires shadowtls_password"));
             }
             let mut stls = Mapping::new();
             insert(&mut stls, "type", str_val("shadowtls"));
-            insert(&mut stls, "password", str_val(m.shadowtls_password.trim()));
-            if !m.sni.trim().is_empty() {
-                insert(&mut stls, "sni_hostname", str_val(m.sni.trim()));
+            insert(
+                &mut stls,
+                "password",
+                str_val(hop_cfg.shadowtls_password.trim()),
+            );
+            if !hop_cfg.sni.trim().is_empty() {
+                insert(&mut stls, "sni_hostname", str_val(hop_cfg.sni.trim()));
             }
-            insert(&mut stls, "protocol", Value::Mapping(inner));
+            insert(&mut stls, "protocol", transported);
             Value::Mapping(stls)
-        } else if m.tls {
+        }
+        "reality" => {
+            if hop_cfg.reality_public_key.trim().is_empty() {
+                return Err(anyhow!("{label}: REALITY outbound requires public_key"));
+            }
+            if hop_cfg.sni.trim().is_empty() {
+                return Err(anyhow!("{label}: REALITY outbound requires sni_hostname"));
+            }
+            let mut rm = Mapping::new();
+            insert(&mut rm, "type", str_val("reality"));
+            insert(
+                &mut rm,
+                "public_key",
+                str_val(hop_cfg.reality_public_key.trim()),
+            );
+            insert(
+                &mut rm,
+                "short_id",
+                str_val(hop_cfg.reality_short_id.trim()),
+            );
+            insert(&mut rm, "sni_hostname", str_val(hop_cfg.sni.trim()));
+            if !hop_cfg.reality_mldsa65_verify.trim().is_empty() {
+                insert(
+                    &mut rm,
+                    "mldsa65_verify",
+                    str_val(hop_cfg.reality_mldsa65_verify.trim()),
+                );
+            }
+            if proto == "vless" && net != "ws" && net != "xhttp" && hop_cfg.vision && !has_vless_enc {
+                insert(&mut rm, "vision", bool_val(true));
+            }
+            insert(&mut rm, "protocol", transported);
+            Value::Mapping(rm)
+        }
+        "tls" => {
+            let outer_vision =
+                proto == "vless" && net != "ws" && net != "xhttp" && hop_cfg.vision && !has_vless_enc;
             let mut tls_map = Mapping::new();
             insert(&mut tls_map, "type", str_val("tls"));
-            insert(&mut tls_map, "verify", bool_val(m.verify));
-            if !m.sni.trim().is_empty() {
-                insert(&mut tls_map, "sni_hostname", str_val(m.sni.trim()));
+            insert(&mut tls_map, "verify", bool_val(hop_cfg.verify));
+            if !hop_cfg.sni.trim().is_empty() {
+                insert(&mut tls_map, "sni_hostname", str_val(hop_cfg.sni.trim()));
             }
-            insert(&mut tls_map, "protocol", Value::Mapping(inner));
+            if !hop_cfg.alpn.is_empty() {
+                insert(
+                    &mut tls_map,
+                    "alpn_protocols",
+                    Value::Sequence(hop_cfg.alpn.iter().map(|a| str_val(a.trim())).collect()),
+                );
+            }
+            if !hop_cfg.tls_cert.trim().is_empty() && !hop_cfg.tls_key.trim().is_empty() {
+                insert(
+                    &mut tls_map,
+                    "cert",
+                    str_val(&hop_cfg.tls_cert.trim().replace('\\', "/")),
+                );
+                insert(
+                    &mut tls_map,
+                    "key",
+                    str_val(&hop_cfg.tls_key.trim().replace('\\', "/")),
+                );
+            }
+            let sfps = normalize_fingerprints(&hop_cfg.server_fingerprints)?;
+            if !sfps.is_empty() {
+                insert(&mut tls_map, "server_fingerprints", Value::Sequence(sfps));
+            }
+            if let Some(kx) =
+                validate_key_exchange_groups(&hop_cfg.key_exchange_groups, outer_vision, false)?
+            {
+                insert(&mut tls_map, "key_exchange_groups", Value::Sequence(kx));
+            }
+            if outer_vision {
+                insert(&mut tls_map, "vision", bool_val(true));
+            }
+            insert(&mut tls_map, "protocol", transported);
             Value::Mapping(tls_map)
-        } else {
-            Value::Mapping(inner)
-        };
-        insert(&mut hop, "protocol", final_proto);
+        }
+        _ => transported,
+    };
+
+    // Outermost Sudoku TCP FinalMask wrapper (optional)
+    let final_proto = wrap_sudoku_mask(secured, &hop_cfg.sudoku)?;
+    insert(&mut hop, "protocol", final_proto);
+    Ok(Value::Mapping(hop))
+}
+
+fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
+    let mut wrapper = Mapping::new();
+    let primary = m.primary_hop();
+    let is_multi_hop = !m.extra_hops.is_empty();
+
+    if is_multi_hop {
+        if !m.name.trim().is_empty() {
+            insert(&mut wrapper, "name", str_val(m.name.trim()));
+        }
+        let mut hops_seq = Vec::with_capacity(1 + m.extra_hops.len());
+        hops_seq.push(build_outbound_hop_value(
+            &primary,
+            None,
+            &format!("Outbound '{}' hop 1", m.name),
+            0,
+        )?);
+        for (idx, extra) in m.extra_hops.iter().enumerate() {
+            hops_seq.push(build_outbound_hop_value(
+                extra,
+                None,
+                &format!("Outbound '{}' hop {}", m.name, idx + 2),
+                idx + 1,
+            )?);
+        }
+        insert(&mut wrapper, "chain", Value::Sequence(hops_seq));
+        return Ok(Value::Mapping(wrapper));
     }
 
-    insert(&mut wrapper, "chain", Value::Sequence(vec![Value::Mapping(hop)]));
+    if primary.protocol == "group" {
+        insert(
+            &mut wrapper,
+            "chain",
+            Value::Sequence(vec![str_val(primary.address.trim())]),
+        );
+        return Ok(Value::Mapping(wrapper));
+    }
+
+    let hop0 = build_outbound_hop_value(
+        &primary,
+        Some(m.name.as_str()),
+        &format!("Outbound '{}'", m.name),
+        0,
+    )?;
+    insert(&mut wrapper, "chain", Value::Sequence(vec![hop0]));
     Ok(Value::Mapping(wrapper))
 }
 
@@ -1266,9 +1729,16 @@ fn apply_outbound_to_rule(
 /// Validates and normalizes an inbound port range string (e.g. `"20000-20100"` or `"20000,20010-20020"`),
 /// ensuring the primary `port` is included and total expanded ports stay within safe bounds.
 pub fn normalize_port_range_spec(port: u16, raw: &str) -> Result<Option<String>> {
+    let parts: Vec<_> = parse_port_ranges(port, raw)?.into_iter().map(|(start, end)| {
+        if start == end { start.to_string() } else { format!("{start}-{end}") }
+    }).collect();
+    Ok((!parts.is_empty()).then(|| parts.join(",")))
+}
+
+pub(crate) fn parse_port_ranges(port: u16, raw: &str) -> Result<Vec<(u16, u16)>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut parts = Vec::new();
     let mut total_ports: usize = 0;
@@ -1294,11 +1764,7 @@ pub fn normalize_port_range_spec(port: u16, raw: &str) -> Result<Option<String>>
             if port >= start && port <= end {
                 includes_primary = true;
             }
-            parts.push(if start == end {
-                start.to_string()
-            } else {
-                format!("{start}-{end}")
-            });
+            parts.push((start, end));
         } else {
             let p: u16 = token
                 .parse()
@@ -1310,15 +1776,15 @@ pub fn normalize_port_range_spec(port: u16, raw: &str) -> Result<Option<String>>
             if p == port {
                 includes_primary = true;
             }
-            parts.push(p.to_string());
+            parts.push((p, p));
         }
     }
 
     if parts.is_empty() {
-        return Ok(None);
+        return Ok(parts);
     }
     if !includes_primary {
-        parts.insert(0, port.to_string());
+        parts.insert(0, (port, port));
         total_ports = total_ports.saturating_add(1);
     }
     if total_ports > 2048 {
@@ -1326,36 +1792,260 @@ pub fn normalize_port_range_spec(port: u16, raw: &str) -> Result<Option<String>>
             "port_range expands to {total_ports} ports (maximum supported per inbound is 2048)"
         ));
     }
-    Ok(Some(parts.join(",")))
+    Ok(parts)
 }
 
-fn build_inbound_entry(
-    data_dir: &Path,
+fn build_rules_value_opt(
+    rules_ref: &str,
+    has_panel_routing: bool,
+    group_names: &HashSet<String>,
+    is_override: bool,
+) -> Option<Value> {
+    let rref = rules_ref.trim();
+    if rref.eq_ignore_ascii_case("direct") {
+        if is_override {
+            let mut r = Mapping::new();
+            insert(&mut r, "masks", str_val("0.0.0.0/0"));
+            insert(&mut r, "action", str_val("allow"));
+            let mut p = Mapping::new();
+            insert(&mut p, "type", str_val("direct"));
+            let mut cc = Mapping::new();
+            insert(&mut cc, "protocol", Value::Mapping(p));
+            insert(&mut r, "client_chain", Value::Mapping(cc));
+            Some(Value::Sequence(vec![Value::Mapping(r)]))
+        } else {
+            None
+        }
+    } else if rref.eq_ignore_ascii_case("block") {
+        let mut cond = Mapping::new();
+        insert(&mut cond, "any_destination", bool_val(true));
+        let mut r = Mapping::new();
+        insert(&mut r, "conditions", Value::Mapping(cond));
+        insert(&mut r, "action", str_val("block"));
+        Some(Value::Sequence(vec![Value::Mapping(r)]))
+    } else if !rref.is_empty() {
+        if group_names.contains(rref) {
+            let mut r = Mapping::new();
+            insert(&mut r, "masks", str_val("0.0.0.0/0"));
+            insert(&mut r, "action", str_val("allow"));
+            insert(&mut r, "client_chain", str_val(rref));
+            Some(Value::Sequence(vec![Value::Mapping(r)]))
+        } else {
+            Some(str_val(rref))
+        }
+    } else if !is_override && has_panel_routing {
+        Some(str_val("panel-routing"))
+    } else {
+        None
+    }
+}
+
+fn build_wireguard_server_entry(
     ib: &Inbound,
+    enabled_clients: &[&ClientRecord],
     has_panel_routing: bool,
     group_names: &HashSet<String>,
     dns_names: &HashSet<String>,
-    acme_cert_names: &HashSet<String>,
 ) -> Result<Option<Value>> {
-    // Allow full raw YAML override for advanced power-user protocols
-    if !ib.protocol_settings.raw_override_yaml.trim().is_empty() {
-        let mut raw_val: Value = serde_yaml::from_str(&ib.protocol_settings.raw_override_yaml)
-            .context("invalid raw_override_yaml")?;
-        if let Value::Mapping(ref mut m) = raw_val {
-            // Ensure stable dashboard identity for traffic tracking
-            insert(m, "name", str_val(&ib.tag));
-        }
-        return Ok(Some(raw_val));
-    }
-
-    let enabled_clients: Vec<&ClientRecord> = ib.clients.iter().filter(|c| c.enable).collect();
-    if enabled_clients.is_empty()
-        && !matches!(ib.protocol.as_str(), "socks" | "http" | "mixed" | "portforward")
-    {
-        // No enabled credentials -> do not open listener
+    if enabled_clients.is_empty() {
         return Ok(None);
     }
+    let ps = &ib.protocol_settings;
+    let ss = &ib.stream_settings;
+    if ss.sudoku.enabled {
+        return Err(anyhow!(
+            "Sudoku TCP mask cannot be enabled on WireGuard inbound"
+        ));
+    }
+    if !ps.port_range.trim().is_empty() {
+        return Err(anyhow!(
+            "WireGuard server inbound does not support port ranges in shoes"
+        ));
+    }
+    let priv_key = ps.wg_server_private_key.trim();
+    if priv_key.is_empty() {
+        return Err(anyhow!("WireGuard server inbound requires private_key"));
+    }
+    let addrs: Vec<String> = if ps.wg_server_addresses.is_empty() {
+        vec!["10.77.0.1/32".to_string(), "fd77::1/128".to_string()]
+    } else {
+        ps.wg_server_addresses
+            .iter()
+            .flat_map(|s| split_items(s))
+            .collect()
+    };
+    if addrs.is_empty() {
+        return Err(anyhow!(
+            "WireGuard server inbound requires at least one tunnel address (e.g. 10.77.0.1/32)"
+        ));
+    }
 
+    let mut peers_seq = Vec::new();
+    for c in enabled_clients {
+        let peer_pub = if !c.wg_public_key.trim().is_empty() {
+            c.wg_public_key.trim().to_string()
+        } else if !c.wg_private_key.trim().is_empty() {
+            crate::crypto_util::derive_wireguard_public_key(&c.wg_private_key)?
+        } else {
+            return Err(anyhow!(
+                "WireGuard peer '{}' requires public_key (or private_key)",
+                c.name
+            ));
+        };
+        let allowed: Vec<String> = split_items(&c.wg_allowed_ips);
+        if allowed.is_empty() {
+            return Err(anyhow!(
+                "WireGuard peer '{}' requires allowed_ips (e.g. 10.77.0.2/32)",
+                c.name
+            ));
+        }
+        let mut pm = Mapping::new();
+        insert(&mut pm, "public_key", str_val(&peer_pub));
+        if !c.wg_preshared_key.trim().is_empty() {
+            insert(&mut pm, "pre_shared_key", str_val(c.wg_preshared_key.trim()));
+        }
+        insert(
+            &mut pm,
+            "allowed_ips",
+            Value::Sequence(allowed.into_iter().map(|a| str_val(&a)).collect()),
+        );
+        if c.wg_keepalive > 0 {
+            insert(&mut pm, "persistent_keepalive", num_u64(c.wg_keepalive as u64));
+        }
+        peers_seq.push(Value::Mapping(pm));
+    }
+
+    let mut wg = Mapping::new();
+    insert(&mut wg, "type", str_val("wireguard"));
+    insert(&mut wg, "wireguard_name", str_val(&ib.tag));
+    insert(&mut wg, "private_key", str_val(priv_key));
+    insert(
+        &mut wg,
+        "addresses",
+        Value::Sequence(addrs.into_iter().map(|a| str_val(&a)).collect()),
+    );
+    insert(&mut wg, "peers", Value::Sequence(peers_seq));
+    if ps.wg_mtu > 0 {
+        if !(1280..=1420).contains(&ps.wg_mtu) {
+            return Err(anyhow!("WireGuard server MTU must be between 1280 and 1420"));
+        }
+        insert(&mut wg, "mtu", num_u64(ps.wg_mtu as u64));
+    }
+    if !ps.wg_bind_interface.trim().is_empty() {
+        insert(&mut wg, "bind_interface", str_val(ps.wg_bind_interface.trim()));
+    }
+    if ps.wg_tcp_buffer_size.is_some() || ps.wg_tcp_memory_bytes.is_some() {
+        let mut rl = Mapping::new();
+        if let Some(buf) = ps.wg_tcp_buffer_size.filter(|&v| v > 0) {
+            insert(&mut rl, "tcp_buffer_size", num_u64(buf as u64));
+        }
+        if let Some(mem) = ps.wg_tcp_memory_bytes.filter(|&v| v > 0) {
+            insert(&mut rl, "tcp_memory_bytes", num_u64(mem));
+        }
+        if !rl.is_empty() {
+            insert(&mut wg, "resource_limits", Value::Mapping(rl));
+        }
+    }
+
+    let mut server = Mapping::new();
+    insert(&mut server, "name", str_val(&ib.tag));
+    let bind_ip = if ib.listen.trim().is_empty() {
+        "0.0.0.0"
+    } else {
+        ib.listen.trim()
+    };
+    let bind_addr = if bind_ip.contains(':') && !bind_ip.starts_with('[') {
+        format!("[{bind_ip}]:{}", ib.port)
+    } else {
+        format!("{bind_ip}:{}", ib.port)
+    };
+    insert(&mut server, "address", str_val(&bind_addr));
+    insert(&mut server, "transport", str_val("udp"));
+    if ps.sniff {
+        insert(&mut server, "sniff", bool_val(true));
+    }
+    insert(&mut server, "protocol", Value::Mapping(wg));
+
+    // WireGuard server strictly requires explicit non-empty top-level `rules`.
+    let rref = ps.rules_ref.trim();
+    if rref.is_empty() && has_panel_routing && !ps.wg_block_private {
+        insert(&mut server, "rules", str_val("panel-routing"));
+    } else {
+        let mut rules_seq: Vec<Value> = Vec::new();
+        if ps.wg_block_private {
+            let mut blk = Mapping::new();
+            insert(
+                &mut blk,
+                "masks",
+                Value::Sequence(vec![
+                    str_val("127.0.0.0/8"),
+                    str_val("::1/128"),
+                    str_val("169.254.0.0/16"),
+                    str_val("fe80::/10"),
+                ]),
+            );
+            insert(&mut blk, "action", str_val("block"));
+            rules_seq.push(Value::Mapping(blk));
+        }
+        if rref.eq_ignore_ascii_case("block") {
+            let mut blk = Mapping::new();
+            insert(
+                &mut blk,
+                "masks",
+                Value::Sequence(vec![str_val("0.0.0.0/0"), str_val("::/0")]),
+            );
+            insert(&mut blk, "action", str_val("block"));
+            rules_seq.push(Value::Mapping(blk));
+        } else if !rref.is_empty() && !rref.eq_ignore_ascii_case("direct") {
+            if group_names.contains(rref) {
+                let mut alw = Mapping::new();
+                insert(
+                    &mut alw,
+                    "masks",
+                    Value::Sequence(vec![str_val("0.0.0.0/0"), str_val("::/0")]),
+                );
+                insert(&mut alw, "action", str_val("allow"));
+                insert(&mut alw, "client_chain", str_val(rref));
+                rules_seq.push(Value::Mapping(alw));
+            } else {
+                rules_seq.push(str_val(rref));
+            }
+        } else if has_panel_routing {
+            rules_seq.push(str_val("panel-routing"));
+        } else {
+            let mut alw = Mapping::new();
+            insert(
+                &mut alw,
+                "masks",
+                Value::Sequence(vec![str_val("0.0.0.0/0"), str_val("::/0")]),
+            );
+            insert(&mut alw, "action", str_val("allow"));
+            rules_seq.push(Value::Mapping(alw));
+        }
+        insert(&mut server, "rules", Value::Sequence(rules_seq));
+    }
+
+    let dref = ps.dns_group.trim();
+    if dref == "__system__" {
+        insert(&mut server, "dns", Value::Mapping(Mapping::new()));
+    } else if !dref.is_empty() {
+        if !dns_names.contains(dref) {
+            return Err(anyhow!(
+                "Inbound references unknown or disabled DNS group '{dref}'"
+            ));
+        }
+        let mut dm = Mapping::new();
+        insert(&mut dm, "servers", str_val(dref));
+        insert(&mut server, "dns", Value::Mapping(dm));
+    }
+
+    Ok(Some(Value::Mapping(server)))
+}
+
+fn build_transported_inner_protocol(
+    ib: &Inbound,
+    enabled_clients: &[&ClientRecord],
+) -> Result<Value> {
     let primary = enabled_clients.first().copied();
     let ps = &ib.protocol_settings;
     let ss = &ib.stream_settings;
@@ -1367,7 +2057,6 @@ fn build_inbound_entry(
         ));
     }
 
-    // 1. Build innermost protocol config
     let mut inner = Mapping::new();
     match ib.protocol.as_str() {
         "vless" => {
@@ -1556,8 +2245,6 @@ fn build_inbound_entry(
     }
 
     let is_quic = ib.is_quic();
-
-    // 2. Wrap stream transport (WebSocket / XHTTP) if configured
     let transported = if !is_quic && ss.network == "ws" {
         let mut target = Mapping::new();
         if !ss.ws.path.trim().is_empty() {
@@ -1623,7 +2310,422 @@ fn build_inbound_entry(
         Value::Mapping(inner)
     };
 
-    // 3. Build outer server record + TLS / Reality / QUIC security
+    Ok(transported)
+}
+
+fn build_tls_target_mapping(
+    ib: &Inbound,
+    transported: Value,
+    override_rules: Option<Value>,
+) -> Result<Mapping> {
+    let ss = &ib.stream_settings;
+    let has_vless_enc = ib.has_vless_native_encryption();
+    let tls_vision = ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision && !has_vless_enc;
+
+    let mut target = Mapping::new();
+    apply_cert_fields(&mut target, &ss.tls, &ib.remark)?;
+    if ib.protocol == "naiveproxy"
+        && !ss.tls.alpn.is_empty()
+        && !ss.tls.alpn.iter().any(|a| a == "h2")
+    {
+        return Err(anyhow!("NaiveProxy requires h2 in TLS ALPN"));
+    }
+    let alpn: Vec<String> = if ib.protocol == "naiveproxy" {
+        if ss.tls.alpn.is_empty() || (ss.tls.alpn.len() == 1 && ss.tls.alpn[0] == "h2") {
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        } else {
+            ss.tls.alpn.clone()
+        }
+    } else if !ss.tls.alpn.is_empty() {
+        ss.tls.alpn.clone()
+    } else {
+        Vec::new()
+    };
+    if !alpn.is_empty() {
+        insert(
+            &mut target,
+            "alpn_protocols",
+            Value::Sequence(alpn.iter().map(|a| str_val(a)).collect()),
+        );
+    }
+    if let Some(kx) = validate_key_exchange_groups(&ss.tls.key_exchange_groups, tls_vision, false)? {
+        insert(&mut target, "key_exchange_groups", Value::Sequence(kx));
+    }
+    apply_mtls_fields(&mut target, &ss.tls.client_ca_certs, &ss.tls.client_fingerprints)?;
+    if tls_vision {
+        insert(&mut target, "vision", bool_val(true));
+    }
+    insert(&mut target, "protocol", transported);
+    if let Some(ov) = override_rules {
+        insert(&mut target, "override_rules", ov);
+    }
+    Ok(target)
+}
+
+fn build_reality_target_mapping(
+    ib: &Inbound,
+    transported: Value,
+    override_rules: Option<Value>,
+) -> Result<(String, Mapping)> {
+    let ss = &ib.stream_settings;
+    let has_vless_enc = ib.has_vless_native_encryption();
+    let sni = ss.reality.sni.trim();
+    if sni.is_empty() {
+        return Err(anyhow!("Reality requires SNI hostname"));
+    }
+    if ss.reality.private_key.trim().is_empty() {
+        return Err(anyhow!("Reality requires private_key"));
+    }
+    let dest = if ss.reality.dest.trim().is_empty() {
+        format!("{sni}:443")
+    } else {
+        ss.reality.dest.trim().to_string()
+    };
+    if dest.parse::<std::net::SocketAddr>().is_ok() || dest.parse::<std::net::IpAddr>().is_ok() {
+        return Err(anyhow!(
+            "REALITY destination must use a DNS hostname, such as example.com:443"
+        ));
+    }
+    let mut rtarget = Mapping::new();
+    insert(
+        &mut rtarget,
+        "private_key",
+        str_val(ss.reality.private_key.trim()),
+    );
+    if !ss.reality.mldsa65_seed.trim().is_empty() {
+        insert(
+            &mut rtarget,
+            "mldsa65_seed",
+            str_val(ss.reality.mldsa65_seed.trim()),
+        );
+    }
+    let sids: Vec<Value> = if ss.reality.short_ids.is_empty() {
+        vec![str_val("")]
+    } else {
+        ss.reality
+            .short_ids
+            .iter()
+            .map(|s| str_val(s.trim()))
+            .collect()
+    };
+    insert(&mut rtarget, "short_ids", Value::Sequence(sids));
+    insert(&mut rtarget, "dest", str_val(&dest));
+    if ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision && !has_vless_enc {
+        insert(&mut rtarget, "vision", bool_val(true));
+    }
+    insert(&mut rtarget, "protocol", transported);
+    if let Some(ov) = override_rules {
+        insert(&mut rtarget, "override_rules", ov);
+    }
+    Ok((sni.to_string(), rtarget))
+}
+
+fn build_shadowtls_target_mapping(
+    ib: &Inbound,
+    transported: Value,
+    override_rules: Option<Value>,
+) -> Result<(String, Mapping)> {
+    let st = &ib.stream_settings.shadowtls;
+    let sni = st.sni.trim();
+    if sni.is_empty() {
+        return Err(anyhow!("ShadowTLS v3 requires an SNI hostname"));
+    }
+    if st.password.trim().is_empty() {
+        return Err(anyhow!("ShadowTLS v3 requires a password"));
+    }
+    let mut handshake = Mapping::new();
+    if st.handshake_mode.trim() == "local" {
+        if st.cert_file.trim().is_empty() || st.key_file.trim().is_empty() {
+            return Err(anyhow!(
+                "ShadowTLS v3 local handshake requires both cert_file and key_file"
+            ));
+        }
+        insert(
+            &mut handshake,
+            "cert",
+            str_val(&st.cert_file.trim().replace('\\', "/")),
+        );
+        insert(
+            &mut handshake,
+            "key",
+            str_val(&st.key_file.trim().replace('\\', "/")),
+        );
+        apply_mtls_fields(&mut handshake, &st.client_ca_certs, &st.client_fingerprints)?;
+    } else {
+        let raw_addr = if st.handshake_addr.trim().is_empty() {
+            format!("{sni}:443")
+        } else if st.handshake_addr.trim().contains(':') {
+            st.handshake_addr.trim().to_string()
+        } else {
+            format!("{}:443", st.handshake_addr.trim())
+        };
+        insert(&mut handshake, "address", str_val(&raw_addr));
+    }
+
+    let mut st_target = Mapping::new();
+    insert(&mut st_target, "password", str_val(st.password.trim()));
+    insert(&mut st_target, "handshake", Value::Mapping(handshake));
+    insert(&mut st_target, "protocol", transported);
+    if let Some(ov) = override_rules {
+        insert(&mut st_target, "override_rules", ov);
+    }
+    Ok((sni.to_string(), st_target))
+}
+
+/// Merges multiple TLS / REALITY / ShadowTLS TCP inbounds sharing the same `(listen, port)`
+/// into a single `type: tls` listener with SNI-based dispatch and per-target `override_rules`.
+fn build_shared_sni_server_entry(
+    members: &[&Inbound],
+    has_panel_routing: bool,
+    group_names: &HashSet<String>,
+    dns_names: &HashSet<String>,
+    acme_cert_names: &HashSet<String>,
+) -> Result<Option<Value>> {
+    let mut tls_targets = Mapping::new();
+    let mut reality_targets = Mapping::new();
+    let mut shadowtls_targets = Mapping::new();
+    let mut default_tls_target: Option<Mapping> = None;
+    let mut claimed_snis: HashSet<String> = HashSet::new();
+    let mut any_sniff = false;
+    let mut shared_dns: Option<String> = None;
+    let mut primary_tag: Option<String> = None;
+    let mut active_count = 0usize;
+
+    for ib in members {
+        let enabled_clients: Vec<&ClientRecord> = ib.clients.iter().filter(|c| c.enable).collect();
+        if enabled_clients.is_empty()
+            && !matches!(ib.protocol.as_str(), "socks" | "http" | "mixed")
+        {
+            continue;
+        }
+        active_count += 1;
+        if primary_tag.is_none() {
+            primary_tag = Some(ib.tag.clone());
+        }
+        if ib.protocol_settings.sniff {
+            any_sniff = true;
+        }
+        let dref = ib.protocol_settings.dns_group.trim();
+        if !dref.is_empty() {
+            if let Some(ref prev) = shared_dns {
+                if prev != dref {
+                    return Err(anyhow!(
+                        "Inbounds sharing port {} cannot use conflicting dns_group settings ('{}' vs '{}')",
+                        ib.port,
+                        prev,
+                        dref
+                    ));
+                }
+            } else {
+                shared_dns = Some(dref.to_string());
+            }
+        }
+
+        let transported = build_transported_inner_protocol(ib, &enabled_clients)
+            .with_context(|| format!("inbound '{}' (port {})", ib.remark, ib.port))?;
+        let ov_rules = build_rules_value_opt(
+            &ib.protocol_settings.rules_ref,
+            has_panel_routing,
+            group_names,
+            true,
+        );
+
+        match ib.stream_settings.security.as_str() {
+            "tls" => {
+                let target = build_tls_target_mapping(ib, transported, ov_rules)
+                    .with_context(|| format!("inbound '{}'", ib.remark))?;
+                let raw_sni = ib.stream_settings.tls.sni.trim();
+                let is_ip_sni = !raw_sni.is_empty()
+                    && raw_sni.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+                let uses_acme = ib.stream_settings.tls.cert_mode == "source"
+                    && acme_cert_names.contains(ib.stream_settings.tls.certificate_source.trim());
+                let sni = if is_ip_sni {
+                    String::new()
+                } else if uses_acme {
+                    raw_sni.trim_end_matches('.').to_ascii_lowercase()
+                } else {
+                    raw_sni.to_string()
+                };
+                if sni.is_empty() {
+                    if default_tls_target.is_some() {
+                        return Err(anyhow!(
+                            "Port {} already has a default TLS target; specify a unique SNI on inbound '{}'",
+                            ib.port,
+                            ib.remark
+                        ));
+                    }
+                    default_tls_target = Some(target);
+                } else {
+                    let key = sni.trim_end_matches('.').to_ascii_lowercase();
+                    if !claimed_snis.insert(key) {
+                        return Err(anyhow!(
+                            "Duplicate SNI '{sni}' on shared port {} (inbound '{}')",
+                            ib.port,
+                            ib.remark
+                        ));
+                    }
+                    insert(&mut tls_targets, &sni, Value::Mapping(target));
+                }
+            }
+            "reality" => {
+                let (sni, rtarget) = build_reality_target_mapping(ib, transported, ov_rules)
+                    .with_context(|| format!("inbound '{}'", ib.remark))?;
+                let key = sni.trim_end_matches('.').to_ascii_lowercase();
+                if !claimed_snis.insert(key) {
+                    return Err(anyhow!(
+                        "Duplicate SNI '{sni}' on shared port {} (inbound '{}')",
+                        ib.port,
+                        ib.remark
+                    ));
+                }
+                insert(&mut reality_targets, &sni, Value::Mapping(rtarget));
+            }
+            "shadowtls" => {
+                let (sni, st_target) = build_shadowtls_target_mapping(ib, transported, ov_rules)
+                    .with_context(|| format!("inbound '{}'", ib.remark))?;
+                let key = sni.trim_end_matches('.').to_ascii_lowercase();
+                if !claimed_snis.insert(key) {
+                    return Err(anyhow!(
+                        "Duplicate SNI '{sni}' on shared port {} (inbound '{}')",
+                        ib.port,
+                        ib.remark
+                    ));
+                }
+                insert(&mut shadowtls_targets, &sni, Value::Mapping(st_target));
+            }
+            other => {
+                return Err(anyhow!(
+                    "Inbound '{}' with security '{other}' cannot share SNI port {}",
+                    ib.remark,
+                    ib.port
+                ));
+            }
+        }
+    }
+
+    if active_count == 0 {
+        return Ok(None);
+    }
+
+    let first = members[0];
+    let bind_ip = if first.listen.trim().is_empty() {
+        "0.0.0.0"
+    } else {
+        first.listen.trim()
+    };
+    let bind_addr = if bind_ip.contains(':') && !bind_ip.starts_with('[') {
+        format!("[{bind_ip}]:{}", first.port)
+    } else {
+        format!("{bind_ip}:{}", first.port)
+    };
+
+    let mut tls_outer = Mapping::new();
+    insert(&mut tls_outer, "type", str_val("tls"));
+    if !tls_targets.is_empty() {
+        insert(&mut tls_outer, "tls_targets", Value::Mapping(tls_targets));
+    }
+    if let Some(def) = default_tls_target {
+        insert(&mut tls_outer, "default_tls_target", Value::Mapping(def));
+    }
+    if !reality_targets.is_empty() {
+        insert(
+            &mut tls_outer,
+            "reality_targets",
+            Value::Mapping(reality_targets),
+        );
+    }
+    if !shadowtls_targets.is_empty() {
+        insert(
+            &mut tls_outer,
+            "shadowtls_targets",
+            Value::Mapping(shadowtls_targets),
+        );
+    }
+
+    let mut server = Mapping::new();
+    if let Some(tag) = primary_tag {
+        insert(&mut server, "name", str_val(&tag));
+    }
+    insert(&mut server, "address", str_val(&bind_addr));
+    if any_sniff {
+        insert(&mut server, "sniff", bool_val(true));
+    }
+    insert(&mut server, "protocol", Value::Mapping(tls_outer));
+
+    if has_panel_routing {
+        insert(&mut server, "rules", str_val("panel-routing"));
+    }
+
+    if let Some(dref) = shared_dns {
+        if dref == "__system__" {
+            insert(&mut server, "dns", Value::Mapping(Mapping::new()));
+        } else {
+            if !dns_names.contains(&dref) {
+                return Err(anyhow!(
+                    "Shared SNI port references unknown or disabled DNS group '{dref}'"
+                ));
+            }
+            let mut dm = Mapping::new();
+            insert(&mut dm, "servers", str_val(&dref));
+            insert(&mut server, "dns", Value::Mapping(dm));
+        }
+    }
+
+    Ok(Some(Value::Mapping(server)))
+}
+
+fn build_inbound_entry(
+    data_dir: &Path,
+    ib: &Inbound,
+    has_panel_routing: bool,
+    group_names: &HashSet<String>,
+    dns_names: &HashSet<String>,
+    acme_cert_names: &HashSet<String>,
+) -> Result<Option<Value>> {
+    // Allow full raw YAML override for advanced power-user protocols
+    if !ib.protocol_settings.raw_override_yaml.trim().is_empty() {
+        let mut raw_val: Value = serde_yaml::from_str(&ib.protocol_settings.raw_override_yaml)
+            .context("invalid raw_override_yaml")?;
+        if let Value::Mapping(ref mut m) = raw_val {
+            // Ensure stable dashboard identity for traffic tracking
+            insert(m, "name", str_val(&ib.tag));
+        }
+        return Ok(Some(raw_val));
+    }
+
+    let enabled_clients: Vec<&ClientRecord> = ib.clients.iter().filter(|c| c.enable).collect();
+    if enabled_clients.is_empty()
+        && !matches!(ib.protocol.as_str(), "socks" | "http" | "mixed" | "portforward")
+    {
+        // No enabled credentials -> do not open listener
+        return Ok(None);
+    }
+
+    if ib.protocol == "wireguard" {
+        return build_wireguard_server_entry(
+            ib,
+            &enabled_clients,
+            has_panel_routing,
+            group_names,
+            dns_names,
+        );
+    }
+
+    let ps = &ib.protocol_settings;
+    let ss = &ib.stream_settings;
+    let is_quic = ib.is_quic();
+
+    if ss.sudoku.enabled && is_quic {
+        return Err(anyhow!(
+            "Sudoku TCP mask cannot be enabled on QUIC inbound '{}'",
+            ib.remark
+        ));
+    }
+
+    // 1-2. Build innermost protocol + stream transport (WS/XHTTP)
+    let transported = build_transported_inner_protocol(ib, &enabled_clients)?;
+
+    // 3. Build outer server record + TLS / Reality / ShadowTLS / QUIC + optional Sudoku mask
     let mut server = Mapping::new();
     insert(&mut server, "name", str_val(&ib.tag));
     let bind_ip = if ib.listen.trim().is_empty() {
@@ -1648,8 +2750,16 @@ fn build_inbound_entry(
         let mut qmap = Mapping::new();
         if ib.uses_auto_quic_cert() {
             let dir = auto_quic_cert_dir(data_dir);
-            insert(&mut qmap, "cert", str_val(&dir.join("cert.pem").to_string_lossy()));
-            insert(&mut qmap, "key", str_val(&dir.join("key.pem").to_string_lossy()));
+            insert(
+                &mut qmap,
+                "cert",
+                str_val(&dir.join("cert.pem").to_string_lossy()),
+            );
+            insert(
+                &mut qmap,
+                "key",
+                str_val(&dir.join("key.pem").to_string_lossy()),
+            );
         } else {
             apply_cert_fields(&mut qmap, &ss.tls, &ib.remark)?;
         }
@@ -1663,191 +2773,74 @@ fn build_inbound_entry(
             "alpn_protocols",
             Value::Sequence(q_alpn.iter().map(|a| str_val(a)).collect()),
         );
+        if let Some(kx) = validate_key_exchange_groups(
+            &ss.tls.key_exchange_groups,
+            false,
+            ib.protocol == "tuic" && ps.zero_rtt_handshake,
+        )? {
+            insert(&mut qmap, "key_exchange_groups", Value::Sequence(kx));
+        }
+        apply_mtls_fields(&mut qmap, &ss.tls.client_ca_certs, &ss.tls.client_fingerprints)?;
         insert(&mut server, "quic_settings", Value::Mapping(qmap));
         insert(&mut server, "protocol", transported);
-    } else if ss.security == "tls" {
-        let mut target = Mapping::new();
-        apply_cert_fields(&mut target, &ss.tls, &ib.remark)?;
-        if ib.protocol == "naiveproxy" && !ss.tls.alpn.is_empty() && !ss.tls.alpn.iter().any(|a| a == "h2") {
-            return Err(anyhow!("NaiveProxy requires h2 in TLS ALPN"));
-        }
-        let alpn: Vec<String> = if ib.protocol == "naiveproxy" {
-            if ss.tls.alpn.is_empty() || (ss.tls.alpn.len() == 1 && ss.tls.alpn[0] == "h2") {
-                vec!["h2".to_string(), "http/1.1".to_string()]
-            } else {
-                ss.tls.alpn.clone()
-            }
-        } else if !ss.tls.alpn.is_empty() {
-            ss.tls.alpn.clone()
-        } else {
-            Vec::new()
-        };
-        if !alpn.is_empty() {
-            insert(
-                &mut target,
-                "alpn_protocols",
-                Value::Sequence(alpn.iter().map(|a| str_val(a)).collect()),
-            );
-        }
-        if ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision && !has_vless_enc {
-            insert(&mut target, "vision", bool_val(true));
-        }
-        insert(&mut target, "protocol", transported);
-
-        let mut tls_outer = Mapping::new();
-        insert(&mut tls_outer, "type", str_val("tls"));
-        let raw_sni = ss.tls.sni.trim();
-        let is_ip_sni = !raw_sni.is_empty()
-            && raw_sni.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
-        let uses_acme = ss.tls.cert_mode == "source"
-            && acme_cert_names.contains(ss.tls.certificate_source.trim());
-        let sni = if is_ip_sni {
-            // RFC 6066 forbids IP addresses in TLS SNI; match via default_tls_target so no-SNI IP handshakes succeed.
-            String::new()
-        } else if uses_acme {
-            raw_sni.trim_end_matches('.').to_ascii_lowercase()
-        } else {
-            raw_sni.to_string()
-        };
-        if !sni.is_empty() && !ss.tls.allow_any_sni {
-            let mut targets = Mapping::new();
-            insert(&mut targets, &sni, Value::Mapping(target));
-            insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
-        } else if !sni.is_empty() && ss.tls.allow_any_sni {
-            let mut targets = Mapping::new();
-            insert(&mut targets, &sni, Value::Mapping(target.clone()));
-            insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
-            insert(&mut tls_outer, "default_tls_target", Value::Mapping(target));
-        } else {
-            insert(&mut tls_outer, "default_tls_target", Value::Mapping(target));
-        }
-        insert(&mut server, "protocol", Value::Mapping(tls_outer));
-    } else if ss.security == "reality" {
-        let sni = ss.reality.sni.trim();
-        if sni.is_empty() {
-            return Err(anyhow!("Reality requires SNI hostname"));
-        }
-        if ss.reality.private_key.trim().is_empty() {
-            return Err(anyhow!("Reality requires private_key"));
-        }
-        let dest = if ss.reality.dest.trim().is_empty() {
-            format!("{sni}:443")
-        } else {
-            ss.reality.dest.trim().to_string()
-        };
-        if dest.parse::<std::net::SocketAddr>().is_ok() || dest.parse::<std::net::IpAddr>().is_ok() {
-            return Err(anyhow!("REALITY destination must use a DNS hostname, such as example.com:443"));
-        }
-        let mut rtarget = Mapping::new();
-        insert(
-            &mut rtarget,
-            "private_key",
-            str_val(ss.reality.private_key.trim()),
-        );
-        if !ss.reality.mldsa65_seed.trim().is_empty() {
-            insert(
-                &mut rtarget,
-                "mldsa65_seed",
-                str_val(ss.reality.mldsa65_seed.trim()),
-            );
-        }
-        let sids: Vec<Value> = if ss.reality.short_ids.is_empty() {
-            vec![str_val("")]
-        } else {
-            ss.reality
-                .short_ids
-                .iter()
-                .map(|s| str_val(s.trim()))
-                .collect()
-        };
-        insert(&mut rtarget, "short_ids", Value::Sequence(sids));
-        insert(&mut rtarget, "dest", str_val(&dest));
-        if ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision && !has_vless_enc {
-            insert(&mut rtarget, "vision", bool_val(true));
-        }
-        insert(&mut rtarget, "protocol", transported);
-
-        let mut targets = Mapping::new();
-        insert(&mut targets, sni, Value::Mapping(rtarget));
-        let mut tls_outer = Mapping::new();
-        insert(&mut tls_outer, "type", str_val("tls"));
-        insert(&mut tls_outer, "reality_targets", Value::Mapping(targets));
-        insert(&mut server, "protocol", Value::Mapping(tls_outer));
-    } else if ss.security == "shadowtls" {
-        let st = &ss.shadowtls;
-        let sni = st.sni.trim();
-        if sni.is_empty() {
-            return Err(anyhow!("ShadowTLS v3 requires an SNI hostname"));
-        }
-        if st.password.trim().is_empty() {
-            return Err(anyhow!("ShadowTLS v3 requires a password"));
-        }
-        let mut handshake = Mapping::new();
-        if st.handshake_mode.trim() == "local" {
-            if st.cert_file.trim().is_empty() || st.key_file.trim().is_empty() {
-                return Err(anyhow!(
-                    "ShadowTLS v3 local handshake requires both cert_file and key_file"
-                ));
-            }
-            insert(
-                &mut handshake,
-                "cert",
-                str_val(&st.cert_file.trim().replace('\\', "/")),
-            );
-            insert(
-                &mut handshake,
-                "key",
-                str_val(&st.key_file.trim().replace('\\', "/")),
-            );
-        } else {
-            let raw_addr = if st.handshake_addr.trim().is_empty() {
-                format!("{sni}:443")
-            } else if st.handshake_addr.trim().contains(':') {
-                st.handshake_addr.trim().to_string()
-            } else {
-                format!("{}:443", st.handshake_addr.trim())
-            };
-            insert(&mut handshake, "address", str_val(&raw_addr));
-        }
-
-        let mut st_target = Mapping::new();
-        insert(&mut st_target, "password", str_val(st.password.trim()));
-        insert(&mut st_target, "handshake", Value::Mapping(handshake));
-        insert(&mut st_target, "protocol", transported);
-
-        let mut targets = Mapping::new();
-        insert(&mut targets, sni, Value::Mapping(st_target));
-        let mut tls_outer = Mapping::new();
-        insert(&mut tls_outer, "type", str_val("tls"));
-        insert(&mut tls_outer, "shadowtls_targets", Value::Mapping(targets));
-        insert(&mut server, "protocol", Value::Mapping(tls_outer));
     } else {
-        insert(&mut server, "protocol", transported);
+        let outer_proto = if ss.security == "tls" {
+            let target = build_tls_target_mapping(ib, transported, None)?;
+            let mut tls_outer = Mapping::new();
+            insert(&mut tls_outer, "type", str_val("tls"));
+            let raw_sni = ss.tls.sni.trim();
+            let is_ip_sni = !raw_sni.is_empty()
+                && raw_sni.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+            let uses_acme = ss.tls.cert_mode == "source"
+                && acme_cert_names.contains(ss.tls.certificate_source.trim());
+            let sni = if is_ip_sni {
+                String::new()
+            } else if uses_acme {
+                raw_sni.trim_end_matches('.').to_ascii_lowercase()
+            } else {
+                raw_sni.to_string()
+            };
+            if !sni.is_empty() && !ss.tls.allow_any_sni {
+                let mut targets = Mapping::new();
+                insert(&mut targets, &sni, Value::Mapping(target));
+                insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
+            } else if !sni.is_empty() && ss.tls.allow_any_sni {
+                let mut targets = Mapping::new();
+                insert(&mut targets, &sni, Value::Mapping(target.clone()));
+                insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
+                insert(&mut tls_outer, "default_tls_target", Value::Mapping(target));
+            } else {
+                insert(&mut tls_outer, "default_tls_target", Value::Mapping(target));
+            }
+            Value::Mapping(tls_outer)
+        } else if ss.security == "reality" {
+            let (sni, rtarget) = build_reality_target_mapping(ib, transported, None)?;
+            let mut targets = Mapping::new();
+            insert(&mut targets, &sni, Value::Mapping(rtarget));
+            let mut tls_outer = Mapping::new();
+            insert(&mut tls_outer, "type", str_val("tls"));
+            insert(&mut tls_outer, "reality_targets", Value::Mapping(targets));
+            Value::Mapping(tls_outer)
+        } else if ss.security == "shadowtls" {
+            let (sni, st_target) = build_shadowtls_target_mapping(ib, transported, None)?;
+            let mut targets = Mapping::new();
+            insert(&mut targets, &sni, Value::Mapping(st_target));
+            let mut tls_outer = Mapping::new();
+            insert(&mut tls_outer, "type", str_val("tls"));
+            insert(&mut tls_outer, "shadowtls_targets", Value::Mapping(targets));
+            Value::Mapping(tls_outer)
+        } else {
+            transported
+        };
+
+        let final_proto = wrap_sudoku_mask(outer_proto, &ss.sudoku)?;
+        insert(&mut server, "protocol", final_proto);
     }
 
     // 4. Attach routing rules if configured
-    let rref = ps.rules_ref.trim();
-    if rref.eq_ignore_ascii_case("direct") {
-        // Explicit direct -> leave omitted so shoes uses direct_allow_rule
-    } else if rref.eq_ignore_ascii_case("block") {
-        let mut cond = Mapping::new();
-        insert(&mut cond, "any_destination", bool_val(true));
-        let mut r = Mapping::new();
-        insert(&mut r, "conditions", Value::Mapping(cond));
-        insert(&mut r, "action", str_val("block"));
-        insert(&mut server, "rules", Value::Sequence(vec![Value::Mapping(r)]));
-    } else if !rref.is_empty() {
-        if group_names.contains(rref) {
-            let mut r = Mapping::new();
-            insert(&mut r, "masks", str_val("0.0.0.0/0"));
-            insert(&mut r, "action", str_val("allow"));
-            insert(&mut r, "client_chain", str_val(rref));
-            insert(&mut server, "rules", Value::Sequence(vec![Value::Mapping(r)]));
-        } else {
-            insert(&mut server, "rules", str_val(rref));
-        }
-    } else if has_panel_routing {
-        insert(&mut server, "rules", str_val("panel-routing"));
+    if let Some(rules_val) = build_rules_value_opt(&ps.rules_ref, has_panel_routing, group_names, false)
+    {
+        insert(&mut server, "rules", rules_val);
     }
 
     // 4b. Attach per-inbound DNS override if configured

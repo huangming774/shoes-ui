@@ -21,13 +21,23 @@
           </div>
 
           <div v-if="item.uri" style="width: 100%">
-            <div style="display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 600">
-              <span>URI / Share Link</span>
-              <a-button size="small" type="primary" @click="doCopy(item.uri)">
-                Copy URI
-              </a-button>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-weight: 600">
+              <span>{{ item.protocol === 'wireguard' ? t('inbounds.wgQrTitle') : 'URI / Share Link' }}</span>
+              <a-space size="small">
+                <a-button v-if="item.protocol === 'wireguard'" size="small" @click="downloadWgConf(item)">
+                  ⬇ {{ t('inbounds.wgDownloadConf') }}
+                </a-button>
+                <a-button size="small" type="primary" @click="doCopy(item.uri)">
+                  {{ item.protocol === 'wireguard' ? 'Copy .conf' : 'Copy URI' }}
+                </a-button>
+              </a-space>
             </div>
-            <a-textarea :value="item.uri" :rows="3" readonly style="font-family: monospace; font-size: 12px" />
+            <a-textarea
+              :value="item.uri"
+              :rows="item.protocol === 'wireguard' ? 11 : 3"
+              readonly
+              style="font-family: monospace; font-size: 12px"
+            />
           </div>
 
           <a-collapse v-if="item.shoes_client_yaml" style="width: 100%" ghost>
@@ -88,5 +98,18 @@ watch(
 async function doCopy(txt) {
   await copyText(txt);
   message.success(t('app.copied'));
+}
+
+function downloadWgConf(item) {
+  const safeName = (item.name || 'wireguard-peer').replace(/[^a-zA-Z0-9._-]+/g, '_');
+  const blob = new Blob([item.uri || ''], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${safeName}.conf`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 </script>

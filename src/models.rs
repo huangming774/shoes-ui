@@ -70,7 +70,7 @@ pub struct Inbound {
 impl Inbound {
     /// Whether this protocol supports multiple users on a single port in upstream `shoes`.
     pub fn supports_multi_user(&self) -> bool {
-        matches!(self.protocol.as_str(), "anytls" | "naiveproxy")
+        matches!(self.protocol.as_str(), "anytls" | "naiveproxy" | "wireguard")
     }
 
     pub fn uses_auto_quic_cert(&self) -> bool {
@@ -84,6 +84,42 @@ impl Inbound {
     pub fn is_quic(&self) -> bool {
         matches!(self.protocol.as_str(), "hysteria2" | "tuic")
             || self.stream_settings.network == "quic"
+    }
+
+    /// True for UDP-based transports (QUIC protocols + WireGuard).
+    pub fn is_udp_transport(&self) -> bool {
+        self.is_quic() || self.protocol == "wireguard"
+    }
+
+    /// True when this inbound can share a single TCP `(listen, port)` listener via
+    /// outer TLS / REALITY / ShadowTLS SNI multiplexing (`tls_targets`, `reality_targets`, `shadowtls_targets`).
+    pub fn can_share_sni_port(&self) -> bool {
+        !self.is_udp_transport()
+            && self.protocol != "portforward"
+            && self.protocol_settings.raw_override_yaml.trim().is_empty()
+            && self.protocol_settings.port_range.trim().is_empty()
+            && !self.stream_settings.sudoku.enabled
+            && matches!(
+                self.stream_settings.security.as_str(),
+                "tls" | "reality" | "shadowtls"
+            )
+    }
+
+    /// Normalized SNI routing key for port-443 SNI multiplexing.
+    /// `None` represents the default/fallback TLS target (`default_tls_target`).
+    pub fn sni_mux_key(&self) -> Option<String> {
+        let ss = &self.stream_settings;
+        let raw = match ss.security.as_str() {
+            "reality" => ss.reality.sni.trim(),
+            "shadowtls" => ss.shadowtls.sni.trim(),
+            "tls" => ss.tls.sni.trim(),
+            _ => "",
+        };
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.trim_end_matches('.').to_ascii_lowercase())
+        }
     }
 
     pub fn has_vless_native_encryption(&self) -> bool {
@@ -108,7 +144,7 @@ impl Inbound {
     }
 
     /// Protocols/transports where H2Mux (`sing-mux` / `h2mux`) applies cleanly.
-    /// QUIC / Hysteria2 / TUIC / AnyTLS / NaiveProxy / XHTTP already multiplex natively.
+    /// QUIC / Hysteria2 / TUIC / AnyTLS / NaiveProxy / XHTTP / WireGuard / PortForward are excluded.
     pub fn supports_h2mux(&self) -> bool {
         let ss = &self.stream_settings;
         if ss.security == "shadowtls" {
@@ -123,7 +159,7 @@ impl Inbound {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientRecord {
     #[serde(default)]
     pub id: i64,
@@ -154,6 +190,25 @@ pub struct ClientRecord {
     pub comment: String,
     #[serde(default)]
     pub created_at: i64,
+    // WireGuard server peer fields (only used when inbound.protocol == "wireguard")
+    #[serde(default)]
+    pub wg_private_key: String,
+    #[serde(default)]
+    pub wg_public_key: String,
+    #[serde(default)]
+    pub wg_preshared_key: String,
+    #[serde(default)]
+    pub wg_allowed_ips: String,
+    #[serde(default)]
+    pub wg_keepalive: u16,
+}
+
+fn default_wg_mtu() -> u16 {
+    1408
+}
+
+fn default_wg_dns() -> String {
+    "1.1.1.1".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +241,25 @@ pub struct ProtocolSettings {
     pub port_range: String,
     #[serde(default)]
     pub forward_targets: Vec<String>,
+    // WireGuard server inbound settings
+    #[serde(default)]
+    pub wg_server_private_key: String,
+    #[serde(default)]
+    pub wg_server_public_key: String,
+    #[serde(default)]
+    pub wg_server_addresses: Vec<String>,
+    #[serde(default = "default_wg_mtu")]
+    pub wg_mtu: u16,
+    #[serde(default = "default_wg_dns")]
+    pub wg_dns: String,
+    #[serde(default)]
+    pub wg_bind_interface: String,
+    #[serde(default = "default_true")]
+    pub wg_block_private: bool,
+    #[serde(default)]
+    pub wg_tcp_buffer_size: Option<u32>,
+    #[serde(default)]
+    pub wg_tcp_memory_bytes: Option<u64>,
     #[serde(default)]
     pub raw_override_yaml: String,
 }
@@ -207,9 +281,30 @@ impl Default for ProtocolSettings {
             vless_native_vision: false,
             port_range: String::new(),
             forward_targets: Vec::new(),
+            wg_server_private_key: String::new(),
+            wg_server_public_key: String::new(),
+            wg_server_addresses: Vec::new(),
+            wg_mtu: default_wg_mtu(),
+            wg_dns: default_wg_dns(),
+            wg_bind_interface: String::new(),
+            wg_block_private: true,
+            wg_tcp_buffer_size: None,
+            wg_tcp_memory_bytes: None,
             raw_override_yaml: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SudokuMaskSettings {
+    pub enabled: bool,
+    pub password: String,
+    pub ascii: String, // "" | "prefer_entropy" | "entropy" | "prefer_ascii" | "ascii"
+    pub custom_table: String,
+    pub custom_tables: Vec<String>,
+    pub padding_min: u32,
+    pub padding_max: u32,
 }
 
 fn default_h2mux_max_connections() -> u32 {
@@ -264,6 +359,8 @@ pub struct StreamSettings {
     pub xhttp: XhttpSettings,
     #[serde(default)]
     pub h2mux: H2MuxSettings,
+    #[serde(default)]
+    pub sudoku: SudokuMaskSettings,
 }
 
 impl Default for StreamSettings {
@@ -277,6 +374,7 @@ impl Default for StreamSettings {
             ws: WsSettings::default(),
             xhttp: XhttpSettings::default(),
             h2mux: H2MuxSettings::default(),
+            sudoku: SudokuMaskSettings::default(),
         }
     }
 }
@@ -299,6 +397,10 @@ pub struct ShadowTlsSettings {
     pub cert_file: String,
     #[serde(default)]
     pub key_file: String,
+    #[serde(default)]
+    pub client_ca_certs: Vec<String>,
+    #[serde(default)]
+    pub client_fingerprints: Vec<String>,
 }
 
 impl Default for ShadowTlsSettings {
@@ -310,6 +412,8 @@ impl Default for ShadowTlsSettings {
             handshake_addr: default_reality_dest(),
             cert_file: String::new(),
             key_file: String::new(),
+            client_ca_certs: Vec::new(),
+            client_fingerprints: Vec::new(),
         }
     }
 }
@@ -336,6 +440,12 @@ pub struct TlsSettings {
     pub fingerprint: String,
     #[serde(default)]
     pub allow_insecure: bool,
+    #[serde(default)]
+    pub key_exchange_groups: Vec<String>,
+    #[serde(default)]
+    pub client_ca_certs: Vec<String>,
+    #[serde(default)]
+    pub client_fingerprints: Vec<String>,
 }
 
 fn default_cert_mode() -> String {
@@ -359,6 +469,9 @@ impl Default for TlsSettings {
             vision: false,
             fingerprint: "chrome".to_string(),
             allow_insecure: false,
+            key_exchange_groups: Vec::new(),
+            client_ca_certs: Vec::new(),
+            client_fingerprints: Vec::new(),
         }
     }
 }
@@ -539,52 +652,273 @@ fn default_http01_listen() -> String {
     "0.0.0.0:80".to_string()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Single hop inside a visual multi-hop outbound chain (used for hop 2..N in `OutboundMember.extra_hops`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutboundHop {
+    pub protocol: String, // "direct" | "group" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan" | "hysteria2" | "tuic" | "anytls" | "wireguard" | "snell"
+    pub address: String,
+    pub uuid: String,
+    pub username: String,
+    pub password: String,
+    pub cipher: String,
+    pub security: String, // "" | "none" | "tls" | "reality" | "shadowtls"
+    pub tls: bool,
+    pub shadowtls: bool,
+    pub shadowtls_password: String,
+    pub sni: String,
+    pub verify: bool,
+    pub alpn: Vec<String>,
+    pub tls_cert: String,
+    pub tls_key: String,
+    pub server_fingerprints: Vec<String>,
+    pub key_exchange_groups: Vec<String>,
+    pub reality_public_key: String,
+    pub reality_short_id: String,
+    pub reality_mldsa65_verify: String,
+    pub vision: bool,
+    pub vless_encryption: String,
+    pub network: String, // "" | "tcp" | "ws" | "xhttp"
+    pub ws_path: String,
+    pub ws_host: String,
+    pub xhttp_path: String,
+    pub xhttp_host: String,
+    pub xhttp_mode: String,
+    pub hy2_obfs_password: String,
+    pub hy2_hopping_ports: String,
+    pub tuic_udp_mode: String, // "native" | "quic"
+    pub h2mux: H2MuxSettings,
+    pub sudoku: SudokuMaskSettings,
+    pub bind_interface: String,
+    pub wg_private_key: String,
+    pub wg_public_key: String,
+    pub wg_preshared_key: String,
+    pub wg_addresses: Vec<String>,
+    pub wg_allowed_ips: Vec<String>,
+    pub wg_mtu: u16,
+    pub wg_keepalive: u16,
+    pub wg_tcp_buffer_size: Option<u32>,
+    pub wg_tcp_memory_bytes: Option<u64>,
+}
+
+impl Default for OutboundHop {
+    fn default() -> Self {
+        Self {
+            protocol: "socks".to_string(),
+            address: String::new(),
+            uuid: String::new(),
+            username: String::new(),
+            password: String::new(),
+            cipher: String::new(),
+            security: String::new(),
+            tls: false,
+            shadowtls: false,
+            shadowtls_password: String::new(),
+            sni: String::new(),
+            verify: true,
+            alpn: Vec::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            server_fingerprints: Vec::new(),
+            key_exchange_groups: Vec::new(),
+            reality_public_key: String::new(),
+            reality_short_id: String::new(),
+            reality_mldsa65_verify: String::new(),
+            vision: false,
+            vless_encryption: String::new(),
+            network: String::new(),
+            ws_path: String::new(),
+            ws_host: String::new(),
+            xhttp_path: String::new(),
+            xhttp_host: String::new(),
+            xhttp_mode: String::new(),
+            hy2_obfs_password: String::new(),
+            hy2_hopping_ports: String::new(),
+            tuic_udp_mode: String::new(),
+            h2mux: H2MuxSettings::default(),
+            sudoku: SudokuMaskSettings::default(),
+            bind_interface: String::new(),
+            wg_private_key: String::new(),
+            wg_public_key: String::new(),
+            wg_preshared_key: String::new(),
+            wg_addresses: Vec::new(),
+            wg_allowed_ips: Vec::new(),
+            wg_mtu: 0,
+            wg_keepalive: 0,
+            wg_tcp_buffer_size: None,
+            wg_tcp_memory_bytes: None,
+        }
+    }
+}
+
+impl OutboundHop {
+    pub fn effective_security(&self) -> &str {
+        let sec = self.security.trim();
+        if !sec.is_empty() {
+            sec
+        } else if self.shadowtls {
+            "shadowtls"
+        } else if !self.reality_public_key.trim().is_empty() {
+            "reality"
+        } else if self.tls {
+            "tls"
+        } else {
+            "none"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OutboundMember {
     pub name: String,
-    pub protocol: String, // "direct" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan" | "wireguard" | "group"
-    #[serde(default)]
+    pub protocol: String, // "direct" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan" | "hysteria2" | "tuic" | "anytls" | "wireguard" | "snell" | "group"
     pub address: String,
-    #[serde(default)]
     pub uuid: String,
-    #[serde(default)]
     pub username: String,
-    #[serde(default)]
     pub password: String,
-    #[serde(default)]
     pub cipher: String,
-    #[serde(default)]
+    pub security: String, // "" | "none" | "tls" | "reality" | "shadowtls"
     pub tls: bool,
-    #[serde(default)]
     pub shadowtls: bool,
-    #[serde(default)]
     pub shadowtls_password: String,
-    #[serde(default)]
     pub sni: String,
-    #[serde(default = "default_true")]
     pub verify: bool,
-    #[serde(default)]
+    pub alpn: Vec<String>,
+    pub tls_cert: String,
+    pub tls_key: String,
+    pub server_fingerprints: Vec<String>,
+    pub key_exchange_groups: Vec<String>,
+    pub reality_public_key: String,
+    pub reality_short_id: String,
+    pub reality_mldsa65_verify: String,
+    pub vision: bool,
+    pub vless_encryption: String,
+    pub network: String, // "" | "tcp" | "ws" | "xhttp"
+    pub ws_path: String,
+    pub ws_host: String,
+    pub xhttp_path: String,
+    pub xhttp_host: String,
+    pub xhttp_mode: String,
+    pub hy2_obfs_password: String,
+    pub hy2_hopping_ports: String,
+    pub tuic_udp_mode: String,
     pub h2mux: H2MuxSettings,
-    #[serde(default)]
+    pub sudoku: SudokuMaskSettings,
     pub bind_interface: String,
-    #[serde(default)]
     pub wg_private_key: String,
-    #[serde(default)]
     pub wg_public_key: String,
-    #[serde(default)]
     pub wg_preshared_key: String,
-    #[serde(default)]
     pub wg_addresses: Vec<String>,
-    #[serde(default)]
     pub wg_allowed_ips: Vec<String>,
-    #[serde(default)]
     pub wg_mtu: u16,
-    #[serde(default)]
     pub wg_keepalive: u16,
-    #[serde(default)]
     pub wg_tcp_buffer_size: Option<u32>,
-    #[serde(default)]
     pub wg_tcp_memory_bytes: Option<u64>,
+    /// Additional sequential proxy hops appended after hop 0 (visual multi-hop chain builder).
+    pub extra_hops: Vec<OutboundHop>,
+}
+
+impl Default for OutboundMember {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            protocol: String::new(),
+            address: String::new(),
+            uuid: String::new(),
+            username: String::new(),
+            password: String::new(),
+            cipher: String::new(),
+            security: String::new(),
+            tls: false,
+            shadowtls: false,
+            shadowtls_password: String::new(),
+            sni: String::new(),
+            verify: true,
+            alpn: Vec::new(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            server_fingerprints: Vec::new(),
+            key_exchange_groups: Vec::new(),
+            reality_public_key: String::new(),
+            reality_short_id: String::new(),
+            reality_mldsa65_verify: String::new(),
+            vision: false,
+            vless_encryption: String::new(),
+            network: String::new(),
+            ws_path: String::new(),
+            ws_host: String::new(),
+            xhttp_path: String::new(),
+            xhttp_host: String::new(),
+            xhttp_mode: String::new(),
+            hy2_obfs_password: String::new(),
+            hy2_hopping_ports: String::new(),
+            tuic_udp_mode: String::new(),
+            h2mux: H2MuxSettings::default(),
+            sudoku: SudokuMaskSettings::default(),
+            bind_interface: String::new(),
+            wg_private_key: String::new(),
+            wg_public_key: String::new(),
+            wg_preshared_key: String::new(),
+            wg_addresses: Vec::new(),
+            wg_allowed_ips: Vec::new(),
+            wg_mtu: 0,
+            wg_keepalive: 0,
+            wg_tcp_buffer_size: None,
+            wg_tcp_memory_bytes: None,
+            extra_hops: Vec::new(),
+        }
+    }
+}
+
+impl OutboundMember {
+    pub fn primary_hop(&self) -> OutboundHop {
+        OutboundHop {
+            protocol: self.protocol.clone(),
+            address: self.address.clone(),
+            uuid: self.uuid.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            cipher: self.cipher.clone(),
+            security: self.security.clone(),
+            tls: self.tls,
+            shadowtls: self.shadowtls,
+            shadowtls_password: self.shadowtls_password.clone(),
+            sni: self.sni.clone(),
+            verify: self.verify,
+            alpn: self.alpn.clone(),
+            tls_cert: self.tls_cert.clone(),
+            tls_key: self.tls_key.clone(),
+            server_fingerprints: self.server_fingerprints.clone(),
+            key_exchange_groups: self.key_exchange_groups.clone(),
+            reality_public_key: self.reality_public_key.clone(),
+            reality_short_id: self.reality_short_id.clone(),
+            reality_mldsa65_verify: self.reality_mldsa65_verify.clone(),
+            vision: self.vision,
+            vless_encryption: self.vless_encryption.clone(),
+            network: self.network.clone(),
+            ws_path: self.ws_path.clone(),
+            ws_host: self.ws_host.clone(),
+            xhttp_path: self.xhttp_path.clone(),
+            xhttp_host: self.xhttp_host.clone(),
+            xhttp_mode: self.xhttp_mode.clone(),
+            hy2_obfs_password: self.hy2_obfs_password.clone(),
+            hy2_hopping_ports: self.hy2_hopping_ports.clone(),
+            tuic_udp_mode: self.tuic_udp_mode.clone(),
+            h2mux: self.h2mux.clone(),
+            sudoku: self.sudoku.clone(),
+            bind_interface: self.bind_interface.clone(),
+            wg_private_key: self.wg_private_key.clone(),
+            wg_public_key: self.wg_public_key.clone(),
+            wg_preshared_key: self.wg_preshared_key.clone(),
+            wg_addresses: self.wg_addresses.clone(),
+            wg_allowed_ips: self.wg_allowed_ips.clone(),
+            wg_mtu: self.wg_mtu,
+            wg_keepalive: self.wg_keepalive,
+            wg_tcp_buffer_size: self.wg_tcp_buffer_size,
+            wg_tcp_memory_bytes: self.wg_tcp_memory_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -856,6 +1190,44 @@ fn default_rule_outbound() -> String {
     "direct".to_string()
 }
 
+fn default_sub_template_preset() -> String {
+    "minimal".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscriptionTemplateConfig {
+    /// "minimal" | "global_direct" | "bypass_cn" | "streaming"
+    #[serde(default = "default_sub_template_preset")]
+    pub preset: String,
+    #[serde(default = "default_true")]
+    pub prepend_custom_rules: bool,
+    #[serde(default)]
+    pub enable_adblock: bool,
+    #[serde(default)]
+    pub enable_ipv6: bool,
+    #[serde(default)]
+    pub clash_custom_rules: String,
+    #[serde(default)]
+    pub clash_extra_groups_yaml: String,
+    #[serde(default)]
+    pub singbox_custom_rules: String,
+}
+
+impl Default for SubscriptionTemplateConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_sub_template_preset(),
+            prepend_custom_rules: true,
+            enable_adblock: false,
+            enable_ipv6: false,
+            clash_custom_rules: String::new(),
+            clash_extra_groups_yaml: String::new(),
+            singbox_custom_rules: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionRecord {
     #[serde(default)]
@@ -865,6 +1237,8 @@ pub struct SubscriptionRecord {
     pub name: String,
     #[serde(default = "default_true")]
     pub enable: bool,
+    #[serde(default)]
+    pub template: String, // "" = inherit global default, or preset name
     #[serde(default)]
     pub created_at: i64,
 }
@@ -907,6 +1281,8 @@ pub struct PanelSettings {
     pub tg_backup_enabled: bool,
     #[serde(default)]
     pub core_global: CoreGlobalSettings,
+    #[serde(default)]
+    pub sub_template: SubscriptionTemplateConfig,
 }
 
 impl PanelSettings {

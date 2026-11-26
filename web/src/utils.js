@@ -56,4 +56,5 @@ export const PROTOCOL_COLORS = {
   http: 'default',
   mixed: 'processing',
   portforward: 'geekblue',
+  wireguard: 'orange',
 };

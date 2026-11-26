@@ -23,11 +23,11 @@ use crate::crypto_util::{
     generate_random_alnum, generate_reality_keypair, generate_self_signed_cert,
     generate_short_id, generate_ss2022_password, generate_uuid, generate_wireguard_keypair,
 };
-use crate::db::default_client_for_inbound;
+use crate::db::{default_client_for_inbound, ConfigTable};
 use crate::models::{
     CertificateRecord, ClientRecord, DnsGroupRecord, Inbound, OutboundGroupRecord, PanelSettings,
-    RoutingRuleRecord, RuleSourceGroupRecord, SubscriptionRecord, DEFAULT_LETSENCRYPT_DIR,
-    DEFAULT_LETSENCRYPT_TOS,
+    RoutingRuleRecord, RuleSourceGroupRecord, SubscriptionRecord, SubscriptionTemplateConfig,
+    DEFAULT_LETSENCRYPT_DIR, DEFAULT_LETSENCRYPT_TOS,
 };
 use crate::ops_util::{
     backups_dir, build_backup_caption, check_github_updates, create_local_backup,
@@ -37,7 +37,7 @@ use crate::ops_util::{
 };
 use crate::state::{is_loopback_or_unspecified_host, AppState};
 use crate::sub_gen::{
-    build_client_share_info, generate_subscription_with_certs, SubFormat,
+    build_client_share_info, generate_subscription_with_options, SubFormat,
 };
 use crate::yaml_gen::{build_shoes_yaml_full, normalize_acme_domains};
 
@@ -77,7 +77,7 @@ async fn require_auth(
 }
 
 pub fn build_inner_router(state: Arc<AppState>) -> Router {
-    let protected_api = Router::new()
+    let service_api = Router::new()
         // Dashboard & Shoes service control
         .route("/status", get(api_status))
         .route("/traffic/daily", get(api_daily_traffic))
@@ -100,9 +100,13 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         )
         .route("/clash/proxies", get(api_clash_proxies))
         .route("/clash/proxies/{group}", put(api_clash_select_proxy))
-        .route("/clash/delay", get(api_clash_delay))
+        .route("/clash/delay", get(api_clash_delay));
+    let inbound_api = Router::new()
         // Inbounds & Clients (Two-Layer Model)
         .route("/inbounds", get(api_list_inbounds).post(api_create_inbound))
+        .route("/inbounds/batch", post(api_batch_inbounds))
+        .route("/inbounds/import/preview", post(api_import_inbounds_preview))
+        .route("/inbounds/import/apply", post(api_import_inbounds_apply))
         .route(
             "/inbounds/reset-all-traffic",
             post(api_reset_all_inbound_traffic),
@@ -120,7 +124,8 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             "/clients/{client_id}",
             put(api_update_client).delete(api_delete_client),
         )
-        .route("/next-port", get(api_next_port))
+        .route("/next-port", get(api_next_port));
+    let tools_api = Router::new()
         // Keygen utilities
         .route("/keygen/uuid", get(api_keygen_uuid))
         .route("/keygen/reality", get(api_keygen_reality))
@@ -131,6 +136,8 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/keygen/parse-wg-conf", post(api_parse_wg_conf))
         .route("/keygen/vless-encryption", get(api_keygen_vless_encryption))
         .route("/keygen/mldsa65", get(api_keygen_mldsa65))
+        .route("/keygen/mtls-client", get(api_keygen_mtls_client))
+        .route("/tools/probe-reality", post(api_probe_reality))
         // Certificates
         .route(
             "/certificates",
@@ -145,12 +152,14 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             "/certificates/{id}/apply-panel-https",
             post(api_apply_panel_https),
         )
-        .route("/certificates/{id}", delete(api_delete_cert))
+        .route("/certificates/{id}", delete(api_delete_cert));
+    let routing_api = Router::new()
         // Outbound Groups, DNS Groups, Rule Sources & Routing Rules
         .route(
             "/outbound-groups",
             get(api_list_outbound_groups).post(api_save_outbound_group),
         )
+        .route("/outbound-groups/parse-uri", post(api_parse_outbound_uri))
         .route("/outbound-groups/{id}", delete(api_delete_outbound_group))
         .route(
             "/dns-groups",
@@ -167,11 +176,29 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             "/routing-rules",
             get(api_list_routing_rules).post(api_save_routing_rule),
         )
-        .route("/routing-rules/{id}", delete(api_delete_routing_rule))
+        .route("/routing-rules/{id}", delete(api_delete_routing_rule));
+    let config_api = inbound_api.merge(routing_api).route_layer(middleware::from_fn(
+        |req: Request, next: Next| async move {
+            if req.method().is_safe() {
+                return Ok(next.run(req).await);
+            }
+            // Complete the SQLite edit and core validation/rollback after a browser disconnect.
+            tokio::spawn(next.run(req)).await.map_err(internal_err)
+        },
+    ));
+    let protected_api = service_api.merge(tools_api).merge(config_api)
         // Subscriptions
         .route(
             "/subscriptions",
             get(api_list_subscriptions).post(api_save_subscription),
+        )
+        .route(
+            "/subscriptions/template",
+            get(api_get_sub_template).put(api_save_sub_template),
+        )
+        .route(
+            "/subscriptions/preview-template",
+            post(api_preview_sub_template),
         )
         .route("/subscriptions/{id}/rotate", post(api_rotate_subscription))
         .route("/subscriptions/{id}", delete(api_delete_subscription))
@@ -538,6 +565,19 @@ async fn api_list_inbounds(
     let host = resolve_share_host(&state, &settings, &headers, None);
     let active_map = state.monitor.snapshot().inbound_active_conns;
 
+    let mut sni_counts: std::collections::HashMap<(String, u16), usize> =
+        std::collections::HashMap::new();
+    for ib in &inbounds {
+        if ib.enable && ib.can_share_sni_port() {
+            let l = if ib.listen.trim().is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                ib.listen.trim().to_string()
+            };
+            *sni_counts.entry((l, ib.port)).or_insert(0) += 1;
+        }
+    }
+
     let enriched: Vec<Value> = inbounds
         .into_iter()
         .map(|ib| {
@@ -547,11 +587,23 @@ async fn api_list_inbounds(
                 .iter()
                 .map(|c| build_client_share_info(&ib, c, &host))
                 .collect();
+            let sni_shared_count = if ib.enable && ib.can_share_sni_port() {
+                let l = if ib.listen.trim().is_empty() {
+                    "0.0.0.0".to_string()
+                } else {
+                    ib.listen.trim().to_string()
+                };
+                let cnt = sni_counts.get(&(l, ib.port)).copied().unwrap_or(0);
+                if cnt >= 2 { cnt } else { 0 }
+            } else {
+                0
+            };
             let mut val = serde_json::to_value(&ib).unwrap_or_else(|_| json!({}));
             val["active_connections"] = json!(active);
             val["shares"] = json!(shares);
             val["share_host"] = json!(host);
             val["multi_user_supported"] = json!(ib.supports_multi_user());
+            val["sni_shared_count"] = json!(sni_shared_count);
             val
         })
         .collect();
@@ -562,8 +614,9 @@ async fn api_create_inbound(
     State(state): State<Arc<AppState>>,
     Json(ib): Json<Inbound>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let created = state.db.create_inbound(ib).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         // Roll back invalid inbound so DB and live config stay consistent
         let _ = state.db.delete_inbound(created.id);
         return Err(bad_req(format!("{e:#}")));
@@ -576,18 +629,34 @@ async fn api_update_inbound(
     Path(id): Path<i64>,
     Json(ib): Json<Inbound>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let prev = state
         .db
         .get_inbound(id)
         .map_err(internal_err)?
         .ok_or_else(|| bad_req("Inbound not found"))?;
     let updated = state.db.update_inbound(id, ib).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        // Restore previous valid inbound configuration
-        let _ = state.db.update_inbound(id, prev);
+    finish_inbound_edit(&state, prev, updated).await
+}
+
+// Callers hold the process operation lock across the edit, validation and rollback.
+async fn finish_inbound_edit(state: &AppState, previous: Inbound, updated: Inbound) -> ApiResult {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
+        state.db.restore_inbound(previous).map_err(internal_err)?;
         return Err(bad_req(format!("{e:#}")));
     }
     ok_json(updated)
+}
+
+async fn delete_config_rows(state: &AppState, table: ConfigTable, ids: &[i64])
+    -> Result<usize, (StatusCode, Json<Value>)>
+{
+    let deleted = state.db.delete_config_rows(table, ids).map_err(internal_err)?;
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
+        state.db.undo_config_deletion(deleted).map_err(internal_err)?;
+        return Err(bad_req(format!("{e:#}")));
+    }
+    Ok(deleted.affected)
 }
 
 #[derive(Deserialize)]
@@ -600,6 +669,7 @@ async fn api_toggle_inbound(
     Path(id): Path<i64>,
     Json(req): Json<ToggleReq>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let prev = state
         .db
         .get_inbound(id)
@@ -609,7 +679,7 @@ async fn api_toggle_inbound(
         .db
         .set_inbound_enable(id, req.enable)
         .map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         let _ = state.db.set_inbound_enable(id, prev.enable);
         return Err(bad_req(e));
     }
@@ -631,23 +701,20 @@ async fn api_clone_inbound(
     Path(id): Path<i64>,
     Json(req): Json<CloneInboundReq>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let mut src = state
         .db
         .get_inbound(id)
         .map_err(internal_err)?
         .ok_or_else(|| bad_req("Source inbound not found"))?;
 
-    let new_port = match req.port {
-        Some(p) if p > 0 => p,
-        _ => state
-            .db
-            .next_available_port(src.port.saturating_add(1))
-            .map_err(internal_err)?,
-    };
+    let exact = req.port.filter(|p| *p > 0);
+    let start = exact.unwrap_or_else(|| src.port.saturating_add(1));
+    state.db.assign_inbound_port(&mut src, start, exact.is_some()).map_err(bad_req)?;
+    let new_port = src.port;
 
     src.id = 0;
     src.tag = String::new();
-    src.port = new_port;
     src.up_bytes = 0;
     src.down_bytes = 0;
     src.enable = true;
@@ -670,7 +737,7 @@ async fn api_clone_inbound(
     src.clients = vec![fresh_client];
 
     let created = state.db.create_inbound(src).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         let _ = state.db.delete_inbound(created.id);
         return Err(bad_req(e));
     }
@@ -681,11 +748,13 @@ async fn api_reset_inbound_traffic(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     state.db.reset_inbound_traffic(id).map_err(bad_req)?;
     ok_json(true)
 }
 
 async fn api_reset_all_inbound_traffic(State(state): State<Arc<AppState>>) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     state.db.reset_all_traffic().map_err(bad_req)?;
     ok_json(true)
 }
@@ -694,9 +763,191 @@ async fn api_delete_inbound(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
-    state.db.delete_inbound(id).map_err(bad_req)?;
-    let _ = state.proc_mgr.reload_config().await;
+    let _operation = state.proc_mgr.operation.lock().await;
+    delete_config_rows(&state, ConfigTable::Inbounds, &[id]).await?;
     ok_json(true)
+}
+
+#[derive(Deserialize)]
+struct BatchInboundsReq {
+    ids: Vec<i64>,
+    action: String, // "enable" | "disable" | "extend_expiry" | "reset_traffic" | "delete"
+    #[serde(default)]
+    extend_days: Option<i64>,
+    #[serde(default)]
+    set_expiry_time: Option<i64>,
+    #[serde(default)]
+    apply_to_clients: bool,
+    #[serde(default)]
+    re_enable_expired: bool,
+}
+
+async fn api_batch_inbounds(
+    State(state): State<Arc<AppState>>,
+    Json(mut req): Json<BatchInboundsReq>,
+) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
+    if req.ids.is_empty() {
+        return Err(bad_req("Please select at least one inbound"));
+    }
+    let action = req.action.trim().to_ascii_lowercase();
+    req.ids.sort_unstable();
+    req.ids.dedup();
+    if action == "delete" {
+        let affected = delete_config_rows(&state, ConfigTable::Inbounds, &req.ids).await?;
+        return ok_json(json!({ "affected": affected, "action": action }));
+    }
+
+    // Snapshot affected inbounds so we can roll back if `shoes check` rejects the batch change
+    let mut snapshots = Vec::new();
+    if matches!(action.as_str(), "enable" | "disable") || (action == "extend_expiry" && req.re_enable_expired) {
+        for &id in &req.ids {
+            if let Some(ib) = state.db.get_inbound(id).map_err(internal_err)? {
+                snapshots.push(ib);
+            }
+        }
+    }
+
+    let (affected, needs_reload) = match action.as_str() {
+        "enable" => (
+            state
+                .db
+                .batch_set_inbounds_enable(&req.ids, true)
+                .map_err(bad_req)?,
+            true,
+        ),
+        "disable" => (
+            state
+                .db
+                .batch_set_inbounds_enable(&req.ids, false)
+                .map_err(bad_req)?,
+            true,
+        ),
+        "extend_expiry" => (
+            state
+                .db
+                .batch_extend_inbounds_expiry(
+                    &req.ids,
+                    req.extend_days,
+                    req.set_expiry_time,
+                    req.apply_to_clients,
+                    req.re_enable_expired,
+                )
+                .map_err(bad_req)?,
+            req.re_enable_expired,
+        ),
+        "reset_traffic" => (
+            state
+                .db
+                .batch_reset_inbounds_traffic(&req.ids)
+                .map_err(bad_req)?,
+            false,
+        ),
+        other => {
+            return Err(bad_req(format!("Unknown batch action '{other}'")));
+        }
+    };
+
+    if needs_reload {
+        if let Err(e) = state.proc_mgr.reload_config_locked().await {
+            for prev in snapshots {
+                state.db.restore_inbound(prev).map_err(internal_err)?;
+            }
+            return Err(bad_req(e));
+        }
+    }
+
+    ok_json(json!({ "affected": affected, "action": action }))
+}
+
+#[derive(Deserialize)]
+struct ImportPreviewReq {
+    input: String,
+}
+
+async fn api_import_inbounds_preview(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ImportPreviewReq>,
+) -> ApiResult {
+    let existing = state.db.list_inbounds().map_err(internal_err)?;
+    let preview =
+        crate::ops_util::parse_migration_inbounds(&req.input, &existing).map_err(bad_req)?;
+    ok_json(preview)
+}
+
+#[derive(Deserialize)]
+struct ImportApplyReq {
+    inbounds: Vec<Inbound>,
+    #[serde(default)]
+    auto_reassign_ports: bool,
+    #[serde(default)]
+    disable_on_import: bool,
+}
+
+async fn api_import_inbounds_apply(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ImportApplyReq>,
+) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
+    if req.inbounds.is_empty() {
+        return Err(bad_req("No inbounds selected to import"));
+    }
+    let mut created_ids: Vec<i64> = Vec::new();
+    let mut created_items: Vec<Inbound> = Vec::new();
+
+    for mut ib in req.inbounds {
+        ib.id = 0;
+        ib.tag = String::new();
+        ib.up_bytes = 0;
+        ib.down_bytes = 0;
+        if req.disable_on_import {
+            ib.enable = false;
+        }
+        // If TLS inbound has no certificate source or file path attached, import disabled so `shoes check` won't fail the entire batch
+        let missing_tls_cert = ib.stream_settings.security == "tls"
+            && !ib.uses_auto_quic_cert()
+            && ((ib.stream_settings.tls.cert_mode == "source"
+                && ib.stream_settings.tls.certificate_source.trim().is_empty())
+                || (ib.stream_settings.tls.cert_mode == "files"
+                    && (ib.stream_settings.tls.cert_file.trim().is_empty()
+                        || ib.stream_settings.tls.key_file.trim().is_empty())));
+        if missing_tls_cert {
+            ib.enable = false;
+        }
+
+        let created = match state.db.create_inbound(ib.clone()) {
+            Ok(c) => c,
+            Err(first_err) if req.auto_reassign_ports => {
+                let start = if ib.port >= 1024 { ib.port } else { 20000 };
+                match state.db.assign_inbound_port(&mut ib, start, false)
+                    .and_then(|()| state.db.create_inbound(ib)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        state.db.batch_delete_inbounds(&created_ids).map_err(internal_err)?;
+                        return Err(bad_req(format!(
+                            "Failed to import inbound (even after port reassignment): {e} (initial: {first_err})"
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                state.db.batch_delete_inbounds(&created_ids).map_err(internal_err)?;
+                return Err(bad_req(e));
+            }
+        };
+        created_ids.push(created.id);
+        created_items.push(created);
+    }
+
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
+        state.db.batch_delete_inbounds(&created_ids).map_err(internal_err)?;
+        return Err(bad_req(e));
+    }
+
+    ok_json(json!({
+        "imported_count": created_items.len(),
+        "inbounds": created_items,
+    }))
 }
 
 #[derive(Deserialize, Default)]
@@ -730,9 +981,10 @@ async fn api_add_client(
     Path(id): Path<i64>,
     Json(client): Json<ClientRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
+    let prev = state.db.get_inbound(id).map_err(internal_err)?.ok_or_else(|| bad_req("Inbound not found"))?;
     let updated = state.db.add_client(id, client).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
-    ok_json(updated)
+    finish_inbound_edit(&state, prev, updated).await
 }
 
 async fn api_update_client(
@@ -740,18 +992,20 @@ async fn api_update_client(
     Path(client_id): Path<i64>,
     Json(client): Json<ClientRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
+    let prev = state.db.inbound_for_client(client_id).map_err(bad_req)?;
     let updated = state.db.update_client(client_id, client).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
-    ok_json(updated)
+    finish_inbound_edit(&state, prev, updated).await
 }
 
 async fn api_delete_client(
     State(state): State<Arc<AppState>>,
     Path(client_id): Path<i64>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
+    let prev = state.db.inbound_for_client(client_id).map_err(bad_req)?;
     let updated = state.db.delete_client(client_id).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
-    ok_json(updated)
+    finish_inbound_edit(&state, prev, updated).await
 }
 
 #[derive(Deserialize)]
@@ -767,7 +1021,7 @@ async fn api_next_port(
     State(state): State<Arc<AppState>>,
     Query(q): Query<NextPortQuery>,
 ) -> ApiResult {
-    let port = state.db.next_available_port(q.start).map_err(internal_err)?;
+    let port = state.db.next_available_port(q.start).map_err(bad_req)?;
     ok_json(json!({ "port": port }))
 }
 
@@ -966,6 +1220,99 @@ async fn api_keygen_mldsa65(State(state): State<Arc<AppState>>) -> ApiResult {
     ok_json(json!({
         "mldsa65_seed": seed,
         "mldsa65_verify": verify,
+    }))
+}
+
+#[derive(Deserialize)]
+struct MtlsClientQuery {
+    #[serde(default)]
+    cn: String,
+}
+
+async fn api_keygen_mtls_client(Query(q): Query<MtlsClientQuery>) -> ApiResult {
+    let (cert_pem, key_pem, fingerprint) =
+        crate::crypto_util::generate_mtls_client_cert(&q.cn).map_err(bad_req)?;
+    ok_json(json!({
+        "cert_pem": cert_pem,
+        "key_pem": key_pem,
+        "fingerprint": fingerprint,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ParseOutboundUriReq {
+    uris: String,
+}
+
+async fn api_parse_outbound_uri(Json(req): Json<ParseOutboundUriReq>) -> ApiResult {
+    let members = crate::ops_util::parse_outbound_share_uris(&req.uris).map_err(bad_req)?;
+    ok_json(json!({ "members": members }))
+}
+
+#[derive(Deserialize)]
+struct ProbeRealityReq {
+    #[serde(default)]
+    dest: String,
+    #[serde(default)]
+    sni: String,
+    #[serde(default)]
+    targets: Vec<crate::reality_probe::RealityProbeTarget>,
+    #[serde(default)]
+    use_presets: bool,
+    #[serde(default)]
+    timeout_ms: u64,
+}
+
+async fn api_probe_reality(Json(req): Json<ProbeRealityReq>) -> ApiResult {
+    use crate::reality_probe::{
+        probe_reality_batch, RealityProbeTarget, DEFAULT_REALITY_CANDIDATES,
+    };
+    let timeout = std::time::Duration::from_millis(req.timeout_ms.clamp(1500, 6000));
+    let mut targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if !req.dest.trim().is_empty() {
+        let key = format!(
+            "{}|{}",
+            req.dest.trim().to_ascii_lowercase(),
+            req.sni.trim().to_ascii_lowercase()
+        );
+        if seen.insert(key) {
+            targets.push(RealityProbeTarget {
+                dest: req.dest.trim().to_string(),
+                sni: req.sni.trim().to_string(),
+            });
+        }
+    }
+    for t in req.targets {
+        if t.dest.trim().is_empty() {
+            continue;
+        }
+        let key = format!(
+            "{}|{}",
+            t.dest.trim().to_ascii_lowercase(),
+            t.sni.trim().to_ascii_lowercase()
+        );
+        if seen.insert(key) {
+            targets.push(t);
+        }
+    }
+    if req.use_presets || targets.is_empty() {
+        for cand in DEFAULT_REALITY_CANDIDATES {
+            let key = format!("{}|", cand.to_ascii_lowercase());
+            if seen.insert(key) {
+                targets.push(RealityProbeTarget {
+                    dest: (*cand).to_string(),
+                    sni: String::new(),
+                });
+            }
+        }
+    }
+
+    let results = probe_reality_batch(targets, timeout).await;
+    ok_json(json!({
+        "results": results,
+        "candidates": DEFAULT_REALITY_CANDIDATES,
     }))
 }
 
@@ -1470,17 +1817,14 @@ async fn api_save_outbound_group(
     State(state): State<Arc<AppState>>,
     Json(g): Json<OutboundGroupRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let previous = if g.id > 0 {
-        state
-            .db
-            .list_outbound_groups()
-            .ok()
-            .and_then(|all| all.into_iter().find(|item| item.id == g.id))
+        state.db.get_outbound_group(g.id).map_err(internal_err)?
     } else {
         None
     };
     let saved = state.db.save_outbound_group(g).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
             let _ = state.db.save_outbound_group(prev);
         } else {
@@ -1495,19 +1839,8 @@ async fn api_delete_outbound_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
-    let existing = state
-        .db
-        .list_outbound_groups()
-        .map_err(internal_err)?
-        .into_iter()
-        .find(|g| g.id == id);
-    state.db.delete_outbound_group(id).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        if let Some(prev) = existing {
-            let _ = state.db.save_outbound_group(prev);
-        }
-        return Err(bad_req(e));
-    }
+    let _operation = state.proc_mgr.operation.lock().await;
+    delete_config_rows(&state, ConfigTable::OutboundGroups, &[id]).await?;
     ok_json(true)
 }
 
@@ -1521,17 +1854,14 @@ async fn api_save_dns_group(
     State(state): State<Arc<AppState>>,
     Json(g): Json<DnsGroupRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let previous = if g.id > 0 {
-        state
-            .db
-            .list_dns_groups()
-            .ok()
-            .and_then(|all| all.into_iter().find(|item| item.id == g.id))
+        state.db.get_dns_group(g.id).map_err(internal_err)?
     } else {
         None
     };
     let saved = state.db.save_dns_group(g).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
             let _ = state.db.save_dns_group(prev);
         } else {
@@ -1546,12 +1876,11 @@ async fn api_delete_dns_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let existing = state
         .db
-        .list_dns_groups()
+        .get_dns_group(id)
         .map_err(internal_err)?
-        .into_iter()
-        .find(|g| g.id == id)
         .ok_or_else(|| bad_req("DNS group not found"))?;
     if let Ok(settings) = state.db.get_settings() {
         if settings.core_global.default_dns_group.trim() == existing.name.trim() {
@@ -1561,11 +1890,7 @@ async fn api_delete_dns_group(
             )));
         }
     }
-    state.db.delete_dns_group(id).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        let _ = state.db.save_dns_group(existing);
-        return Err(bad_req(e));
-    }
+    delete_config_rows(&state, ConfigTable::DnsGroups, &[id]).await?;
     ok_json(true)
 }
 
@@ -1579,6 +1904,7 @@ async fn api_save_rule_source(
     State(state): State<Arc<AppState>>,
     Json(mut g): Json<RuleSourceGroupRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     if g.name.trim().is_empty() {
         return Err(bad_req("Rule source group name must not be empty"));
     }
@@ -1588,7 +1914,7 @@ async fn api_save_rule_source(
         ));
     }
     let previous = if g.id > 0 {
-        state.db.get_rule_source_group(g.id).ok().flatten()
+        state.db.get_rule_source_group(g.id).map_err(internal_err)?
     } else {
         None
     };
@@ -1607,7 +1933,7 @@ async fn api_save_rule_source(
     }
 
     let saved = state.db.save_rule_source_group(g).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
             let _ = state.db.save_rule_source_group(prev);
         } else {
@@ -1622,6 +1948,7 @@ async fn api_sync_rule_source(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let mut group = state
         .db
         .get_rule_source_group(id)
@@ -1635,7 +1962,7 @@ async fn api_sync_rule_source(
         .update_rule_source_items(group.id, &group.items)
         .map_err(internal_err)?;
     if group.enable {
-        state.proc_mgr.reload_config().await.map_err(bad_req)?;
+        state.proc_mgr.reload_config_locked().await.map_err(bad_req)?;
     }
     ok_json(json!({ "group": group, "changed": changed }))
 }
@@ -1644,15 +1971,9 @@ async fn api_delete_rule_source(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
-    let existing = state
-        .db
-        .get_rule_source_group(id)
-        .map_err(internal_err)?
-        .ok_or_else(|| bad_req("Rule source group not found"))?;
-    state.db.delete_rule_source_group(id).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        let _ = state.db.save_rule_source_group(existing);
-        return Err(bad_req(e));
+    let _operation = state.proc_mgr.operation.lock().await;
+    if delete_config_rows(&state, ConfigTable::RuleSourceGroups, &[id]).await? == 0 {
+        return Err(bad_req("Rule source group not found"));
     }
     ok_json(true)
 }
@@ -1665,17 +1986,14 @@ async fn api_save_routing_rule(
     State(state): State<Arc<AppState>>,
     Json(r): Json<RoutingRuleRecord>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let previous = if r.id > 0 {
-        state
-            .db
-            .list_routing_rules()
-            .ok()
-            .and_then(|all| all.into_iter().find(|item| item.id == r.id))
+        state.db.get_routing_rule(r.id).map_err(internal_err)?
     } else {
         None
     };
     let saved = state.db.save_routing_rule(r).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
             let _ = state.db.save_routing_rule(prev);
         } else {
@@ -1690,19 +2008,8 @@ async fn api_delete_routing_rule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
-    let existing = state
-        .db
-        .list_routing_rules()
-        .map_err(internal_err)?
-        .into_iter()
-        .find(|r| r.id == id);
-    state.db.delete_routing_rule(id).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        if let Some(prev) = existing {
-            let _ = state.db.save_routing_rule(prev);
-        }
-        return Err(bad_req(e));
-    }
+    let _operation = state.proc_mgr.operation.lock().await;
+    delete_config_rows(&state, ConfigTable::RoutingRules, &[id]).await?;
     ok_json(true)
 }
 
@@ -1780,6 +2087,62 @@ async fn api_delete_subscription(
     ok_json(true)
 }
 
+async fn api_get_sub_template(State(state): State<Arc<AppState>>) -> ApiResult {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    ok_json(settings.sub_template)
+}
+
+async fn api_save_sub_template(
+    State(state): State<Arc<AppState>>,
+    Json(tpl): Json<SubscriptionTemplateConfig>,
+) -> ApiResult {
+    let saved = state.db.save_sub_template(&tpl).map_err(bad_req)?;
+    ok_json(saved)
+}
+
+#[derive(Deserialize)]
+struct PreviewSubTemplateReq {
+    #[serde(default)]
+    sub_id: String,
+    template: SubscriptionTemplateConfig,
+}
+
+async fn api_preview_sub_template(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PreviewSubTemplateReq>,
+) -> ApiResult {
+    let inbounds = state.db.list_inbounds().map_err(internal_err)?;
+    let certs = state.db.list_certificates().unwrap_or_default();
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let host = resolve_share_host(&state, &settings, &headers, None);
+    let sub_id = if req.sub_id.trim().is_empty() {
+        "all"
+    } else {
+        req.sub_id.trim()
+    };
+    let clash = generate_subscription_with_options(
+        &inbounds,
+        &certs,
+        sub_id,
+        &host,
+        SubFormat::ClashYaml,
+        &req.template,
+    );
+    let singbox = generate_subscription_with_options(
+        &inbounds,
+        &certs,
+        sub_id,
+        &host,
+        SubFormat::SingBoxJson,
+        &req.template,
+    );
+    ok_json(json!({
+        "clash_yaml": clash.body,
+        "singbox_json": singbox.body,
+    }))
+}
+
 async fn public_subscription_handler(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
@@ -1809,7 +2172,25 @@ async fn public_subscription_handler(
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let fmt = SubFormat::detect(query.get("format").map(String::as_str), ua);
 
-    let payload = generate_subscription_with_certs(&inbounds, &certs, &sub.sub_id, &host, fmt);
+    let mut effective_tpl = settings.sub_template.clone();
+    if let Some(q_tpl) = query
+        .get("template")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| matches!(s.as_str(), "minimal" | "global_direct" | "bypass_cn" | "streaming"))
+    {
+        effective_tpl.preset = q_tpl;
+    } else if !sub.template.trim().is_empty() {
+        effective_tpl.preset = sub.template.trim().to_ascii_lowercase();
+    }
+
+    let payload = generate_subscription_with_options(
+        &inbounds,
+        &certs,
+        &sub.sub_id,
+        &host,
+        fmt,
+        &effective_tpl,
+    );
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -1923,16 +2304,26 @@ async fn api_backup_db(
         .unwrap())
 }
 
+async fn restore_and_apply(state: Arc<AppState>, bytes: Vec<u8>) -> ApiResult {
+    tokio::spawn(async move {
+        let _operation = state.proc_mgr.operation.lock().await;
+        let db = state.db.clone();
+        let pre_backup = tokio::task::spawn_blocking(move || db.restore_from_bytes(&bytes))
+            .await.map_err(internal_err)?.map_err(bad_req)?;
+        apply_post_restore(&state, pre_backup).await
+    }).await.map_err(internal_err)?
+}
+
 async fn apply_post_restore(state: &AppState, pre_backup: String) -> ApiResult {
+    state.sessions.revoke_all();
     if let Ok(settings) = state.db.get_settings() {
         state.set_base_path(&settings.panel_base_path);
     }
     // Reload shoes config with restored inbounds/certs/routing (log warning if shoes bin missing)
-    let reload_note = match state.proc_mgr.reload_config().await {
+    let reload_note = match state.proc_mgr.reload_config_locked().await {
         Ok(_) => None,
         Err(e) => Some(e.to_string()),
     };
-    state.sessions.revoke_all();
     ok_json(json!({
         "restored": true,
         "pre_restore_backup": pre_backup,
@@ -1956,12 +2347,7 @@ async fn api_restore_db(
         }
     }
     let bytes = uploaded.ok_or_else(|| bad_req("No SQLite .db file uploaded"))?;
-    let db = state.db.clone();
-    let pre_backup = tokio::task::spawn_blocking(move || db.restore_from_bytes(&bytes))
-        .await
-        .map_err(internal_err)?
-        .map_err(bad_req)?;
-    apply_post_restore(&state, pre_backup).await
+    restore_and_apply(state, bytes).await
 }
 
 async fn api_list_backups(State(state): State<Arc<AppState>>) -> ApiResult {
@@ -2091,12 +2477,7 @@ async fn api_restore_local_backup(
     let path = backups_dir(&state.db.data_dir).join(&safe);
     let bytes = std::fs::read(&path)
         .map_err(|_| err_json(StatusCode::NOT_FOUND, format!("Backup '{safe}' not found")))?;
-    let db = state.db.clone();
-    let pre_backup = tokio::task::spawn_blocking(move || db.restore_from_bytes(&bytes))
-        .await
-        .map_err(internal_err)?
-        .map_err(bad_req)?;
-    apply_post_restore(&state, pre_backup).await
+    restore_and_apply(state, bytes).await
 }
 
 async fn api_delete_local_backup(
@@ -2204,4 +2585,41 @@ fn render_index_with_base(state: &AppState, raw_html: &[u8]) -> Response {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(injected))
         .unwrap()
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn rejected_config_mutations_restore_original_rows_through_http() -> anyhow::Result<()> {
+    use crate::{db::Database, monitor::RuntimeMonitor, process::ShoesProcessManager};
+    use tower::ServiceExt;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+    let dns = db.save_dns_group(serde_json::from_value(json!({"name":"saved-dns"}))?)?;
+    let ib = db.create_inbound(serde_json::from_value(json!({
+        "protocol":"anytls","remark":"saved-inbound","port":21000,
+        "clients":[{"name":"one","password":"one"},{"name":"two","password":"two"}]
+    }))?)?;
+    db.set_setting_kv("shoes_extra_yaml", "- [")?;
+    let manager = ShoesProcessManager::new(db.clone());
+    let monitor = RuntimeMonitor::new(db.clone(), manager.clone());
+    let state = AppState::new(db.clone(), manager, monitor, &db.get_settings()?);
+    let token = state.sessions.create_session("admin", 1);
+    let app = build_inner_router(state);
+    for (method, path, body) in [
+        ("DELETE", format!("/api/dns-groups/{}", dns.id), Value::Null),
+        ("DELETE", format!("/api/clients/{}", ib.clients[0].id), Value::Null),
+        ("POST", format!("/api/inbounds/{}/clients", ib.id), json!({"name":"new","password":"new"})),
+        ("POST", "/api/inbounds/batch".to_owned(), json!({"action":"delete","ids":[ib.id]})),
+    ] {
+        let req = Request::builder().method(method).uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))?;
+        assert_eq!(app.clone().oneshot(req).await?.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::to_value(db.get_inbound(ib.id)?)?, serde_json::to_value(&ib)?);
+        assert_eq!(serde_json::to_value(db.get_dns_group(dns.id)?)?, serde_json::to_value(&dns)?);
+    }
+    Ok(())
 }

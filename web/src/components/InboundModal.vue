@@ -33,6 +33,7 @@
               <a-select-option value="http">HTTP / HTTPS</a-select-option>
               <a-select-option value="mixed">Mixed (HTTP+SOCKS5)</a-select-option>
               <a-select-option value="portforward">PortForward (TCP 转发)</a-select-option>
+              <a-select-option value="wireguard">WireGuard (VPN 服务端 · Multi-Peer)</a-select-option>
             </a-select>
           </a-form-item>
         </a-col>
@@ -103,8 +104,99 @@
         </a-form-item>
       </div>
 
+      <!-- WireGuard Server Inbound Settings -->
+      <div v-if="isWireGuard" class="sub-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
+          <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.wgServerTitle') }}</span>
+          <a-button size="small" type="primary" ghost @click="genWgServerKeys">
+            🔑 {{ t('routing.wgGenKeys') }}
+          </a-button>
+        </div>
+        <a-alert type="info" show-icon :message="t('routing.wgPlatformNote')" style="margin-bottom: 10px; font-size: 12px" />
+        <a-row :gutter="12">
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.wgServerPrivKey')" required>
+              <a-input-password v-model:value="form.protocol_settings.wg_server_private_key" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.wgServerPubKey')">
+              <a-input v-model:value="form.protocol_settings.wg_server_public_key" placeholder="Auto-derived on save" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+        <a-row :gutter="12">
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.wgServerAddrs')" required>
+              <a-input v-model:value="wgServerAddrsStr" placeholder="10.77.0.1/32, fd77::1/128" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="6">
+            <a-form-item :label="t('inbounds.wgServerDns')">
+              <a-input v-model:value="form.protocol_settings.wg_dns" placeholder="1.1.1.1" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="6">
+            <a-form-item :label="t('routing.wgMtu')">
+              <a-input-number v-model:value="form.protocol_settings.wg_mtu" :min="1280" :max="1420" style="width: 100%" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+        <a-row :gutter="12" style="align-items: center; margin-bottom: 10px">
+          <a-col :span="8">
+            <a-input v-model:value="form.protocol_settings.wg_bind_interface" size="small" :placeholder="t('routing.wgBindInterface')" />
+          </a-col>
+          <a-col :span="9">
+            <a-checkbox v-model:checked="form.protocol_settings.wg_block_private" style="font-size: 12px">
+              {{ t('inbounds.wgBlockPrivate') }}
+            </a-checkbox>
+          </a-col>
+          <a-col :span="7">
+            <a-checkbox v-model:checked="wgServerHighThroughput" style="font-size: 12px">
+              {{ t('routing.wgHighThroughput') }}
+            </a-checkbox>
+          </a-col>
+        </a-row>
+
+        <a-divider orientation="left" style="margin: 8px 0 10px; font-size: 12px">
+          Peer 1 ({{ t('inbounds.primaryClient') }})
+        </a-divider>
+        <a-row :gutter="12">
+          <a-col :span="8">
+            <a-form-item :label="t('inbounds.clientName')">
+              <a-input v-model:value="primaryClient.name" placeholder="phone-1" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="10">
+            <a-form-item :label="t('inbounds.wgPeerAllowedIps')">
+              <a-input v-model:value="primaryClient.wg_allowed_ips" placeholder="10.77.0.2/32, fd77::2/128" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="6">
+            <a-form-item :label="t('inbounds.wgPeerKeepalive')">
+              <a-input-number v-model:value="primaryClient.wg_keepalive" :min="0" :max="65535" style="width: 100%" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+        <a-row :gutter="12">
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.wgPeerPrivKey')">
+              <a-input-group compact>
+                <a-input v-model:value="primaryClient.wg_private_key" style="width: calc(100% - 76px)" />
+                <a-button style="width: 76px" @click="genWgPrimaryPeerKeys">🔑 Gen</a-button>
+              </a-input-group>
+            </a-form-item>
+          </a-col>
+          <a-col :span="12">
+            <a-form-item :label="t('routing.wgPsk')">
+              <a-input v-model:value="primaryClient.wg_preshared_key" placeholder="Optional Base64 PSK" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+      </div>
+
       <!-- Primary Client Credentials -->
-      <template v-if="!isPortForward">
+      <template v-if="!isPortForward && !isWireGuard">
       <a-divider orientation="left" style="margin: 8px 0 12px">{{ t('inbounds.primaryClient') }}</a-divider>
       <a-row :gutter="12">
         <a-col :span="8">
@@ -223,8 +315,15 @@
       </div>
 
       <!-- Transport & Security -->
-      <template v-if="!isPortForward">
+      <template v-if="!isPortForward && !isWireGuard">
       <a-divider orientation="left" style="margin: 8px 0 12px">{{ t('inbounds.transport') }}</a-divider>
+      <a-alert
+        v-if="!isQuicOuter && ['tls', 'reality', 'shadowtls'].includes(form.stream_settings.security) && !form.stream_settings.sudoku.enabled"
+        type="success"
+        show-icon
+        :message="t('inbounds.sniMuxTip')"
+        style="margin-bottom: 10px; font-size: 12px"
+      />
       <a-row :gutter="12">
         <a-col :span="12">
           <a-form-item :label="t('inbounds.network')">
@@ -380,13 +479,58 @@
             </a-checkbox>
           </a-col>
         </a-row>
+
+        <!-- Post-Quantum TLS Key Exchange & mTLS -->
+        <a-row :gutter="12">
+          <a-col :span="24">
+            <a-form-item :label="t('inbounds.tlsKxGroups')" :extra="t('inbounds.tlsKxTip')">
+              <a-select
+                v-model:value="form.stream_settings.tls.key_exchange_groups"
+                mode="multiple"
+                allow-clear
+                placeholder="Default (X25519MLKEM768 + classical fallback)"
+              >
+                <a-select-option value="X25519MLKEM768">X25519MLKEM768 (PQ Hybrid)</a-select-option>
+                <a-select-option value="SecP256r1MLKEM768">SecP256r1MLKEM768 (PQ Hybrid)</a-select-option>
+                <a-select-option value="X25519">X25519</a-select-option>
+                <a-select-option value="SecP256r1">SecP256r1</a-select-option>
+                <a-select-option value="SecP384r1">SecP384r1</a-select-option>
+              </a-select>
+            </a-form-item>
+          </a-col>
+        </a-row>
+
+        <a-collapse ghost style="margin-bottom: 8px">
+          <a-collapse-panel key="mtls" :header="`🔐 ${t('inbounds.mtlsTitle')}`">
+            <div style="margin-bottom: 8px">
+              <a-button size="small" type="dashed" :loading="mtlsGenLoading" @click="genMtlsClientCert">
+                ⚡ {{ t('inbounds.mtlsGenClient') }}
+              </a-button>
+            </div>
+            <a-row :gutter="12">
+              <a-col :span="12">
+                <a-form-item :label="t('inbounds.mtlsCaCerts')">
+                  <a-textarea v-model:value="mtlsCaStr" :rows="2" style="font-family: monospace; font-size: 12px" placeholder="/etc/shoes/ca.crt" />
+                </a-form-item>
+              </a-col>
+              <a-col :span="12">
+                <a-form-item :label="t('inbounds.mtlsFingerprints')">
+                  <a-textarea v-model:value="mtlsFpStr" :rows="2" style="font-family: monospace; font-size: 12px" placeholder="AA:BB:CC:..." />
+                </a-form-item>
+              </a-col>
+            </a-row>
+          </a-collapse-panel>
+        </a-collapse>
       </div>
 
       <!-- REALITY Settings -->
       <div v-if="!isQuicOuter && form.stream_settings.security === 'reality'" class="sub-box">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px">
           <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.realitySettings') }}</span>
-          <a-space size="small">
+          <a-space size="small" wrap>
+            <a-button size="small" type="primary" @click="openRealityProbe">
+              🔎 {{ t('inbounds.realityProbeBtn') }}
+            </a-button>
             <a-button size="small" type="primary" ghost @click="refreshRealityKeys">
               🔑 {{ t('inbounds.genRealityKeys') }}
             </a-button>
@@ -504,6 +648,52 @@
         </a-row>
       </div>
 
+      <!-- Sudoku TCP FinalMask Obfuscation -->
+      <div v-if="!isQuicOuter" class="sub-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
+          <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.sudokuTitle') }}</span>
+          <a-switch v-model:checked="form.stream_settings.sudoku.enabled" size="small" />
+        </div>
+        <template v-if="form.stream_settings.sudoku.enabled">
+          <a-alert type="info" show-icon :message="t('inbounds.sudokuTip')" style="margin-bottom: 10px; font-size: 12px" />
+          <a-row :gutter="12">
+            <a-col :span="10">
+              <a-form-item :label="t('inbounds.sudokuPassword')">
+                <a-input v-model:value="form.stream_settings.sudoku.password" placeholder="shared-mask-password" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="7">
+              <a-form-item :label="t('inbounds.sudokuAscii')">
+                <a-select v-model:value="form.stream_settings.sudoku.ascii">
+                  <a-select-option value="">prefer_entropy (default)</a-select-option>
+                  <a-select-option value="prefer_entropy">prefer_entropy</a-select-option>
+                  <a-select-option value="entropy">entropy</a-select-option>
+                  <a-select-option value="prefer_ascii">prefer_ascii</a-select-option>
+                  <a-select-option value="ascii">ascii</a-select-option>
+                </a-select>
+              </a-form-item>
+            </a-col>
+            <a-col :span="7">
+              <a-form-item :label="t('inbounds.sudokuCustomTable')">
+                <a-input v-model:value="form.stream_settings.sudoku.custom_table" placeholder="xpxvvpvv" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+          <a-row :gutter="12">
+            <a-col :span="12">
+              <a-form-item :label="t('inbounds.sudokuPaddingMin')">
+                <a-input-number v-model:value="form.stream_settings.sudoku.padding_min" :min="0" :max="100" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item :label="t('inbounds.sudokuPaddingMax')">
+                <a-input-number v-model:value="form.stream_settings.sudoku.padding_max" :min="0" :max="100" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+        </template>
+      </div>
+
       <!-- H2Mux Multiplexing -->
       <div v-if="supportsH2Mux" class="sub-box">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
@@ -609,6 +799,155 @@
       </a-collapse>
     </a-form>
   </a-modal>
+
+  <!-- REALITY Destination Probe & Picker Modal -->
+  <a-modal
+    v-model:open="realityProbeOpen"
+    :title="t('inbounds.realityProbeTitle')"
+    width="1020px"
+    :footer="null"
+  >
+    <a-alert
+      type="info"
+      show-icon
+      :message="t('inbounds.realityProbeDesc')"
+      style="margin-bottom: 12px; font-size: 12px"
+    />
+    <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; align-items: center">
+      <a-input
+        v-model:value="probeDestInput"
+        style="flex: 1 1 220px"
+        placeholder="Dest (e.g. www.microsoft.com:443)"
+        @pressEnter="runRealityProbe(false)"
+      />
+      <a-input
+        v-model:value="probeSniInput"
+        style="flex: 1 1 180px"
+        placeholder="SNI (optional, defaults to Dest host)"
+        @pressEnter="runRealityProbe(false)"
+      />
+      <a-button type="primary" :loading="realityProbing" @click="runRealityProbe(false)">
+        🔎 {{ t('inbounds.realityProbeSingle') }}
+      </a-button>
+      <a-button :loading="realityProbing" @click="runRealityProbe(true)">
+        ⚡ {{ t('inbounds.realityProbeBatch') }}
+      </a-button>
+    </div>
+
+    <a-table
+      :data-source="realityProbeResults"
+      :columns="realityProbeColumns"
+      :loading="realityProbing"
+      :pagination="false"
+      size="small"
+      row-key="dest"
+      :scroll="{ x: 920 }"
+    >
+      <template #bodyCell="{ column, record }">
+        <template v-if="column.key === 'target'">
+          <div style="font-weight: 600; font-family: monospace">{{ record.dest }}</div>
+          <div style="font-size: 11px; opacity: 0.7">SNI: {{ record.sni }}</div>
+        </template>
+
+        <template v-else-if="column.key === 'latency'">
+          <template v-if="record.reachable">
+            <a-tag :color="(record.tls_ms ?? 999) < 180 ? 'success' : (record.tls_ms ?? 999) < 400 ? 'warning' : 'error'">
+              {{ record.tcp_ms ?? '-' }}ms / {{ record.tls_ms ?? '-' }}ms
+            </a-tag>
+          </template>
+          <a-tag v-else color="error">Unreachable</a-tag>
+        </template>
+
+        <template v-else-if="column.key === 'proto'">
+          <a-space :size="4" wrap>
+            <a-tag v-if="record.tls_version" :color="record.tls_version === 'TLSv1.3' ? 'green' : 'error'">
+              {{ record.tls_version }}
+            </a-tag>
+            <a-tag v-if="record.alpn" :color="record.alpn === 'h2' ? 'blue' : 'orange'">
+              {{ record.alpn }}
+            </a-tag>
+            <a-tag v-if="record.x25519" color="cyan">X25519</a-tag>
+            <a-tag v-if="record.hello_retry" color="error">HRR</a-tag>
+          </a-space>
+        </template>
+
+        <template v-else-if="column.key === 'mldsa'">
+          <div v-if="record.reachable">
+            <a-tag :color="record.mldsa65_compatible ? 'geekblue' : 'default'">
+              {{ record.mldsa65_compatible ? 'ML-DSA-65 ✓' : 'Standard Only' }}
+            </a-tag>
+            <div v-if="record.flight_mode" style="font-size: 11px; opacity: 0.7">
+              {{ record.flight_mode }} · {{ record.cert_capacity_bytes }}B
+            </div>
+          </div>
+          <span v-else style="opacity: 0.45">-</span>
+        </template>
+
+        <template v-else-if="column.key === 'cert'">
+          <template v-if="record.cert_issuer || record.cert_subject">
+            <div style="font-size: 11px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap" :title="`${record.cert_subject} / ${record.cert_issuer}`">
+              {{ record.cert_issuer || record.cert_subject }}
+            </div>
+            <div style="font-size: 11px">
+              <a-tag v-if="record.sni_matched" color="green" style="font-size: 10px">SAN ✓</a-tag>
+              <a-tag v-else color="error" style="font-size: 10px">SAN ✗</a-tag>
+              <span v-if="record.cert_days_left != null" style="opacity: 0.7">{{ record.cert_days_left }}d</span>
+            </div>
+          </template>
+          <span v-else style="opacity: 0.45">-</span>
+        </template>
+
+        <template v-else-if="column.key === 'verdict'">
+          <a-tooltip :title="(record.reasons || []).join(' | ') || (record.error || 'All checks passed')">
+            <a-tag
+              :color="
+                record.verdict === 'excellent'
+                  ? 'success'
+                  : record.verdict === 'good'
+                    ? 'processing'
+                    : record.verdict === 'warn'
+                      ? 'warning'
+                      : 'error'
+              "
+            >
+              {{ (record.verdict || 'fail').toUpperCase() }} ({{ record.score }})
+            </a-tag>
+          </a-tooltip>
+        </template>
+
+        <template v-else-if="column.key === 'action'">
+          <a-button
+            size="small"
+            :type="record.suitable ? 'primary' : 'default'"
+            :disabled="!record.reachable"
+            @click="applyRealityProbeResult(record)"
+          >
+            {{ t('inbounds.realityProbeUse') }}
+          </a-button>
+        </template>
+      </template>
+    </a-table>
+  </a-modal>
+
+  <!-- mTLS Generated Client Cert Preview Modal -->
+  <a-modal
+    v-model:open="mtlsResultOpen"
+    :title="t('inbounds.mtlsClientModalTitle')"
+    width="660px"
+    :footer="null"
+  >
+    <a-form layout="vertical">
+      <a-form-item label="SHA-256 Fingerprint">
+        <a-input :value="mtlsResult.fingerprint" readonly style="font-family: monospace" />
+      </a-form-item>
+      <a-form-item label="Client Certificate PEM (save as client.crt)">
+        <a-textarea :value="mtlsResult.cert_pem" :rows="6" readonly style="font-family: monospace; font-size: 11px" />
+      </a-form-item>
+      <a-form-item label="Client Private Key PEM (save as client.key)">
+        <a-textarea :value="mtlsResult.key_pem" :rows="5" readonly style="font-family: monospace; font-size: 11px" />
+      </a-form-item>
+    </a-form>
+  </a-modal>
 </template>
 
 <script setup>
@@ -657,6 +996,15 @@ function blankInbound() {
       vless_native_vision: false,
       port_range: '',
       forward_targets: [],
+      wg_server_private_key: '',
+      wg_server_public_key: '',
+      wg_server_addresses: ['10.77.0.1/32', 'fd77::1/128'],
+      wg_mtu: 1408,
+      wg_dns: '1.1.1.1',
+      wg_bind_interface: '',
+      wg_block_private: true,
+      wg_tcp_buffer_size: null,
+      wg_tcp_memory_bytes: null,
       raw_override_yaml: '',
     },
     stream_settings: {
@@ -673,6 +1021,9 @@ function blankInbound() {
         vision: false,
         fingerprint: 'chrome',
         allow_insecure: false,
+        key_exchange_groups: [],
+        client_ca_certs: [],
+        client_fingerprints: [],
       },
       reality: {
         sni: 'www.microsoft.com',
@@ -692,10 +1043,13 @@ function blankInbound() {
         handshake_addr: 'www.microsoft.com:443',
         cert_file: '',
         key_file: '',
+        client_ca_certs: [],
+        client_fingerprints: [],
       },
       ws: { path: '/ws', host: '', headers: {}, max_early_data: 0, early_data_header_name: '' },
       xhttp: { path: '/xhttp', host: '', mode: 'auto', headers: {} },
       h2mux: { enabled: false, max_connections: 4, min_streams: 4, max_streams: 0, padding: false },
+      sudoku: { enabled: false, password: '', ascii: '', custom_table: '', custom_tables: [], padding_min: 0, padding_max: 0 },
     },
     clients: [
       {
@@ -708,6 +1062,11 @@ function blankInbound() {
         flow: 'xtls-rprx-vision',
         sub_id: 'default',
         comment: '',
+        wg_private_key: '',
+        wg_public_key: '',
+        wg_preshared_key: '',
+        wg_allowed_ips: '10.77.0.2/32, fd77::2/128',
+        wg_keepalive: 25,
       },
     ],
   };
@@ -719,6 +1078,13 @@ const expiryDayjs = ref(null);
 const alpnStr = ref('');
 const shortIdsStr = ref('0123456789abcdef');
 const forwardTargetsStr = ref('');
+const wgServerAddrsStr = ref('10.77.0.1/32, fd77::1/128');
+const wgServerHighThroughput = ref(false);
+const mtlsCaStr = ref('');
+const mtlsFpStr = ref('');
+const mtlsGenLoading = ref(false);
+const mtlsResultOpen = ref(false);
+const mtlsResult = reactive({ cert_pem: '', key_pem: '', fingerprint: '' });
 const vlessEncLoading = ref(false);
 const mldsaLoading = ref(false);
 const vlessEncOpts = reactive({ auth: 'mlkem768', mode: 'native', rtt: '0rtt', lifetime: '600s' });
@@ -731,6 +1097,7 @@ const primaryClient = computed(() => {
 });
 
 const isPortForward = computed(() => form.protocol === 'portforward');
+const isWireGuard = computed(() => form.protocol === 'wireguard');
 const hasVlessNativeEnc = computed(
   () =>
     form.protocol === 'vless' &&
@@ -780,6 +1147,12 @@ const compatInfo = computed(() => {
 
   if (p === 'portforward') {
     return { supported: ['Shoes'], omitted: [] };
+  }
+  if (p === 'wireguard') {
+    return { supported: ['WireGuard App', 'Shoes', 'Mihomo / Clash', 'sing-box'], omitted: [] };
+  }
+  if (!isQuicOuter.value && form.stream_settings.sudoku?.enabled) {
+    return { supported: ['Shoes'], omitted: ['Mihomo / Clash', 'sing-box'] };
   }
 
   let mihomo = false;
@@ -844,6 +1217,11 @@ watch(
         blank.protocol_settings,
         cloned.protocol_settings || {}
       );
+      form.stream_settings.tls = Object.assign(
+        {},
+        blank.stream_settings.tls,
+        cloned.stream_settings?.tls || {}
+      );
       form.stream_settings.h2mux = Object.assign(
         {},
         blank.stream_settings.h2mux,
@@ -854,12 +1232,26 @@ watch(
         blank.stream_settings.shadowtls,
         cloned.stream_settings?.shadowtls || {}
       );
+      form.stream_settings.sudoku = Object.assign(
+        {},
+        blank.stream_settings.sudoku,
+        cloned.stream_settings?.sudoku || {}
+      );
       if (isQuicProtocol.value) selectAutoCertIfEmpty();
-      quotaGb.value = form.total_quota_bytes > 0 ? +(form.total_quota_bytes / 1073741824).toFixed(2) : 0;
+      quotaGb.value = form.total_quota_bytes / 1073741824;
       expiryDayjs.value = form.expiry_time > 0 ? dayjs(form.expiry_time) : null;
       alpnStr.value = (form.stream_settings.tls.alpn || []).join(',');
       shortIdsStr.value = (form.stream_settings.reality.short_ids || []).join(',');
       forwardTargetsStr.value = (form.protocol_settings.forward_targets || []).join('\n');
+      wgServerAddrsStr.value = (form.protocol_settings.wg_server_addresses?.length
+        ? form.protocol_settings.wg_server_addresses
+        : ['10.77.0.1/32', 'fd77::1/128']
+      ).join(', ');
+      wgServerHighThroughput.value = Boolean(
+        form.protocol_settings.wg_tcp_buffer_size && form.protocol_settings.wg_tcp_buffer_size >= 262144
+      );
+      mtlsCaStr.value = (form.stream_settings.tls.client_ca_certs || []).join('\n');
+      mtlsFpStr.value = (form.stream_settings.tls.client_fingerprints || []).join('\n');
     } else {
       Object.assign(form, blankInbound());
       quotaGb.value = 0;
@@ -867,6 +1259,10 @@ watch(
       alpnStr.value = '';
       shortIdsStr.value = '0123456789abcdef';
       forwardTargetsStr.value = '';
+      wgServerAddrsStr.value = '10.77.0.1/32, fd77::1/128';
+      wgServerHighThroughput.value = false;
+      mtlsCaStr.value = '';
+      mtlsFpStr.value = '';
       if (props.certs?.length > 0) {
         form.stream_settings.tls.certificate_source = props.certs[0].name;
         onCertSourceChange(props.certs[0].name);
@@ -924,12 +1320,64 @@ async function onProtocolChange(proto) {
     form.protocol_settings.cipher = 'any';
   } else if (proto === 'snell') {
     form.protocol_settings.cipher = 'aes-128-gcm';
+  } else if (proto === 'wireguard') {
+    form.stream_settings.network = 'tcp';
+    form.stream_settings.security = 'none';
+    form.stream_settings.sudoku.enabled = false;
+    form.stream_settings.h2mux.enabled = false;
+    if (!form.protocol_settings.wg_server_private_key) {
+      await genWgServerKeys();
+    }
+    if (!primaryClient.value.wg_private_key) {
+      await genWgPrimaryPeerKeys();
+    }
   } else if (['socks', 'http', 'mixed'].includes(proto) && !isEdit.value) {
     primaryClient.value.username = '';
     primaryClient.value.password = '';
   }
   if (!supportsH2Mux.value) {
     form.stream_settings.h2mux.enabled = false;
+  }
+}
+
+async function genWgServerKeys() {
+  try {
+    const res = await api.genWireguard();
+    form.protocol_settings.wg_server_private_key = res.private_key;
+    form.protocol_settings.wg_server_public_key = res.public_key;
+  } catch (e) {
+    message.error(e.message);
+  }
+}
+
+async function genWgPrimaryPeerKeys() {
+  try {
+    const res = await api.genWireguard();
+    primaryClient.value.wg_private_key = res.private_key;
+    primaryClient.value.wg_public_key = res.public_key;
+    primaryClient.value.wg_preshared_key = res.preshared_key || '';
+    if (!primaryClient.value.wg_allowed_ips) {
+      primaryClient.value.wg_allowed_ips = '10.77.0.2/32, fd77::2/128';
+    }
+  } catch (e) {
+    message.error(e.message);
+  }
+}
+
+async function genMtlsClientCert() {
+  mtlsGenLoading.value = true;
+  try {
+    const res = await api.genMtlsClient(form.remark || 'shoes-client');
+    mtlsResult.cert_pem = res.cert_pem;
+    mtlsResult.key_pem = res.key_pem;
+    mtlsResult.fingerprint = res.fingerprint;
+    const existing = mtlsFpStr.value.trim();
+    mtlsFpStr.value = existing ? `${existing}\n${res.fingerprint}` : res.fingerprint;
+    mtlsResultOpen.value = true;
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    mtlsGenLoading.value = false;
   }
 }
 
@@ -1067,6 +1515,55 @@ async function refreshRealityKeys() {
   shortIdsStr.value = rk.short_id;
 }
 
+const realityProbeOpen = ref(false);
+const realityProbing = ref(false);
+const probeDestInput = ref('');
+const probeSniInput = ref('');
+const realityProbeResults = ref([]);
+
+const realityProbeColumns = computed(() => [
+  { title: t('inbounds.realityProbeTarget'), key: 'target', width: 190 },
+  { title: t('inbounds.realityProbeLatency'), key: 'latency', width: 115 },
+  { title: t('inbounds.realityProbeProto'), key: 'proto', width: 165 },
+  { title: t('inbounds.realityProbeMldsa'), key: 'mldsa', width: 125 },
+  { title: t('inbounds.realityProbeCert'), key: 'cert', width: 150 },
+  { title: t('inbounds.realityProbeVerdict'), key: 'verdict', width: 110 },
+  { title: t('app.actions'), key: 'action', width: 95, fixed: 'right' },
+]);
+
+function openRealityProbe() {
+  probeDestInput.value = form.stream_settings.reality.dest || 'www.microsoft.com:443';
+  probeSniInput.value = form.stream_settings.reality.sni || '';
+  realityProbeOpen.value = true;
+  if (probeDestInput.value.trim()) {
+    runRealityProbe(false);
+  }
+}
+
+async function runRealityProbe(usePresets) {
+  realityProbing.value = true;
+  try {
+    const res = await api.probeReality({
+      dest: probeDestInput.value.trim(),
+      sni: probeSniInput.value.trim(),
+      use_presets: Boolean(usePresets),
+      timeout_ms: 4500,
+    });
+    realityProbeResults.value = res.results || [];
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    realityProbing.value = false;
+  }
+}
+
+function applyRealityProbeResult(rec) {
+  form.stream_settings.reality.dest = rec.dest;
+  form.stream_settings.reality.sni = rec.sni;
+  realityProbeOpen.value = false;
+  message.success(t('inbounds.realityProbeApplied', { dest: rec.dest, sni: rec.sni }));
+}
+
 async function quickGenSelfSigned() {
   try {
     const sni = form.stream_settings.tls.sni?.trim();
@@ -1108,6 +1605,14 @@ async function handleSave() {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+    payload.stream_settings.tls.client_ca_certs = mtlsCaStr.value
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    payload.stream_settings.tls.client_fingerprints = mtlsFpStr.value
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
     payload.stream_settings.reality.short_ids = shortIdsStr.value
       .split(',')
       .map((s) => s.trim());
@@ -1115,10 +1620,22 @@ async function handleSave() {
       .split(/[\n,;]+/)
       .map((s) => s.trim())
       .filter(Boolean);
+    payload.protocol_settings.wg_server_addresses = wgServerAddrsStr.value
+      .split(/[\n,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    payload.protocol_settings.wg_tcp_buffer_size = wgServerHighThroughput.value ? 262144 : null;
+    payload.protocol_settings.wg_tcp_memory_bytes = wgServerHighThroughput.value ? 268435456 : null;
     if (payload.protocol === 'portforward') {
       payload.stream_settings.network = 'tcp';
       payload.stream_settings.security = 'none';
       payload.stream_settings.h2mux.enabled = false;
+      payload.stream_settings.sudoku.enabled = false;
+    } else if (payload.protocol === 'wireguard') {
+      payload.stream_settings.network = 'tcp';
+      payload.stream_settings.security = 'none';
+      payload.stream_settings.h2mux.enabled = false;
+      payload.stream_settings.sudoku.enabled = false;
     }
 
     if (isEdit.value) {

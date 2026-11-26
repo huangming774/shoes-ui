@@ -27,9 +27,9 @@
                 <a-tag
                   v-for="(m, i) in record.members"
                   :key="i"
-                  :color="m.protocol === 'wireguard' ? 'orange' : (m.shadowtls ? 'magenta' : undefined)"
+                  :color="memberTagColor(m)"
                 >
-                  {{ m.name }} ({{ m.protocol }}{{ m.shadowtls ? ' · ShadowTLS' : '' }}{{ m.h2mux?.enabled ? ' · H2Mux' : '' }})
+                  {{ formatMemberSummary(m) }}
                 </a-tag>
               </a-space>
             </template>
@@ -337,7 +337,7 @@
     </a-tabs>
 
     <!-- Outbound Group Modal -->
-    <a-modal v-model:open="groupModalOpen" :title="t('routing.addGroup')" width="820px" @ok="saveGroup">
+    <a-modal v-model:open="groupModalOpen" :title="groupForm.id ? `${t('app.edit')} · ${groupForm.name}` : t('routing.addGroup')" width="820px" @ok="saveGroup">
       <a-form layout="vertical">
         <a-row :gutter="12">
           <a-col :span="9">
@@ -361,9 +361,14 @@
           </a-col>
         </a-row>
 
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px">
           <b>{{ t('routing.members') }}</b>
-          <a-button size="small" type="dashed" @click="addMemberRow">+ {{ t('routing.addMember') }}</a-button>
+          <a-space size="small">
+            <a-button size="small" type="primary" ghost @click="openUriImportModal">
+              📋 {{ t('routing.importUriBtn') }}
+            </a-button>
+            <a-button size="small" type="dashed" @click="addMemberRow">+ {{ t('routing.addMember') }}</a-button>
+          </a-space>
         </div>
 
         <div
@@ -378,27 +383,42 @@
             <a-col :span="5">
               <a-select v-model:value="m.protocol" size="small" style="width: 100%" @change="onMemberProtoChange(m)">
                 <a-select-option value="wireguard">WireGuard (WARP)</a-select-option>
-                <a-select-option value="socks">SOCKS5</a-select-option>
-                <a-select-option value="http">HTTP</a-select-option>
-                <a-select-option value="shadowsocks">Shadowsocks</a-select-option>
                 <a-select-option value="vless">VLESS</a-select-option>
                 <a-select-option value="vmess">VMess</a-select-option>
                 <a-select-option value="trojan">Trojan</a-select-option>
+                <a-select-option value="shadowsocks">Shadowsocks</a-select-option>
+                <a-select-option value="hysteria2">Hysteria2 (QUIC)</a-select-option>
+                <a-select-option value="tuic">TUIC v5 (QUIC)</a-select-option>
+                <a-select-option value="anytls">AnyTLS</a-select-option>
+                <a-select-option value="snell">Snell</a-select-option>
+                <a-select-option value="socks">SOCKS5</a-select-option>
+                <a-select-option value="http">HTTP</a-select-option>
                 <a-select-option value="direct">Direct</a-select-option>
                 <a-select-option value="group">Group Ref</a-select-option>
               </a-select>
             </a-col>
             <a-col :span="7">
-              <a-input
-                v-if="m.protocol !== 'direct'"
+              <a-select
+                v-if="m.protocol === 'group'"
                 v-model:value="m.address"
-                :placeholder="m.protocol === 'wireguard' ? 'engage.cloudflareclient.com:2408' : (m.protocol === 'group' ? 'group-name' : 'host:port')"
+                size="small"
+                style="width: 100%"
+                placeholder="Target Group"
+              >
+                <a-select-option v-for="g in groups.filter((x) => x.name !== groupForm.name)" :key="g.name" :value="g.name">
+                  {{ g.name }}
+                </a-select-option>
+              </a-select>
+              <a-input
+                v-else-if="m.protocol !== 'direct'"
+                v-model:value="m.address"
+                :placeholder="m.protocol === 'wireguard' ? 'engage.cloudflareclient.com:2408' : 'host:port'"
                 size="small"
               />
             </a-col>
             <a-col :span="5">
               <a-input
-                v-if="['vless', 'vmess'].includes(m.protocol)"
+                v-if="['vless', 'vmess', 'tuic'].includes(m.protocol)"
                 v-model:value="m.uuid"
                 placeholder="UUID"
                 size="small"
@@ -421,52 +441,188 @@
             </a-col>
           </a-row>
 
-          <!-- TLS / ShadowTLS v3 / H2Mux / Shadowsocks cipher options -->
-          <div v-if="['shadowsocks', 'vless', 'vmess', 'trojan', 'socks', 'http'].includes(m.protocol)" style="margin-top: 8px">
-            <a-row :gutter="8" style="align-items: center">
-              <a-col v-if="m.protocol === 'shadowsocks'" :span="6">
-                <a-input v-model:value="m.cipher" placeholder="aes-256-gcm" size="small" />
+          <!-- Hysteria2 / TUIC QUIC outbound options -->
+          <div v-if="['hysteria2', 'tuic'].includes(m.protocol)" style="margin-top: 8px">
+            <a-row :gutter="8" style="align-items: center; margin-bottom: 6px">
+              <a-col v-if="m.protocol === 'tuic'" :span="6">
+                <a-input v-model:value="m.password" placeholder="TUIC Password" size="small" />
+              </a-col>
+              <a-col :span="m.protocol === 'tuic' ? 6 : 8">
+                <a-input v-model:value="m.sni" placeholder="SNI (e.g. hy2.example.com)" size="small" />
+              </a-col>
+              <a-col v-if="m.protocol === 'hysteria2'" :span="6">
+                <a-input v-model:value="m.hy2_hopping_ports" placeholder="Hopping (e.g. 20000-20100)" size="small" />
+              </a-col>
+              <a-col v-if="m.protocol === 'hysteria2'" :span="6">
+                <a-input v-model:value="m.hy2_obfs_password" placeholder="Salamander Obfs (opt)" size="small" />
+              </a-col>
+              <a-col v-if="m.protocol === 'tuic'" :span="6">
+                <a-select v-model:value="m.tuic_udp_mode" size="small" style="width: 100%">
+                  <a-select-option value="native">UDP: native</a-select-option>
+                  <a-select-option value="quic">UDP: quic</a-select-option>
+                </a-select>
               </a-col>
               <a-col :span="4">
-                <a-checkbox
-                  v-model:checked="m.tls"
-                  @change="(e) => e.target.checked && (m.shadowtls = false)"
-                >
-                  TLS
-                </a-checkbox>
+                <a-checkbox v-model:checked="m.verify" style="font-size: 12px">Verify</a-checkbox>
               </a-col>
-              <a-col :span="6">
-                <a-checkbox
-                  v-model:checked="m.shadowtls"
-                  @change="(e) => e.target.checked && (m.tls = false)"
-                >
-                  ShadowTLS v3
-                </a-checkbox>
+            </a-row>
+          </div>
+
+          <!-- TCP proxy security / transport / REALITY / ShadowTLS / Sudoku / H2Mux options -->
+          <div
+            v-if="['shadowsocks', 'vless', 'vmess', 'trojan', 'anytls', 'snell', 'socks', 'http'].includes(m.protocol)"
+            style="margin-top: 8px"
+          >
+            <a-row :gutter="8" style="align-items: center">
+              <a-col v-if="['shadowsocks', 'vmess', 'snell'].includes(m.protocol)" :span="5">
+                <a-input v-model:value="m.cipher" placeholder="Cipher" size="small" />
+              </a-col>
+              <a-col v-if="['socks', 'http'].includes(m.protocol)" :span="5">
+                <a-input v-model:value="m.username" placeholder="Username (opt)" size="small" />
+              </a-col>
+              <a-col :span="5">
+                <a-select v-model:value="m.security" size="small" style="width: 100%" @change="onHopSecurityChange(m)">
+                  <a-select-option value="none">Sec: None</a-select-option>
+                  <a-select-option value="tls">Sec: TLS</a-select-option>
+                  <a-select-option value="reality">Sec: REALITY</a-select-option>
+                  <a-select-option value="shadowtls">Sec: ShadowTLS v3</a-select-option>
+                </a-select>
+              </a-col>
+              <a-col v-if="['vless', 'vmess', 'trojan', 'shadowsocks'].includes(m.protocol)" :span="4">
+                <a-select v-model:value="m.network" size="small" style="width: 100%">
+                  <a-select-option value="tcp">TCP</a-select-option>
+                  <a-select-option value="ws">WS</a-select-option>
+                  <a-select-option value="xhttp">XHTTP</a-select-option>
+                </a-select>
               </a-col>
               <a-col v-if="['vless', 'vmess', 'trojan'].includes(m.protocol)" :span="4">
                 <a-checkbox v-model:checked="ensureMemberH2Mux(m).enabled">H2Mux</a-checkbox>
               </a-col>
-              <a-col v-if="['vless', 'vmess', 'trojan'].includes(m.protocol) && ensureMemberH2Mux(m).enabled" :span="4">
-                <a-input-number v-model:value="m.h2mux.max_connections" :min="1" :max="64" size="small" style="width: 100%" placeholder="Conns" />
-              </a-col>
-              <a-col v-if="['vless', 'vmess', 'trojan'].includes(m.protocol) && ensureMemberH2Mux(m).enabled" :span="4">
-                <a-checkbox v-model:checked="m.h2mux.padding">Padding</a-checkbox>
+              <a-col :span="4">
+                <a-checkbox v-model:checked="ensureHopSudoku(m).enabled">Sudoku</a-checkbox>
               </a-col>
             </a-row>
 
-            <a-row v-if="m.tls || m.shadowtls" :gutter="8" style="margin-top: 6px; align-items: center">
+            <!-- Security fields -->
+            <a-row v-if="m.security === 'tls'" :gutter="8" style="margin-top: 6px; align-items: center">
+              <a-col :span="8">
+                <a-input v-model:value="m.sni" placeholder="SNI (e.g. proxy.example.com)" size="small" />
+              </a-col>
+              <a-col :span="6">
+                <a-checkbox v-model:checked="m.verify" style="font-size: 12px">Verify Cert</a-checkbox>
+                <a-checkbox v-if="m.protocol === 'vless'" v-model:checked="m.vision" style="font-size: 12px">Vision</a-checkbox>
+              </a-col>
+              <a-col :span="10">
+                <a-select
+                  v-model:value="m.key_exchange_groups"
+                  mode="multiple"
+                  size="small"
+                  style="width: 100%"
+                  placeholder="PQ Key Exchange (opt)"
+                >
+                  <a-select-option value="X25519MLKEM768">X25519MLKEM768</a-select-option>
+                  <a-select-option value="SecP256r1MLKEM768">SecP256r1MLKEM768</a-select-option>
+                  <a-select-option value="X25519">X25519</a-select-option>
+                </a-select>
+              </a-col>
+            </a-row>
+
+            <a-row v-if="m.security === 'tls'" :gutter="8" style="margin-top: 6px">
+              <a-col :span="12">
+                <a-input v-model:value="m.tls_cert" placeholder="mTLS Client Cert Path (opt)" size="small" />
+              </a-col>
+              <a-col :span="12">
+                <a-input v-model:value="m.tls_key" placeholder="mTLS Client Key Path (opt)" size="small" />
+              </a-col>
+            </a-row>
+
+            <a-row v-if="m.security === 'reality'" :gutter="8" style="margin-top: 6px; align-items: center">
+              <a-col :span="6">
+                <a-input v-model:value="m.sni" placeholder="SNI" size="small" />
+              </a-col>
+              <a-col :span="8">
+                <a-input v-model:value="m.reality_public_key" placeholder="Public Key (pbk)" size="small" />
+              </a-col>
+              <a-col :span="5">
+                <a-input v-model:value="m.reality_short_id" placeholder="Short ID (sid)" size="small" />
+              </a-col>
+              <a-col :span="5">
+                <a-checkbox v-if="m.protocol === 'vless'" v-model:checked="m.vision" style="font-size: 12px">Vision</a-checkbox>
+              </a-col>
+            </a-row>
+            <a-row v-if="m.security === 'reality'" :gutter="8" style="margin-top: 6px">
+              <a-col :span="24">
+                <a-input v-model:value="m.reality_mldsa65_verify" placeholder="ML-DSA-65 Verify Key (pqv, optional)" size="small" />
+              </a-col>
+            </a-row>
+
+            <a-row v-if="m.security === 'shadowtls'" :gutter="8" style="margin-top: 6px">
               <a-col :span="10">
                 <a-input v-model:value="m.sni" placeholder="SNI (e.g. www.microsoft.com)" size="small" />
               </a-col>
-              <a-col v-if="m.shadowtls" :span="14">
-                <a-input
-                  v-model:value="m.shadowtls_password"
-                  :placeholder="t('inbounds.shadowtlsPassword')"
-                  size="small"
-                />
+              <a-col :span="14">
+                <a-input v-model:value="m.shadowtls_password" :placeholder="t('inbounds.shadowtlsPassword')" size="small" />
               </a-col>
-              <a-col v-else :span="8">
-                <a-checkbox v-model:checked="m.verify" style="font-size: 12px">Verify TLS Cert</a-checkbox>
+            </a-row>
+
+            <!-- VLESS native encryption -->
+            <a-row v-if="m.protocol === 'vless'" :gutter="8" style="margin-top: 6px">
+              <a-col :span="24">
+                <a-input v-model:value="m.vless_encryption" placeholder="VLESS Native Encryption (optional, e.g. mlkem768x25519plus...)" size="small" />
+              </a-col>
+            </a-row>
+
+            <!-- Transport fields (WS / XHTTP) -->
+            <a-row v-if="m.network === 'ws'" :gutter="8" style="margin-top: 6px">
+              <a-col :span="12">
+                <a-input v-model:value="m.ws_path" placeholder="WS Path (e.g. /ws)" size="small" />
+              </a-col>
+              <a-col :span="12">
+                <a-input v-model:value="m.ws_host" placeholder="WS Host Header (optional)" size="small" />
+              </a-col>
+            </a-row>
+            <a-row v-if="m.network === 'xhttp'" :gutter="8" style="margin-top: 6px">
+              <a-col :span="9">
+                <a-input v-model:value="m.xhttp_path" placeholder="XHTTP Path (e.g. /xhttp)" size="small" />
+              </a-col>
+              <a-col :span="9">
+                <a-input v-model:value="m.xhttp_host" placeholder="XHTTP Host (optional)" size="small" />
+              </a-col>
+              <a-col :span="6">
+                <a-select v-model:value="m.xhttp_mode" size="small" style="width: 100%">
+                  <a-select-option value="auto">auto</a-select-option>
+                  <a-select-option value="packet-up">packet-up</a-select-option>
+                  <a-select-option value="stream-up">stream-up</a-select-option>
+                  <a-select-option value="stream-one">stream-one</a-select-option>
+                </a-select>
+              </a-col>
+            </a-row>
+
+            <!-- Sudoku Mask outbound fields -->
+            <a-row v-if="ensureHopSudoku(m).enabled" :gutter="8" style="margin-top: 6px">
+              <a-col :span="10">
+                <a-input v-model:value="m.sudoku.password" placeholder="Sudoku Password" size="small" />
+              </a-col>
+              <a-col :span="7">
+                <a-select v-model:value="m.sudoku.ascii" size="small" style="width: 100%">
+                  <a-select-option value="">prefer_entropy</a-select-option>
+                  <a-select-option value="entropy">entropy</a-select-option>
+                  <a-select-option value="prefer_ascii">prefer_ascii</a-select-option>
+                  <a-select-option value="ascii">ascii</a-select-option>
+                </a-select>
+              </a-col>
+              <a-col :span="7">
+                <a-input v-model:value="m.sudoku.custom_table" placeholder="Custom Table (opt)" size="small" />
+              </a-col>
+            </a-row>
+
+            <!-- H2Mux fields -->
+            <a-row v-if="['vless', 'vmess', 'trojan'].includes(m.protocol) && ensureMemberH2Mux(m).enabled" :gutter="8" style="margin-top: 6px; align-items: center">
+              <a-col :span="6">
+                <a-input-number v-model:value="m.h2mux.max_connections" :min="1" :max="64" size="small" style="width: 100%" placeholder="Conns" />
+              </a-col>
+              <a-col :span="6">
+                <a-checkbox v-model:checked="m.h2mux.padding" style="font-size: 12px">H2Mux Padding</a-checkbox>
               </a-col>
             </a-row>
           </div>
@@ -524,12 +680,129 @@
               {{ t('routing.wgPlatformNote') }}
             </div>
           </div>
+
+          <!-- Visual Multi-Hop Chain Builder (Hop 2..N) -->
+          <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(127,127,127,0.2)">
+            <div
+              v-for="(hop, hidx) in m.extra_hops || []"
+              :key="hidx"
+              style="padding: 8px; margin-bottom: 6px; border-radius: 6px; background: rgba(127,127,127,0.08)"
+            >
+              <a-row :gutter="6" style="align-items: center">
+                <a-col :span="3">
+                  <a-tag color="geekblue" style="margin: 0">→ {{ t('routing.hopLabel', { n: hidx + 2 }) }}</a-tag>
+                </a-col>
+                <a-col :span="5">
+                  <a-select v-model:value="hop.protocol" size="small" style="width: 100%">
+                    <a-select-option value="group">Group Ref</a-select-option>
+                    <a-select-option value="socks">SOCKS5</a-select-option>
+                    <a-select-option value="http">HTTP</a-select-option>
+                    <a-select-option value="vless">VLESS</a-select-option>
+                    <a-select-option value="vmess">VMess</a-select-option>
+                    <a-select-option value="trojan">Trojan</a-select-option>
+                    <a-select-option value="shadowsocks">Shadowsocks</a-select-option>
+                    <a-select-option value="anytls">AnyTLS</a-select-option>
+                    <a-select-option value="direct">Direct</a-select-option>
+                  </a-select>
+                </a-col>
+                <a-col :span="7">
+                  <a-select
+                    v-if="hop.protocol === 'group'"
+                    v-model:value="hop.address"
+                    size="small"
+                    style="width: 100%"
+                    placeholder="Select group"
+                  >
+                    <a-select-option v-for="g in groups.filter((x) => x.name !== groupForm.name)" :key="g.name" :value="g.name">
+                      {{ g.name }}
+                    </a-select-option>
+                  </a-select>
+                  <a-input
+                    v-else-if="hop.protocol !== 'direct'"
+                    v-model:value="hop.address"
+                    placeholder="host:port"
+                    size="small"
+                  />
+                </a-col>
+                <a-col :span="5">
+                  <a-input
+                    v-if="['vless', 'vmess'].includes(hop.protocol)"
+                    v-model:value="hop.uuid"
+                    placeholder="UUID"
+                    size="small"
+                  />
+                  <a-input
+                    v-else-if="!['group', 'direct'].includes(hop.protocol)"
+                    v-model:value="hop.password"
+                    placeholder="Password"
+                    size="small"
+                  />
+                </a-col>
+                <a-col :span="3">
+                  <a-select
+                    v-if="!['group', 'direct'].includes(hop.protocol)"
+                    v-model:value="hop.security"
+                    size="small"
+                    style="width: 100%"
+                  >
+                    <a-select-option value="none">None</a-select-option>
+                    <a-select-option value="tls">TLS</a-select-option>
+                    <a-select-option value="reality">REALITY</a-select-option>
+                    <a-select-option value="shadowtls">ShadowTLS</a-select-option>
+                  </a-select>
+                </a-col>
+                <a-col :span="1" style="text-align: right">
+                  <a-button size="small" danger type="text" @click="m.extra_hops.splice(hidx, 1)">✕</a-button>
+                </a-col>
+              </a-row>
+              <a-row
+                v-if="!['group', 'direct'].includes(hop.protocol) && ['tls', 'reality', 'shadowtls'].includes(hop.security)"
+                :gutter="6"
+                style="margin-top: 6px"
+              >
+                <a-col :span="8">
+                  <a-input v-model:value="hop.sni" placeholder="SNI" size="small" />
+                </a-col>
+                <a-col v-if="hop.security === 'reality'" :span="10">
+                  <a-input v-model:value="hop.reality_public_key" placeholder="Public Key (pbk)" size="small" />
+                </a-col>
+                <a-col v-if="hop.security === 'reality'" :span="6">
+                  <a-input v-model:value="hop.reality_short_id" placeholder="Short ID" size="small" />
+                </a-col>
+                <a-col v-if="hop.security === 'shadowtls'" :span="16">
+                  <a-input v-model:value="hop.shadowtls_password" placeholder="ShadowTLS Password" size="small" />
+                </a-col>
+                <a-col v-if="hop.security === 'tls'" :span="8">
+                  <a-checkbox v-model:checked="hop.verify" style="font-size: 12px">Verify Cert</a-checkbox>
+                </a-col>
+              </a-row>
+            </div>
+            <a-button size="small" type="link" style="padding: 0" @click="addExtraHop(m)">
+              + {{ t('routing.addNextHop') }}
+            </a-button>
+          </div>
         </div>
 
         <a-form-item :label="t('routing.rawChainsYaml')" style="margin-top: 10px">
           <a-textarea v-model:value="groupForm.raw_chains_yaml" :rows="3" style="font-family: monospace; font-size: 12px" />
         </a-form-item>
       </a-form>
+    </a-modal>
+
+    <!-- Share URI -> Outbound Member Import Modal -->
+    <a-modal
+      v-model:open="uriImportOpen"
+      :title="t('routing.importUriTitle')"
+      width="640px"
+      :confirm-loading="uriImporting"
+      @ok="applyUriImport"
+    >
+      <a-textarea
+        v-model:value="uriImportText"
+        :rows="8"
+        style="font-family: monospace; font-size: 12px"
+        :placeholder="t('routing.importUriPlaceholder')"
+      />
     </a-modal>
 
     <!-- WireGuard .conf Import Modal -->
@@ -955,6 +1228,9 @@ const groupForm = reactive({
 const wgImportOpen = ref(false);
 const wgImportText = ref('');
 const wgImportTarget = ref(null);
+const uriImportOpen = ref(false);
+const uriImportText = ref('');
+const uriImporting = ref(false);
 
 const ruleSourceModalOpen = ref(false);
 const ruleSourceForm = reactive({
@@ -1098,81 +1374,230 @@ function defaultH2Mux() {
   return { enabled: false, max_connections: 4, min_streams: 4, max_streams: 0, padding: false };
 }
 
+function defaultSudoku() {
+  return { enabled: false, password: '', ascii: '', custom_table: '', custom_tables: [], padding_min: 0, padding_max: 0 };
+}
+
 function ensureMemberH2Mux(m) {
   if (!m.h2mux) m.h2mux = defaultH2Mux();
   return m.h2mux;
 }
 
-function hydrateMemberForUi(m) {
+function ensureHopSudoku(m) {
+  if (!m.sudoku) m.sudoku = defaultSudoku();
+  return m.sudoku;
+}
+
+function memberEffectiveSec(m) {
+  if (m.security) return m.security;
+  if (m.shadowtls) return 'shadowtls';
+  if (m.reality_public_key) return 'reality';
+  if (m.tls) return 'tls';
+  return 'none';
+}
+
+function memberTagColor(m) {
+  if (m.protocol === 'wireguard') return 'orange';
+  if (m.extra_hops?.length > 0) return 'purple';
+  const sec = memberEffectiveSec(m);
+  if (sec === 'shadowtls') return 'magenta';
+  if (sec === 'reality') return 'gold';
+  if (['hysteria2', 'tuic'].includes(m.protocol)) return 'volcano';
+  return undefined;
+}
+
+function formatMemberSummary(m) {
+  const parts = [m.protocol];
+  const sec = memberEffectiveSec(m);
+  if (sec === 'reality') parts.push('REALITY');
+  else if (sec === 'shadowtls') parts.push('ShadowTLS');
+  if (m.sudoku?.enabled) parts.push('Sudoku');
+  if (m.h2mux?.enabled) parts.push('H2Mux');
+  if (m.extra_hops?.length > 0) {
+    parts.push(`${1 + m.extra_hops.length} hops`);
+  }
+  return `${m.name} (${parts.join(' · ')})`;
+}
+
+function hydrateHopForUi(h = {}) {
+  const sec = h.security || (h.shadowtls ? 'shadowtls' : h.reality_public_key ? 'reality' : h.tls ? 'tls' : 'none');
   return {
-    name: m.name || 'node-1',
-    protocol: m.protocol || 'socks',
-    address: m.address || '',
-    uuid: m.uuid || '',
-    username: m.username || '',
-    password: m.password || '',
-    cipher: m.cipher || 'aes-256-gcm',
-    tls: Boolean(m.tls),
-    shadowtls: Boolean(m.shadowtls),
-    shadowtls_password: m.shadowtls_password || '',
-    sni: m.sni || '',
-    verify: m.verify !== false,
-    h2mux: m.h2mux ? { ...defaultH2Mux(), ...m.h2mux } : defaultH2Mux(),
-    bind_interface: m.bind_interface || '',
-    wg_private_key: m.wg_private_key || '',
-    wg_public_key: m.wg_public_key || '',
-    wg_preshared_key: m.wg_preshared_key || '',
-    wg_addresses: Array.isArray(m.wg_addresses) ? [...m.wg_addresses] : [],
-    wg_allowed_ips: Array.isArray(m.wg_allowed_ips) ? [...m.wg_allowed_ips] : ['0.0.0.0/0', '::/0'],
-    wg_mtu: m.wg_mtu || 1280,
-    wg_keepalive: m.wg_keepalive ?? 25,
-    wg_tcp_buffer_size: m.wg_tcp_buffer_size || null,
-    wg_tcp_memory_bytes: m.wg_tcp_memory_bytes || null,
-    _wg_addresses_text: (m.wg_addresses || []).join(', '),
-    _wg_allowed_text: (m.wg_allowed_ips?.length ? m.wg_allowed_ips : ['0.0.0.0/0', '::/0']).join(', '),
-    _wg_high_throughput: Boolean(m.wg_tcp_buffer_size && m.wg_tcp_buffer_size >= 262144),
+    protocol: h.protocol || 'socks',
+    address: h.address || '',
+    uuid: h.uuid || '',
+    username: h.username || '',
+    password: h.password || '',
+    cipher: h.cipher || (h.protocol === 'snell' ? 'aes-128-gcm' : 'aes-256-gcm'),
+    security: sec,
+    tls: sec === 'tls',
+    shadowtls: sec === 'shadowtls',
+    shadowtls_password: h.shadowtls_password || '',
+    sni: h.sni || '',
+    verify: h.verify !== false,
+    alpn: Array.isArray(h.alpn) ? [...h.alpn] : [],
+    tls_cert: h.tls_cert || '',
+    tls_key: h.tls_key || '',
+    server_fingerprints: Array.isArray(h.server_fingerprints) ? [...h.server_fingerprints] : [],
+    key_exchange_groups: Array.isArray(h.key_exchange_groups) ? [...h.key_exchange_groups] : [],
+    reality_public_key: h.reality_public_key || '',
+    reality_short_id: h.reality_short_id || '',
+    reality_mldsa65_verify: h.reality_mldsa65_verify || '',
+    vision: Boolean(h.vision),
+    vless_encryption: h.vless_encryption || '',
+    network: h.network || 'tcp',
+    ws_path: h.ws_path || '',
+    ws_host: h.ws_host || '',
+    xhttp_path: h.xhttp_path || '',
+    xhttp_host: h.xhttp_host || '',
+    xhttp_mode: h.xhttp_mode || 'auto',
+    hy2_obfs_password: h.hy2_obfs_password || '',
+    hy2_hopping_ports: h.hy2_hopping_ports || '',
+    tuic_udp_mode: h.tuic_udp_mode || 'native',
+    h2mux: h.h2mux ? { ...defaultH2Mux(), ...h.h2mux } : defaultH2Mux(),
+    sudoku: h.sudoku ? { ...defaultSudoku(), ...h.sudoku } : defaultSudoku(),
+    bind_interface: h.bind_interface || '',
+    wg_private_key: h.wg_private_key || '',
+    wg_public_key: h.wg_public_key || '',
+    wg_preshared_key: h.wg_preshared_key || '',
+    wg_addresses: Array.isArray(h.wg_addresses) ? [...h.wg_addresses] : [],
+    wg_allowed_ips: Array.isArray(h.wg_allowed_ips) ? [...h.wg_allowed_ips] : ['0.0.0.0/0', '::/0'],
+    wg_mtu: h.wg_mtu || 1280,
+    wg_keepalive: h.wg_keepalive ?? 25,
+    wg_tcp_buffer_size: h.wg_tcp_buffer_size || null,
+    wg_tcp_memory_bytes: h.wg_tcp_memory_bytes || null,
+    _wg_addresses_text: (h.wg_addresses || []).join(', '),
+    _wg_allowed_text: (h.wg_allowed_ips?.length ? h.wg_allowed_ips : ['0.0.0.0/0', '::/0']).join(', '),
+    _wg_high_throughput: Boolean(h.wg_tcp_buffer_size && h.wg_tcp_buffer_size >= 262144),
   };
 }
 
-function serializeMemberFromUi(m) {
+function hydrateMemberForUi(m) {
+  return {
+    name: m.name || 'node-1',
+    ...hydrateHopForUi(m),
+    extra_hops: Array.isArray(m.extra_hops) ? m.extra_hops.map(hydrateHopForUi) : [],
+  };
+}
+
+function serializeHopFromUi(h) {
   const splitList = (txt) =>
     String(txt || '')
       .split(/[\s,;]+/)
       .map((s) => s.trim())
       .filter(Boolean);
+  const sec = h.security || 'none';
   const out = {
-    name: (m.name || '').trim(),
-    protocol: m.protocol,
-    address: (m.address || '').trim(),
-    uuid: (m.uuid || '').trim(),
-    username: (m.username || '').trim(),
-    password: (m.password || '').trim(),
-    cipher: (m.cipher || '').trim(),
-    tls: Boolean(m.tls),
-    shadowtls: Boolean(m.shadowtls),
-    shadowtls_password: (m.shadowtls_password || '').trim(),
-    sni: (m.sni || '').trim(),
-    verify: m.verify !== false,
-    h2mux: m.h2mux ? { ...m.h2mux } : defaultH2Mux(),
-    bind_interface: (m.bind_interface || '').trim(),
-    wg_private_key: (m.wg_private_key || '').trim(),
-    wg_public_key: (m.wg_public_key || '').trim(),
-    wg_preshared_key: (m.wg_preshared_key || '').trim(),
-    wg_addresses: splitList(m._wg_addresses_text),
-    wg_allowed_ips: splitList(m._wg_allowed_text),
-    wg_mtu: Number(m.wg_mtu) || 0,
-    wg_keepalive: Number(m.wg_keepalive) || 0,
-    wg_tcp_buffer_size: m._wg_high_throughput ? 262144 : null,
-    wg_tcp_memory_bytes: m._wg_high_throughput ? 268435456 : null,
+    protocol: h.protocol,
+    address: (h.address || '').trim(),
+    uuid: (h.uuid || '').trim(),
+    username: (h.username || '').trim(),
+    password: (h.password || '').trim(),
+    cipher: (h.cipher || '').trim(),
+    security: sec,
+    tls: sec === 'tls',
+    shadowtls: sec === 'shadowtls',
+    shadowtls_password: (h.shadowtls_password || '').trim(),
+    sni: (h.sni || '').trim(),
+    verify: h.verify !== false,
+    alpn: Array.isArray(h.alpn) ? h.alpn : [],
+    tls_cert: (h.tls_cert || '').trim(),
+    tls_key: (h.tls_key || '').trim(),
+    server_fingerprints: Array.isArray(h.server_fingerprints) ? h.server_fingerprints : [],
+    key_exchange_groups: Array.isArray(h.key_exchange_groups) ? h.key_exchange_groups : [],
+    reality_public_key: (h.reality_public_key || '').trim(),
+    reality_short_id: (h.reality_short_id || '').trim(),
+    reality_mldsa65_verify: (h.reality_mldsa65_verify || '').trim(),
+    vision: Boolean(h.vision),
+    vless_encryption: (h.vless_encryption || '').trim(),
+    network: h.network || 'tcp',
+    ws_path: (h.ws_path || '').trim(),
+    ws_host: (h.ws_host || '').trim(),
+    xhttp_path: (h.xhttp_path || '').trim(),
+    xhttp_host: (h.xhttp_host || '').trim(),
+    xhttp_mode: (h.xhttp_mode || '').trim(),
+    hy2_obfs_password: (h.hy2_obfs_password || '').trim(),
+    hy2_hopping_ports: (h.hy2_hopping_ports || '').trim(),
+    tuic_udp_mode: (h.tuic_udp_mode || 'native').trim(),
+    h2mux: h.h2mux ? { ...h.h2mux } : defaultH2Mux(),
+    sudoku: h.sudoku ? { ...h.sudoku } : defaultSudoku(),
+    bind_interface: (h.bind_interface || '').trim(),
+    wg_private_key: (h.wg_private_key || '').trim(),
+    wg_public_key: (h.wg_public_key || '').trim(),
+    wg_preshared_key: (h.wg_preshared_key || '').trim(),
+    wg_addresses: splitList(h._wg_addresses_text),
+    wg_allowed_ips: splitList(h._wg_allowed_text),
+    wg_mtu: Number(h.wg_mtu) || 0,
+    wg_keepalive: Number(h.wg_keepalive) || 0,
+    wg_tcp_buffer_size: h._wg_high_throughput ? 262144 : null,
+    wg_tcp_memory_bytes: h._wg_high_throughput ? 268435456 : null,
   };
+  if (['wireguard', 'direct', 'group', 'hysteria2', 'tuic'].includes(out.protocol)) {
+    out.h2mux.enabled = false;
+    out.sudoku.enabled = false;
+  }
   if (['wireguard', 'direct', 'group'].includes(out.protocol)) {
+    out.security = 'none';
     out.tls = false;
     out.shadowtls = false;
-    out.h2mux.enabled = false;
-  } else if (out.shadowtls) {
-    out.tls = false;
   }
   return out;
+}
+
+function serializeMemberFromUi(m) {
+  return {
+    name: (m.name || '').trim(),
+    ...serializeHopFromUi(m),
+    extra_hops: (m.extra_hops || []).map(serializeHopFromUi),
+  };
+}
+
+function onHopSecurityChange(m) {
+  m.tls = m.security === 'tls';
+  m.shadowtls = m.security === 'shadowtls';
+}
+
+function addExtraHop(m) {
+  if (!Array.isArray(m.extra_hops)) m.extra_hops = [];
+  const otherGroup = groups.value.find((g) => g.name !== groupForm.name)?.name || '';
+  m.extra_hops.push(
+    hydrateHopForUi(
+      otherGroup
+        ? { protocol: 'group', address: otherGroup }
+        : { protocol: 'socks', address: '127.0.0.1:1080' }
+    )
+  );
+}
+
+function openUriImportModal() {
+  uriImportText.value = '';
+  uriImportOpen.value = true;
+}
+
+async function applyUriImport() {
+  uriImporting.value = true;
+  try {
+    const res = await api.parseOutboundUri(uriImportText.value);
+    const parsed = (res?.members || []).map(hydrateMemberForUi);
+    if (parsed.length === 0) {
+      message.warning('No valid share URIs parsed');
+      return;
+    }
+    // Replace default placeholder row if user hasn't touched it
+    if (
+      groupForm.members.length === 1 &&
+      groupForm.members[0].protocol === 'socks' &&
+      groupForm.members[0].address === '127.0.0.1:1080'
+    ) {
+      groupForm.members.splice(0, 1);
+    }
+    groupForm.members.push(...parsed);
+    uriImportOpen.value = false;
+    message.success(`Imported ${parsed.length} outbound node(s)`);
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    uriImporting.value = false;
+  }
 }
 
 function onMemberProtoChange(m) {
@@ -1180,11 +1605,14 @@ function onMemberProtoChange(m) {
     m.h2mux.enabled = false;
   }
   if (['wireguard', 'direct', 'group'].includes(m.protocol)) {
+    m.security = 'none';
     m.tls = false;
     m.shadowtls = false;
+  } else if (['trojan', 'anytls', 'hysteria2', 'tuic'].includes(m.protocol) && m.security === 'none') {
+    m.security = 'tls';
+    m.tls = true;
   }
   if (m.protocol === 'wireguard') {
-    m.tls = false;
     if (!m.address || m.address === '127.0.0.1:1080') {
       m.address = 'engage.cloudflareclient.com:2408';
     }

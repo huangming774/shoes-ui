@@ -1,6 +1,7 @@
 <template>
   <a-config-provider
-    :locale="locale === 'zh' ? zhCN : enUS"
+    :locale="currentLocaleMeta.antd"
+    :direction="currentLocaleMeta.dir"
     :theme="panelTheme"
   >
     <div v-if="!ready" class="panel-startup" role="status" :aria-label="t('app.loading')">
@@ -65,16 +66,18 @@
               <span v-if="statusData?.shoes" class="panel-status" :class="{ 'panel-status--running': statusData.shoes.running }">
                 Shoes · {{ t(statusData.shoes.running ? 'dashboard.running' : 'dashboard.stopped') }}
               </span>
-              <a-radio-group
+              <a-select
                 :value="locale"
                 class="panel-language"
-                name="panel-language"
-                aria-label="Language / 语言"
-                @change="(e) => setLocale(e.target.value)"
+                size="small"
+                style="min-width: 118px"
+                aria-label="Language"
+                @change="(val) => setLocale(val)"
               >
-                <a-radio-button value="zh">中文</a-radio-button>
-                <a-radio-button value="en">EN</a-radio-button>
-              </a-radio-group>
+                <a-select-option v-for="item in SUPPORTED_LOCALES" :key="item.code" :value="item.code">
+                  🌐 {{ item.label }}
+                </a-select-option>
+              </a-select>
               <a-button
                 class="panel-toolbar__icon"
                 :aria-label="t(isDark ? 'app.themeLight' : 'app.themeDark')"
@@ -164,8 +167,6 @@
 <script setup>
 import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue';
 import { theme } from 'ant-design-vue';
-import zhCN from 'ant-design-vue/es/locale/zh_CN';
-import enUS from 'ant-design-vue/es/locale/en_US';
 import {
   DashboardOutlined,
   ClusterOutlined,
@@ -184,7 +185,7 @@ import {
 } from '@ant-design/icons-vue';
 import { useI18n } from 'vue-i18n';
 import { api, onUnauthorized } from './api';
-import { setLocale } from './i18n';
+import { getLocaleMeta, setLocale, SUPPORTED_LOCALES } from './i18n';
 
 import LoginView from './views/LoginView.vue';
 import DashboardView from './views/DashboardView.vue';
@@ -196,6 +197,7 @@ import ConnectionsView from './views/ConnectionsView.vue';
 import SettingsView from './views/SettingsView.vue';
 
 const { t, locale } = useI18n();
+const currentLocaleMeta = computed(() => getLocaleMeta(locale.value));
 
 const ready = ref(false);
 const authenticated = ref(false);

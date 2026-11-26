@@ -222,13 +222,14 @@ impl RuntimeMonitor {
             let mut prev_net_tx: u64 = networks.iter().map(|(_, n)| n.total_transmitted()).sum();
 
             let mut last_conn_bytes: HashMap<String, (u64, u64)> = HashMap::new();
-            let mut prev_proxy_totals: Option<(u64, u64, Instant)> = None;
+            let mut prev_proxy_totals: Option<(u64, u64, Instant, Option<u32>)> = None;
             let mut recorded_day = None;
             let mut net_sample_at = Instant::now();
             let mut tick_count: u64 = 0;
             let mut network_window = NetworkWindow::default();
             let mut minute = Minute::default();
             let mut previous_pid = None;
+            let mut quota_reload_pending = false;
 
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -271,6 +272,7 @@ impl RuntimeMonitor {
                 prev_net_tx = cur_tx;
 
                 // 2. Poll shoes Clash API /connections for traffic deltas & active connection counts
+                let pid = mon.proc_mgr.current_pid().await;
                 let rate_available = prev_proxy_totals.is_some();
                 let mut clash_online = false;
                 let mut shoes_rss_bytes = 0u64;
@@ -298,12 +300,12 @@ impl RuntimeMonitor {
                                 let sampled = Instant::now();
                                 let (up_delta, down_delta) = match prev_proxy_totals {
                                     None => (0, 0),
-                                    Some((up, down, _)) if snap.upload_total >= up && snap.download_total >= down =>
+                                    Some((up, down, _, last_pid)) if last_pid == pid && snap.upload_total >= up && snap.download_total >= down =>
                                         (snap.upload_total - up, snap.download_total - down),
                                     // Both controller counters start over when the core restarts.
                                     Some(_) => (snap.upload_total, snap.download_total),
                                 };
-                                if let Some((_, _, previous)) = prev_proxy_totals {
+                                if let Some((_, _, previous, _)) = prev_proxy_totals {
                                     let seconds = sampled.duration_since(previous).as_secs_f64().max(0.001);
                                     proxy_up_speed = (up_delta as f64 / seconds) as u64;
                                     proxy_down_speed = (down_delta as f64 / seconds) as u64;
@@ -341,7 +343,7 @@ impl RuntimeMonitor {
                                 match mon.db.add_traffic_deltas(&deltas_by_inbound, daily) {
                                     Ok(()) => {
                                         recorded_day = Some(day);
-                                        prev_proxy_totals = Some((snap.upload_total, snap.download_total, sampled));
+                                        prev_proxy_totals = Some((snap.upload_total, snap.download_total, sampled, pid));
                                         last_conn_bytes = next_conn_bytes;
                                     }
                                     Err(err) => tracing::warn!("Failed to record traffic: {err}"),
@@ -350,33 +352,45 @@ impl RuntimeMonitor {
                         }
                     }
                 }
-                if !clash_online {
-                    last_conn_bytes.clear();
-                    prev_proxy_totals = None;
-                }
+                // Only successful, committed samples advance the baseline. A timeout
+                // does not reset the controller's counters or change connection UUIDs.
 
                 // 3. Enforce expiry and traffic quotas every 3 seconds
-                if tick_count % 3 == 0 {
-                    if let Ok(disabled_tags) = mon.db.enforce_quotas_and_expiry() {
-                        if !disabled_tags.is_empty() {
-                            mon.proc_mgr.push_panel_log(format!(
-                                "Auto-disabled expired/over-quota inbounds: {}",
-                                disabled_tags.join(", ")
-                            ));
-                            // Immediately terminate active connections for those disabled inbounds
-                            for tag in &disabled_tags {
-                                if let Some(conn_ids) = active_ids_by_tag.get(tag) {
-                                    for cid in conn_ids {
-                                        let _ = mon.close_connection(Some(cid)).await;
-                                    }
-                                }
+                let quota_check = if tick_count % 3 == 0 {
+                    mon.proc_mgr.operation.try_lock().ok()
+                } else {
+                    None
+                };
+                if let Some(operation) = quota_check {
+                    let disabled_tags = match mon.db.enforce_quotas_and_expiry() {
+                        Ok(tags) => tags,
+                        Err(err) => {
+                            tracing::warn!("Failed to check inbound quotas: {err:#}");
+                            Vec::new()
+                        }
+                    };
+                    if !disabled_tags.is_empty() {
+                        quota_reload_pending = true;
+                        mon.proc_mgr.push_panel_log(format!(
+                            "Auto-disabled expired/over-quota inbounds: {}", disabled_tags.join(", ")
+                        ));
+                    }
+                    if quota_reload_pending {
+                        match mon.proc_mgr.reload_config_locked().await {
+                            Ok(_) => quota_reload_pending = false,
+                            Err(err) => tracing::warn!("Failed to apply quota enforcement: {err:#}"),
+                        }
+                    }
+                    drop(operation);
+                    for tag in &disabled_tags {
+                        if let Some(conn_ids) = active_ids_by_tag.get(tag) {
+                            for cid in conn_ids {
+                                let _ = mon.close_connection(Some(cid)).await;
                             }
-                            let _ = mon.proc_mgr.reload_config().await;
                         }
                     }
                 }
 
-                let pid = mon.proc_mgr.current_pid().await;
                 let mut health = None;
                 if tick_count % 5 == 1 {
                     health = Some(network_window.sample(pid));
@@ -508,6 +522,49 @@ impl NetworkWindow {
         json!({"pid":pid, "used":used,"limit":limit,"algorithm":algorithm.as_deref().map(str::trim),
                "overflow":changes[0],"retrans":changes[1],"recv":changes[2],"send":changes[3]})
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn traffic_after_controller_outage_uses_last_committed_sample() -> Result<()> {
+    use axum::{http::StatusCode, routing::get, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+    let ib = db.create_inbound(serde_json::from_value(json!({
+        "protocol":"socks", "remark":"traffic", "port":23000
+    }))?)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    db.set_setting_kv("clash_api_addr", &listener.local_addr()?.to_string())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let api = Router::new().route("/connections", get(move || {
+        let sample = counter.fetch_add(1, Ordering::SeqCst);
+        let tag = ib.tag.clone();
+        async move {
+            if sample == 1 {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(Value::Null));
+            }
+            let bytes = if sample == 0 { 100 } else { 130 };
+            (StatusCode::OK, Json(json!({
+                "uploadTotal": bytes, "downloadTotal": 0,
+                "connections":[{"id":"same-connection","upload":bytes,"metadata":{"inboundName":tag}}]
+            })))
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, api).await });
+    let _monitor = RuntimeMonitor::new(db.clone(), ShoesProcessManager::new(db.clone()));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while calls.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await?;
+    assert_eq!(db.inbound_totals()?.up_bytes, 130);
+    assert_eq!(db.daily_traffic()?.last().unwrap()["up"], 30);
+    server.abort();
+    Ok(())
 }
 
 #[cfg(test)]

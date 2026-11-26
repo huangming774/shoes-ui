@@ -307,6 +307,10 @@ impl ShoesProcessManager {
 
     pub async fn reload_config(&self) -> Result<String> {
         let _operation = self.operation.lock().await;
+        self.reload_config_locked().await
+    }
+
+    pub(crate) async fn reload_config_locked(&self) -> Result<String> {
         let pid = self.current_pid().await;
         let yaml = sync_and_apply_config(&self.db, pid).await?;
         if pid.is_some() { self.db.record_core_event("reload"); }

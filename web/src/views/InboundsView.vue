@@ -7,6 +7,9 @@
           <a-button type="primary" @click="openCreate">
             + {{ t('inbounds.add') }}
           </a-button>
+          <a-button @click="openImportModal">
+            ⇅ {{ t('inbounds.importBtn') }}
+          </a-button>
           <a-popconfirm :title="t('inbounds.resetAllConfirm')" @confirm="handleResetAll">
             <a-button>{{ t('inbounds.resetAll') }}</a-button>
           </a-popconfirm>
@@ -37,12 +40,54 @@
       </div>
     </a-card>
 
+    <!-- Batch Actions Bar (appears when rows are selected) -->
+    <a-card
+      v-if="selectedRowKeys.length > 0"
+      size="small"
+      style="margin-bottom: 12px; border-color: #1677ff"
+    >
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px">
+        <a-space wrap>
+          <a-tag color="processing" style="font-size: 13px; padding: 3px 10px">
+            {{ t('inbounds.batchSelected', { n: selectedRowKeys.length }) }}
+          </a-tag>
+          <a-button size="small" type="primary" ghost :loading="batchBusy" @click="runBatch('enable')">
+            ▶ {{ t('inbounds.batchEnable') }}
+          </a-button>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('disable')">
+            ⏸ {{ t('inbounds.batchDisable') }}
+          </a-button>
+          <a-button size="small" :loading="batchBusy" @click="openBatchExtend">
+            ⏳ {{ t('inbounds.batchExtend') }}
+          </a-button>
+          <a-popconfirm
+            :title="t('inbounds.batchResetConfirm', { n: selectedRowKeys.length })"
+            @confirm="runBatch('reset_traffic')"
+          >
+            <a-button size="small" :loading="batchBusy">
+              ↺ {{ t('inbounds.batchResetTraffic') }}
+            </a-button>
+          </a-popconfirm>
+          <a-popconfirm
+            :title="t('inbounds.batchDeleteConfirm', { n: selectedRowKeys.length })"
+            @confirm="runBatch('delete')"
+          >
+            <a-button size="small" danger :loading="batchBusy">
+              🗑 {{ t('inbounds.batchDelete') }}
+            </a-button>
+          </a-popconfirm>
+        </a-space>
+        <a-button size="small" type="link" @click="selectedRowKeys = []">{{ t('app.cancel') }}</a-button>
+      </div>
+    </a-card>
+
     <!-- Two-Layer Expandable Table: Inbound -> Clients -->
     <a-card size="small" :body-style="{ padding: 0 }">
       <a-table
         :data-source="filteredInbounds"
         :columns="columns"
         row-key="id"
+        :row-selection="rowSelection"
         :loading="loading"
         :pagination="{ pageSize: 15, showSizeChanger: true }"
         size="middle"
@@ -81,6 +126,11 @@
               <a-tag color="default" style="font-family: monospace; font-size: 13px; font-weight: 600">
                 {{ record.port }}
               </a-tag>
+              <div v-if="record.sni_shared_count >= 2" style="margin-top: 3px">
+                <a-tag color="purple" style="font-size: 11px; margin: 0">
+                  {{ t('inbounds.sniMuxBadge', { n: record.sni_shared_count }) }}
+                </a-tag>
+              </div>
               <div v-if="record.protocol_settings?.port_range?.trim()" style="margin-top: 3px">
                 <a-tag color="blue" style="font-family: monospace; font-size: 11px; margin: 0">
                   ⇄ {{ record.protocol_settings.port_range.trim() }}
@@ -103,6 +153,13 @@
                 +{{ (record.protocol_settings?.forward_targets || []).length - 2 }}
               </a-tag>
             </a-space>
+            <a-space v-else-if="record.protocol === 'wireguard'" :size="4" wrap>
+              <a-tag color="orange">UDP</a-tag>
+              <a-tag color="geekblue">WG-SERVER</a-tag>
+              <a-tag v-if="record.protocol_settings?.wg_server_addresses?.length" style="font-family: monospace; font-size: 11px">
+                {{ record.protocol_settings.wg_server_addresses[0] }}
+              </a-tag>
+            </a-space>
             <a-space v-else :size="4" wrap>
               <a-tag>{{ transportLabel(record) }}</a-tag>
               <a-tag v-if="securityLabel(record)" :color="securityColor(record)">
@@ -110,6 +167,9 @@
               </a-tag>
               <a-tag v-if="hasVlessNativeEnc(record)" color="volcano">VLESS-ENC</a-tag>
               <a-tag v-if="hasMldsa65(record)" color="geekblue">ML-DSA-65</a-tag>
+              <a-tag v-if="hasPqKx(record)" color="geekblue">PQ-KX</a-tag>
+              <a-tag v-if="hasMtls(record)" color="green">mTLS</a-tag>
+              <a-tag v-if="hasSudoku(record)" color="volcano">SUDOKU</a-tag>
               <a-tag v-if="hasVision(record)" color="purple">Vision</a-tag>
               <a-tag v-if="hasH2Mux(record)" color="cyan">H2Mux</a-tag>
             </a-space>
@@ -337,6 +397,160 @@
       </a-form>
     </a-modal>
 
+    <!-- Batch Extend Expiry Modal -->
+    <a-modal
+      v-model:open="batchExtendOpen"
+      :title="t('inbounds.batchExtendTitle')"
+      :confirm-loading="batchBusy"
+      @ok="submitBatchExtend"
+    >
+      <a-form layout="vertical">
+        <a-form-item>
+          <a-radio-group v-model:value="batchExtendForm.mode" style="display: flex; flex-direction: column; gap: 8px">
+            <a-radio value="days">{{ t('inbounds.batchExtendModeDays') }}</a-radio>
+            <a-radio value="date">{{ t('inbounds.batchExtendModeDate') }}</a-radio>
+            <a-radio value="never">{{ t('inbounds.batchExtendModeNever') }}</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item v-if="batchExtendForm.mode === 'days'">
+          <a-space wrap style="margin-bottom: 8px">
+            <a-button size="small" @click="batchExtendForm.days = 7">+7d</a-button>
+            <a-button size="small" @click="batchExtendForm.days = 30">+30d</a-button>
+            <a-button size="small" @click="batchExtendForm.days = 90">+90d</a-button>
+            <a-button size="small" @click="batchExtendForm.days = 365">+365d</a-button>
+          </a-space>
+          <a-input-number v-model:value="batchExtendForm.days" :min="1" :max="3650" style="width: 100%" addon-after="days" />
+        </a-form-item>
+
+        <a-form-item v-if="batchExtendForm.mode === 'date'">
+          <a-date-picker
+            v-model:value="batchExtendForm.date"
+            show-time
+            style="width: 100%"
+          />
+        </a-form-item>
+
+        <div style="display: flex; flex-direction: column; gap: 6px">
+          <a-checkbox v-model:checked="batchExtendForm.apply_to_clients">
+            {{ t('inbounds.batchExtendClients') }}
+          </a-checkbox>
+          <a-checkbox v-model:checked="batchExtendForm.re_enable_expired">
+            {{ t('inbounds.batchReEnableExpired') }}
+          </a-checkbox>
+        </div>
+      </a-form>
+    </a-modal>
+
+    <!-- 3x-ui / Share-URI Quick Migration Import Modal -->
+    <a-modal
+      v-model:open="importModalOpen"
+      :title="t('inbounds.importTitle')"
+      width="900px"
+      :footer="null"
+    >
+      <a-alert
+        type="info"
+        show-icon
+        :message="t('inbounds.importTip')"
+        style="margin-bottom: 12px; font-size: 12px"
+      />
+
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px">
+        <a-space>
+          <a-button size="small" @click="triggerImportFile">
+            📂 {{ t('inbounds.importUploadFile') }}
+          </a-button>
+          <input
+            ref="importFileInput"
+            type="file"
+            accept=".json,.txt,.conf,.yaml,.yml"
+            style="display: none"
+            @change="onImportFileSelected"
+          />
+        </a-space>
+        <a-button type="primary" size="small" :loading="importParsing" @click="runImportPreview">
+          🔍 {{ t('inbounds.importParseBtn') }}
+        </a-button>
+      </div>
+
+      <a-textarea
+        v-model:value="importRawInput"
+        :rows="6"
+        style="font-family: monospace; font-size: 12px; margin-bottom: 12px"
+        placeholder='[{"remark":"my-reality","port":443,"protocol":"vless","settings":"...","streamSettings":"..."}]  OR  vless://... / vmess://... / hy2://...'
+      />
+
+      <template v-if="importPreviewItems.length > 0">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px">
+          <a-space wrap>
+            <a-tag color="geekblue">{{ t('inbounds.importSourceFmt') }}: {{ importSourceFormat }}</a-tag>
+            <a-checkbox v-model:checked="importAutoPort">{{ t('inbounds.importAutoPort') }}</a-checkbox>
+            <a-checkbox v-model:checked="importDisableAll">{{ t('inbounds.importDisableAll') }}</a-checkbox>
+          </a-space>
+          <a-button
+            type="primary"
+            :loading="importApplying"
+            :disabled="selectedImportItems.length === 0"
+            @click="applyMigrationImport"
+          >
+            {{ t('inbounds.importApplyBtn', { n: selectedImportItems.length }) }}
+          </a-button>
+        </div>
+
+        <a-alert
+          v-if="importSkipped.length > 0"
+          type="warning"
+          show-icon
+          :message="`Skipped: ${importSkipped.join('; ')}`"
+          style="margin-bottom: 8px; font-size: 12px"
+        />
+
+        <a-table
+          :data-source="importPreviewItems"
+          :columns="importPreviewColumns"
+          :pagination="false"
+          size="small"
+          row-key="_idx"
+          :scroll="{ x: 780, y: 300 }"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'pick'">
+              <a-checkbox v-model:checked="record._selected" />
+            </template>
+            <template v-else-if="column.key === 'remark'">
+              <a-input v-model:value="record.inbound.remark" size="small" />
+            </template>
+            <template v-else-if="column.key === 'protocol'">
+              <a-tag :color="PROTOCOL_COLORS[record.inbound.protocol] || 'blue'">
+                {{ record.inbound.protocol.toUpperCase() }}
+              </a-tag>
+            </template>
+            <template v-else-if="column.key === 'port'">
+              <a-space :size="4">
+                <a-input-number v-model:value="record.inbound.port" :min="1" :max="65535" size="small" style="width: 82px" />
+                <a-tag v-if="record.port_conflict" color="error" style="margin: 0">{{ t('inbounds.importConflict') }}</a-tag>
+              </a-space>
+            </template>
+            <template v-else-if="column.key === 'stream'">
+              <a-space :size="4" wrap>
+                <a-tag>{{ (record.inbound.stream_settings?.network || 'tcp').toUpperCase() }}</a-tag>
+                <a-tag v-if="record.inbound.stream_settings?.security && record.inbound.stream_settings.security !== 'none'" color="gold">
+                  {{ record.inbound.stream_settings.security.toUpperCase() }}
+                </a-tag>
+              </a-space>
+            </template>
+            <template v-else-if="column.key === 'warnings'">
+              <a-tooltip v-if="record.warnings?.length" :title="record.warnings.join(' | ')">
+                <a-tag color="warning">⚠ {{ record.warnings.length }}</a-tag>
+              </a-tooltip>
+              <a-tag v-else color="success">OK</a-tag>
+            </template>
+          </template>
+        </a-table>
+      </template>
+    </a-modal>
+
     <!-- Quick Public Host Edit Modal -->
     <a-modal v-model:open="hostModalOpen" title="修改分享链接与订阅的公网 IP / 域名" @ok="savePublicHost">
       <a-form layout="vertical">
@@ -391,6 +605,46 @@ const cloneForm = reactive({ remark: '', port: 20001, client_name: '', sub_id: '
 const currentShareHost = ref('...');
 const hostModalOpen = ref(false);
 const editingPublicHost = ref('');
+
+// Batch Selection & Actions
+const selectedRowKeys = ref([]);
+const batchBusy = ref(false);
+const batchExtendOpen = ref(false);
+const batchExtendForm = reactive({
+  mode: 'days', // 'days' | 'date' | 'never'
+  days: 30,
+  date: null,
+  apply_to_clients: true,
+  re_enable_expired: true,
+});
+const rowSelection = computed(() => ({
+  selectedRowKeys: selectedRowKeys.value,
+  onChange: (keys) => {
+    selectedRowKeys.value = keys;
+  },
+}));
+
+// Migration Import Modal (3x-ui JSON / Share URIs)
+const importModalOpen = ref(false);
+const importRawInput = ref('');
+const importParsing = ref(false);
+const importApplying = ref(false);
+const importSourceFormat = ref('');
+const importPreviewItems = ref([]);
+const importSkipped = ref([]);
+const importAutoPort = ref(true);
+const importDisableAll = ref(false);
+const importFileInput = ref(null);
+
+const selectedImportItems = computed(() => importPreviewItems.value.filter((x) => x._selected));
+const importPreviewColumns = computed(() => [
+  { title: '', key: 'pick', width: 42 },
+  { title: t('app.remark'), key: 'remark', width: 185 },
+  { title: t('inbounds.protocol'), key: 'protocol', width: 110 },
+  { title: t('inbounds.port'), key: 'port', width: 165 },
+  { title: t('inbounds.transport'), key: 'stream', width: 150 },
+  { title: t('app.status'), key: 'warnings', width: 90 },
+]);
 
 const columns = computed(() => [
   { title: t('app.enable'), key: 'enable', width: 70 },
@@ -499,6 +753,26 @@ function hasMldsa65(ib) {
   );
 }
 
+function hasPqKx(ib) {
+  const list = ib.stream_settings?.tls?.key_exchange_groups || [];
+  return Array.isArray(list) && list.length > 0;
+}
+
+function hasMtls(ib) {
+  const tls = ib.stream_settings?.tls || {};
+  const st = ib.stream_settings?.shadowtls || {};
+  return (
+    (tls.client_ca_certs?.length || 0) > 0 ||
+    (tls.client_fingerprints?.length || 0) > 0 ||
+    (st.client_ca_certs?.length || 0) > 0 ||
+    (st.client_fingerprints?.length || 0) > 0
+  );
+}
+
+function hasSudoku(ib) {
+  return Boolean(ib.stream_settings?.sudoku?.enabled);
+}
+
 function hasVision(ib) {
   if (ib.protocol !== 'vless' || ib.stream_settings?.network !== 'tcp') return false;
   if (hasVlessNativeEnc(ib)) {
@@ -531,6 +805,10 @@ function formatDate(ms) {
 }
 
 function formatCred(ib, c) {
+  if (ib.protocol === 'wireguard') {
+    const pub = (c.wg_public_key || '').slice(0, 12);
+    return `${c.wg_allowed_ips || '10.77.0.2/32'} · ${pub ? `${pub}…` : 'peer'}`;
+  }
   if (['vless', 'vmess'].includes(ib.protocol)) return c.uuid;
   if (ib.protocol === 'tuic') return `${c.uuid.slice(0, 8)}…:${c.password}`;
   if (['naiveproxy', 'socks', 'http', 'mixed'].includes(ib.protocol)) {
@@ -540,7 +818,12 @@ function formatCred(ib, c) {
 }
 
 async function copyCred(ib, c) {
-  const raw = ['vless', 'vmess'].includes(ib.protocol) ? c.uuid : c.password || c.uuid;
+  const raw =
+    ib.protocol === 'wireguard'
+      ? c.wg_public_key || c.wg_allowed_ips || ''
+      : ['vless', 'vmess'].includes(ib.protocol)
+        ? c.uuid
+        : c.password || c.uuid;
   await copyText(raw);
   message.success(t('app.copied'));
 }
@@ -670,5 +953,118 @@ function handleDelete(ib) {
       await loadData();
     },
   });
+}
+
+async function runBatch(action, extra = {}) {
+  if (selectedRowKeys.value.length === 0) return;
+  batchBusy.value = true;
+  try {
+    const res = await api.batchInbounds({
+      ids: [...selectedRowKeys.value],
+      action,
+      ...extra,
+    });
+    message.success(t('inbounds.batchDone', { n: res.affected ?? selectedRowKeys.value.length }));
+    selectedRowKeys.value = [];
+    batchExtendOpen.value = false;
+    await loadData();
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    batchBusy.value = false;
+  }
+}
+
+function openBatchExtend() {
+  batchExtendForm.mode = 'days';
+  batchExtendForm.days = 30;
+  batchExtendForm.date = dayjs().add(30, 'day');
+  batchExtendForm.apply_to_clients = true;
+  batchExtendForm.re_enable_expired = true;
+  batchExtendOpen.value = true;
+}
+
+async function submitBatchExtend() {
+  const payload = {
+    apply_to_clients: batchExtendForm.apply_to_clients,
+    re_enable_expired: batchExtendForm.re_enable_expired,
+  };
+  if (batchExtendForm.mode === 'days') {
+    payload.extend_days = Number(batchExtendForm.days || 30);
+  } else if (batchExtendForm.mode === 'date') {
+    payload.set_expiry_time = batchExtendForm.date ? batchExtendForm.date.valueOf() : 0;
+  } else {
+    payload.set_expiry_time = 0;
+  }
+  await runBatch('extend_expiry', payload);
+}
+
+function openImportModal() {
+  importRawInput.value = '';
+  importPreviewItems.value = [];
+  importSkipped.value = [];
+  importSourceFormat.value = '';
+  importAutoPort.value = true;
+  importDisableAll.value = false;
+  importModalOpen.value = true;
+}
+
+function triggerImportFile() {
+  importFileInput.value?.click();
+}
+
+async function onImportFileSelected(e) {
+  const file = e.target?.files?.[0];
+  if (!file) return;
+  try {
+    importRawInput.value = await file.text();
+    await runImportPreview();
+  } catch (err) {
+    message.error(err.message);
+  } finally {
+    if (e.target) e.target.value = '';
+  }
+}
+
+async function runImportPreview() {
+  if (!importRawInput.value.trim()) {
+    message.warning(t('inbounds.importTip'));
+    return;
+  }
+  importParsing.value = true;
+  try {
+    const res = await api.importInboundsPreview(importRawInput.value);
+    importSourceFormat.value = res.source_format || '';
+    importSkipped.value = res.skipped || [];
+    importPreviewItems.value = (res.items || []).map((item, idx) => ({
+      ...item,
+      _idx: idx,
+      _selected: true,
+    }));
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    importParsing.value = false;
+  }
+}
+
+async function applyMigrationImport() {
+  const chosen = selectedImportItems.value.map((x) => x.inbound);
+  if (chosen.length === 0) return;
+  importApplying.value = true;
+  try {
+    const res = await api.importInboundsApply({
+      inbounds: chosen,
+      auto_reassign_ports: importAutoPort.value,
+      disable_on_import: importDisableAll.value,
+    });
+    message.success(t('inbounds.importSuccess', { n: res.imported_count ?? chosen.length }));
+    importModalOpen.value = false;
+    await loadData();
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    importApplying.value = false;
+  }
 }
 </script>

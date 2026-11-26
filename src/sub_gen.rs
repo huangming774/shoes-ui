@@ -8,7 +8,9 @@ use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use crate::crypto_util::derive_reality_public_key;
-use crate::models::{CertificateRecord, ClientRecord, H2MuxSettings, Inbound};
+use crate::models::{
+    CertificateRecord, ClientRecord, H2MuxSettings, Inbound, SubscriptionTemplateConfig,
+};
 
 /// RFC 3986 query value encode set: preserves unreserved chars (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`)
 /// and `/`, encoding only controls, spaces, and query/URI delimiters (`#`, `%`, `&`, `+`, `=`, `?`).
@@ -159,9 +161,61 @@ fn effective_tls_sni(ib: &Inbound) -> String {
     }
 }
 
+pub fn build_wireguard_peer_conf(ib: &Inbound, c: &ClientRecord, host: &str) -> String {
+    let ps = &ib.protocol_settings;
+    let server_pub = if !ps.wg_server_public_key.trim().is_empty() {
+        ps.wg_server_public_key.trim().to_string()
+    } else if !ps.wg_server_private_key.trim().is_empty() {
+        crate::crypto_util::derive_wireguard_public_key(&ps.wg_server_private_key)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let priv_key = if c.wg_private_key.trim().is_empty() {
+        "<YOUR_CLIENT_PRIVATE_KEY>"
+    } else {
+        c.wg_private_key.trim()
+    };
+    let addrs = if c.wg_allowed_ips.trim().is_empty() {
+        "10.77.0.2/32"
+    } else {
+        c.wg_allowed_ips.trim()
+    };
+    let dns = if ps.wg_dns.trim().is_empty() {
+        "1.1.1.1"
+    } else {
+        ps.wg_dns.trim()
+    };
+    let mtu = if ps.wg_mtu > 0 { ps.wg_mtu } else { 1408 };
+    let endpoint = format!("{}:{}", format_host(host), ib.port);
+    let mut lines = vec![
+        "[Interface]".to_string(),
+        format!("PrivateKey = {priv_key}"),
+        format!("Address = {addrs}"),
+        format!("DNS = {dns}"),
+        format!("MTU = {mtu}"),
+        String::new(),
+        "[Peer]".to_string(),
+        format!("PublicKey = {server_pub}"),
+    ];
+    if !c.wg_preshared_key.trim().is_empty() {
+        lines.push(format!("PresharedKey = {}", c.wg_preshared_key.trim()));
+    }
+    lines.push(format!("Endpoint = {endpoint}"));
+    lines.push("AllowedIPs = 0.0.0.0/0, ::/0".to_string());
+    if c.wg_keepalive > 0 {
+        lines.push(format!("PersistentKeepalive = {}", c.wg_keepalive));
+    }
+    lines.join("\n")
+}
+
 pub fn build_client_share_info(ib: &Inbound, c: &ClientRecord, host: &str) -> ShareInfo {
     let name = node_display_name(ib, c);
-    let uri = build_uri(ib, c, host, &name);
+    let uri = if ib.protocol == "wireguard" {
+        build_wireguard_peer_conf(ib, c, host)
+    } else {
+        build_uri(ib, c, host, &name)
+    };
     let shoes_client_yaml = build_shoes_client_snippet(ib, c, host, &name);
     ShareInfo {
         name,
@@ -238,8 +292,11 @@ fn extract_pem_cert_raw(pem: &str) -> Option<String> {
 
 fn can_export_uri_transport(ib: &Inbound) -> bool {
     let ss = &ib.stream_settings;
+    if ss.sudoku.enabled {
+        return false;
+    }
     match ib.protocol.as_str() {
-        "portforward" => false,
+        "portforward" | "wireguard" => false,
         "tuic" | "hysteria2" => true,
         "snell" => {
             ss.network == "tcp"
@@ -714,6 +771,57 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let target_addr = format!("{}:{}", format_host(host), ib.port);
+
+    if ib.protocol == "wireguard" {
+        let server_pub = if !ps.wg_server_public_key.trim().is_empty() {
+            ps.wg_server_public_key.trim().to_string()
+        } else if !ps.wg_server_private_key.trim().is_empty() {
+            crate::crypto_util::derive_wireguard_public_key(&ps.wg_server_private_key)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let addrs: Vec<String> = c
+            .wg_allowed_ips
+            .split([',', ';', ' ', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut wg_proto = json!({
+            "type": "wireguard",
+            "private_key": if c.wg_private_key.trim().is_empty() { "<YOUR_CLIENT_PRIVATE_KEY>" } else { c.wg_private_key.trim() },
+            "public_key": server_pub,
+            "addresses": if addrs.is_empty() { vec!["10.77.0.2/32".to_string()] } else { addrs },
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "mtu": if ps.wg_mtu > 0 { ps.wg_mtu } else { 1408 },
+        });
+        if !c.wg_preshared_key.trim().is_empty() {
+            wg_proto["pre_shared_key"] = json!(c.wg_preshared_key.trim());
+        }
+        if c.wg_keepalive > 0 {
+            wg_proto["persistent_keepalive"] = json!(c.wg_keepalive);
+        }
+        let full = json!([
+            {
+                "address": "127.0.0.1:1080",
+                "protocol": { "type": "mixed", "udp_enabled": true },
+                "rules": [
+                    {
+                        "masks": "0.0.0.0/0",
+                        "action": "allow",
+                        "client_chain": {
+                            "name": name,
+                            "address": target_addr,
+                            "protocol": wg_proto
+                        }
+                    }
+                ]
+            }
+        ]);
+        return serde_yaml::to_string(&full).unwrap_or_default();
+    }
+
     let active_mux = inbound_effective_h2mux(ib);
     let has_vless_enc = ib.has_vless_native_encryption();
 
@@ -836,20 +944,24 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         inner
     };
 
-    let client_hop = if ib.is_quic() {
+    let mut client_hop = if ib.is_quic() {
         let mut sni = effective_tls_sni(ib);
         if sni.is_empty() {
             sni = host.trim().to_string();
+        }
+        let mut qcfg = json!({
+            "alpn_protocols": if ss.tls.alpn.is_empty() { json!(["h3"]) } else { json!(ss.tls.alpn) },
+            "sni_hostname": sni,
+            "verify": !ss.tls.allow_insecure
+        });
+        if !ss.tls.key_exchange_groups.is_empty() {
+            qcfg["key_exchange_groups"] = json!(ss.tls.key_exchange_groups);
         }
         json!({
             "name": name,
             "address": target_addr,
             "transport": "quic",
-            "quic_settings": {
-                "alpn_protocols": if ss.tls.alpn.is_empty() { json!(["h3"]) } else { json!(ss.tls.alpn) },
-                "sni_hostname": sni,
-                "verify": !ss.tls.allow_insecure
-            },
+            "quic_settings": qcfg,
             "protocol": transported
         })
     } else if ss.security == "reality" {
@@ -894,6 +1006,9 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
                 "protocol": transported
             }
         });
+        if !ss.tls.key_exchange_groups.is_empty() {
+            hop["protocol"]["key_exchange_groups"] = json!(ss.tls.key_exchange_groups);
+        }
         if ib.protocol == "naiveproxy" {
             hop["protocol"]["alpn_protocols"] = json!(["h2", "http/1.1"]);
         } else if !ss.tls.alpn.is_empty() {
@@ -919,6 +1034,33 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         })
     };
 
+    // Wrap outermost TCP protocol in Sudoku FinalMask when enabled
+    if !ib.is_quic() && ss.sudoku.enabled {
+        let inner_proto = client_hop["protocol"].clone();
+        let mut mask = json!({
+            "type": "sudoku_mask",
+            "protocol": inner_proto
+        });
+        if !ss.sudoku.password.is_empty() {
+            mask["password"] = json!(ss.sudoku.password);
+        }
+        if !ss.sudoku.ascii.trim().is_empty() {
+            mask["ascii"] = json!(ss.sudoku.ascii.trim().to_ascii_lowercase());
+        }
+        if !ss.sudoku.custom_tables.is_empty() {
+            mask["custom_tables"] = json!(ss.sudoku.custom_tables);
+        } else if !ss.sudoku.custom_table.trim().is_empty() {
+            mask["custom_table"] = json!(ss.sudoku.custom_table.trim());
+        }
+        if ss.sudoku.padding_min > 0 {
+            mask["padding_min"] = json!(ss.sudoku.padding_min.min(100));
+        }
+        if ss.sudoku.padding_max > 0 {
+            mask["padding_max"] = json!(ss.sudoku.padding_max.min(100).max(ss.sudoku.padding_min.min(100)));
+        }
+        client_hop["protocol"] = mask;
+    }
+
     let full = json!([
         {
             "address": "127.0.0.1:1080",
@@ -936,7 +1078,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
 }
 
 fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Option<JsonValue> {
-    if ib.protocol == "portforward" {
+    if ib.protocol == "portforward" || ib.stream_settings.sudoku.enabled {
         return None;
     }
     let ss = &ib.stream_settings;
@@ -944,6 +1086,53 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
     let server = host.trim();
     let port = ib.port;
     let has_vless_enc = ib.has_vless_native_encryption();
+
+    if ib.protocol == "wireguard" {
+        if c.wg_private_key.trim().is_empty() {
+            return None;
+        }
+        let server_pub = if !ps.wg_server_public_key.trim().is_empty() {
+            ps.wg_server_public_key.trim().to_string()
+        } else {
+            crate::crypto_util::derive_wireguard_public_key(&ps.wg_server_private_key).ok()?
+        };
+        let mut ip4 = String::new();
+        let mut ip6 = String::new();
+        for tok in c.wg_allowed_ips.split([',', ';', ' ', '\n']) {
+            let ip_part = tok.split('/').next().unwrap_or("").trim();
+            if ip_part.is_empty() {
+                continue;
+            }
+            if ip_part.contains(':') && ip6.is_empty() {
+                ip6 = ip_part.to_string();
+            } else if !ip_part.contains(':') && ip4.is_empty() {
+                ip4 = ip_part.to_string();
+            }
+        }
+        if ip4.is_empty() && ip6.is_empty() {
+            ip4 = "10.77.0.2".to_string();
+        }
+        let mut obj = json!({
+            "name": name,
+            "type": "wireguard",
+            "server": server,
+            "port": port,
+            "private-key": c.wg_private_key.trim(),
+            "public-key": server_pub,
+            "udp": true,
+            "mtu": if ps.wg_mtu > 0 { ps.wg_mtu } else { 1408 },
+        });
+        if !ip4.is_empty() {
+            obj["ip"] = json!(ip4);
+        }
+        if !ip6.is_empty() {
+            obj["ipv6"] = json!(ip6);
+        }
+        if !c.wg_preshared_key.trim().is_empty() {
+            obj["pre-shared-key"] = json!(c.wg_preshared_key.trim());
+        }
+        return Some(obj);
+    }
 
     if ss.security == "shadowtls" && ib.protocol != "shadowsocks" {
         return None;
@@ -1296,13 +1485,45 @@ fn build_singbox_outbound(
     name: &str,
     certs: &[CertificateRecord],
 ) -> Option<(JsonValue, Option<JsonValue>)> {
-    if ib.protocol == "portforward" {
+    if ib.protocol == "portforward" || ib.stream_settings.sudoku.enabled {
         return None;
     }
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let server = host.trim();
     let port = ib.port;
+
+    if ib.protocol == "wireguard" {
+        if c.wg_private_key.trim().is_empty() {
+            return None;
+        }
+        let server_pub = if !ps.wg_server_public_key.trim().is_empty() {
+            ps.wg_server_public_key.trim().to_string()
+        } else {
+            crate::crypto_util::derive_wireguard_public_key(&ps.wg_server_private_key).ok()?
+        };
+        let local_addrs: Vec<String> = c
+            .wg_allowed_ips
+            .split([',', ';', ' ', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut obj = json!({
+            "tag": name,
+            "type": "wireguard",
+            "server": server,
+            "server_port": port,
+            "local_address": if local_addrs.is_empty() { vec!["10.77.0.2/32".to_string()] } else { local_addrs },
+            "private_key": c.wg_private_key.trim(),
+            "peer_public_key": server_pub,
+            "mtu": if ps.wg_mtu > 0 { ps.wg_mtu } else { 1408 },
+        });
+        if !c.wg_preshared_key.trim().is_empty() {
+            obj["pre_shared_key"] = json!(c.wg_preshared_key.trim());
+        }
+        return Some((obj, None));
+    }
 
     if ib.has_vless_native_encryption() {
         // sing-box does not support Xray/Shoes VLESS native encryption.
@@ -1688,6 +1909,575 @@ fn quote_sensitive_clash_strings(yaml: &str) -> String {
     out
 }
 
+const CN_DIRECT_DOMAINS: &[&str] = &[
+    "cn",
+    "baidu.com",
+    "bdimg.com",
+    "bdstatic.com",
+    "qq.com",
+    "weixin.qq.com",
+    "wechat.com",
+    "qpic.cn",
+    "taobao.com",
+    "tmall.com",
+    "alicdn.com",
+    "aliyun.com",
+    "aliyuncs.com",
+    "alipay.com",
+    "jd.com",
+    "360buyimg.com",
+    "bilibili.com",
+    "hdslb.com",
+    "zhihu.com",
+    "douyin.com",
+    "bytedance.com",
+    "163.com",
+    "126.com",
+    "126.net",
+    "weibo.com",
+    "xiaomi.com",
+    "mi.com",
+    "huawei.com",
+    "tencent.com",
+    "meituan.com",
+    "ctrip.com",
+    "douban.com",
+    "csdn.net",
+];
+
+const AI_DOMAINS: &[&str] = &[
+    "openai.com",
+    "chatgpt.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "anthropic.com",
+    "claude.ai",
+    "gemini.google.com",
+    "generativelanguage.googleapis.com",
+    "perplexity.ai",
+    "copilot.microsoft.com",
+    "x.ai",
+    "grok.com",
+];
+
+const NETFLIX_DOMAINS: &[&str] = &[
+    "netflix.com",
+    "netflix.net",
+    "nflximg.net",
+    "nflxvideo.net",
+    "nflxso.net",
+    "nflxext.com",
+];
+
+const YOUTUBE_DOMAINS: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "googlevideo.com",
+    "ytimg.com",
+    "ggpht.com",
+];
+
+const TELEGRAM_DOMAINS: &[&str] = &[
+    "t.me",
+    "telegram.org",
+    "telegram.me",
+    "telegra.ph",
+    "tdesktop.com",
+];
+
+const TELEGRAM_CIDRS: &[&str] = &[
+    "91.108.4.0/22",
+    "91.108.8.0/22",
+    "91.108.12.0/22",
+    "91.108.16.0/22",
+    "91.108.56.0/22",
+    "149.154.160.0/20",
+];
+
+const GOOGLE_DOMAINS: &[&str] = &[
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "gmail.com",
+    "googleusercontent.com",
+];
+
+const APPLE_DOMAINS: &[&str] = &[
+    "apple.com",
+    "icloud.com",
+    "mzstatic.com",
+    "cdn-apple.com",
+    "apple-cloudkit.com",
+];
+
+const GLOBAL_PROXY_DOMAINS: &[&str] = &[
+    "openai.com",
+    "chatgpt.com",
+    "claude.ai",
+    "anthropic.com",
+    "google.com",
+    "googleapis.com",
+    "youtube.com",
+    "googlevideo.com",
+    "github.com",
+    "githubusercontent.com",
+    "t.me",
+    "telegram.org",
+    "x.com",
+    "twitter.com",
+    "discord.com",
+    "wikipedia.org",
+    "reddit.com",
+    "netflix.com",
+];
+
+const ADBLOCK_DOMAINS: &[&str] = &[
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "ads.yahoo.com",
+    "adnxs.com",
+    "taboola.com",
+    "outbrain.com",
+    "criteo.com",
+    "scorecardresearch.com",
+    "ads-twitter.com",
+    "ad.doubleclick.net",
+    "pagead2.googlesyndication.com",
+];
+
+fn parse_clash_custom_rules(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(|l| l.trim().trim_start_matches('-').trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim_matches('\'').trim_matches('"').to_string())
+        .collect()
+}
+
+fn map_policy_to_singbox_tag(raw: &str) -> String {
+    let t = raw.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "direct" => "direct".to_string(),
+        "reject" | "block" => "block".to_string(),
+        "proxy" | "🚀 proxy" => "proxy".to_string(),
+        "auto" | "⚡ auto" => "auto".to_string(),
+        "ai" | "🤖 ai" => "ai".to_string(),
+        "netflix" | "🎬 netflix" => "netflix".to_string(),
+        "youtube" | "📺 youtube" => "youtube".to_string(),
+        "telegram" | "✈️ telegram" => "telegram".to_string(),
+        "google" | "🌍 google" => "google".to_string(),
+        "apple" | "🍎 apple" => "apple".to_string(),
+        "🎯 direct" => "direct".to_string(),
+        _ => t.to_string(),
+    }
+}
+
+fn parse_singbox_custom_rules(raw: &str) -> Vec<JsonValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(JsonValue::Array(arr)) = serde_json::from_str::<JsonValue>(trimmed) {
+            return arr;
+        }
+    } else if trimmed.starts_with('{') {
+        if let Ok(obj) = serde_json::from_str::<JsonValue>(trimmed) {
+            return vec![obj];
+        }
+    }
+
+    // Fallback: parse Clash-style lines (`DOMAIN-SUFFIX,example.com,proxy` / `IP-CIDR,1.2.3.0/24,direct`)
+    let mut rules = Vec::new();
+    for line in trimmed.lines() {
+        let l = line.trim().trim_start_matches('-').trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = l.split(',').map(str::trim).collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let kind = parts[0].to_ascii_uppercase();
+        let val = parts[1];
+        let outbound = map_policy_to_singbox_tag(parts[2]);
+        if val.is_empty() || outbound.is_empty() {
+            continue;
+        }
+        let rule = match kind.as_str() {
+            "DOMAIN" => json!({ "domain": [val], "outbound": outbound }),
+            "DOMAIN-SUFFIX" => json!({ "domain_suffix": [val], "outbound": outbound }),
+            "DOMAIN-KEYWORD" => json!({ "domain_keyword": [val], "outbound": outbound }),
+            "IP-CIDR" | "IP-CIDR6" => json!({ "ip_cidr": [val], "outbound": outbound }),
+            "DST-PORT" => {
+                if let Ok(p) = val.parse::<u16>() {
+                    json!({ "port": [p], "outbound": outbound })
+                } else {
+                    continue;
+                }
+            }
+            "PROCESS-NAME" => json!({ "process_name": [val], "outbound": outbound }),
+            _ => continue,
+        };
+        rules.push(rule);
+    }
+    rules
+}
+
+fn build_clash_document(
+    proxies: Vec<JsonValue>,
+    names: &[String],
+    tpl: &SubscriptionTemplateConfig,
+) -> JsonValue {
+    let preset = tpl.preset.trim().to_ascii_lowercase();
+    let mut selector_members = vec!["⚡ Auto".to_string()];
+    selector_members.extend(names.iter().cloned());
+    selector_members.push("DIRECT".to_string());
+
+    let auto_members = if names.is_empty() {
+        vec!["DIRECT".to_string()]
+    } else {
+        names.to_vec()
+    };
+
+    let mut proxy_groups = vec![
+        json!({
+            "name": "🚀 Proxy",
+            "type": "select",
+            "proxies": selector_members
+        }),
+        json!({
+            "name": "⚡ Auto",
+            "type": "url-test",
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": 300,
+            "proxies": auto_members
+        }),
+    ];
+
+    if preset == "streaming" {
+        let mut service_proxies = vec!["🚀 Proxy".to_string(), "⚡ Auto".to_string()];
+        service_proxies.extend(names.iter().cloned());
+        service_proxies.push("DIRECT".to_string());
+
+        let mut direct_first = vec!["DIRECT".to_string(), "🚀 Proxy".to_string(), "⚡ Auto".to_string()];
+        direct_first.extend(names.iter().cloned());
+
+        for group_name in ["🤖 AI", "🎬 Netflix", "📺 YouTube", "✈️ Telegram", "🌍 Google"] {
+            proxy_groups.push(json!({
+                "name": group_name,
+                "type": "select",
+                "proxies": service_proxies
+            }));
+        }
+        proxy_groups.push(json!({
+            "name": "🍎 Apple",
+            "type": "select",
+            "proxies": direct_first
+        }));
+        proxy_groups.push(json!({
+            "name": "🎯 Direct",
+            "type": "select",
+            "proxies": ["DIRECT", "🚀 Proxy"]
+        }));
+    }
+
+    // Optional user-supplied extra Clash proxy-groups YAML list
+    if !tpl.clash_extra_groups_yaml.trim().is_empty() {
+        if let Ok(extra_yaml) = serde_yaml::from_str::<YamlValue>(tpl.clash_extra_groups_yaml.trim()) {
+            if let Ok(JsonValue::Array(arr)) = serde_json::to_value(extra_yaml) {
+                for g in arr {
+                    if g.is_object() {
+                        proxy_groups.push(g);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build preset rules (without trailing MATCH so custom rules can be placed cleanly)
+    let mut preset_rules: Vec<String> = Vec::new();
+    if tpl.enable_adblock {
+        for d in ADBLOCK_DOMAINS {
+            preset_rules.push(format!("DOMAIN-SUFFIX,{d},REJECT"));
+        }
+    }
+
+    // Always bypass private LAN ranges cleanly
+    preset_rules.extend([
+        "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve".to_string(),
+        "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve".to_string(),
+        "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve".to_string(),
+        "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve".to_string(),
+    ]);
+
+    let final_policy = match preset.as_str() {
+        "global_direct" => {
+            for d in GLOBAL_PROXY_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🚀 Proxy"));
+            }
+            "DIRECT"
+        }
+        "bypass_cn" => {
+            for d in CN_DIRECT_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},DIRECT"));
+            }
+            preset_rules.push("GEOIP,LAN,DIRECT,no-resolve".to_string());
+            preset_rules.push("GEOIP,CN,DIRECT,no-resolve".to_string());
+            "🚀 Proxy"
+        }
+        "streaming" => {
+            for d in AI_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🤖 AI"));
+            }
+            for d in NETFLIX_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🎬 Netflix"));
+            }
+            for d in YOUTUBE_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},📺 YouTube"));
+            }
+            for d in TELEGRAM_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},✈️ Telegram"));
+            }
+            for cidr in TELEGRAM_CIDRS {
+                preset_rules.push(format!("IP-CIDR,{cidr},✈️ Telegram,no-resolve"));
+            }
+            for d in GOOGLE_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🌍 Google"));
+            }
+            for d in APPLE_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🍎 Apple"));
+            }
+            for d in CN_DIRECT_DOMAINS {
+                preset_rules.push(format!("DOMAIN-SUFFIX,{d},🎯 Direct"));
+            }
+            preset_rules.push("GEOIP,LAN,🎯 Direct,no-resolve".to_string());
+            preset_rules.push("GEOIP,CN,🎯 Direct,no-resolve".to_string());
+            "🚀 Proxy"
+        }
+        _ => "🚀 Proxy", // "minimal"
+    };
+
+    let custom_rules = parse_clash_custom_rules(&tpl.clash_custom_rules);
+    let custom_has_match = custom_rules
+        .iter()
+        .any(|r| r.to_ascii_uppercase().starts_with("MATCH,"));
+
+    let mut rules = Vec::new();
+    if tpl.prepend_custom_rules {
+        rules.extend(custom_rules);
+        rules.extend(preset_rules);
+    } else {
+        rules.extend(preset_rules);
+        rules.extend(custom_rules);
+    }
+    if !custom_has_match {
+        rules.push(format!("MATCH,{final_policy}"));
+    }
+
+    json!({
+        "mixed-port": 7890,
+        "allow-lan": false,
+        "mode": "rule",
+        "log-level": "info",
+        "dns": {
+            "enable": true,
+            "ipv6": tpl.enable_ipv6,
+            "enhanced-mode": "fake-ip",
+            "fake-ip-range": "198.18.0.1/16",
+            "nameserver": ["223.5.5.5", "119.29.29.29", "1.1.1.1"]
+        },
+        "proxies": proxies,
+        "proxy-groups": proxy_groups,
+        "rules": rules
+    })
+}
+
+fn build_singbox_document(
+    outbounds: Vec<JsonValue>,
+    tags: &[String],
+    tpl: &SubscriptionTemplateConfig,
+) -> JsonValue {
+    let preset = tpl.preset.trim().to_ascii_lowercase();
+    let mut select_tags = vec!["auto".to_string()];
+    select_tags.extend(tags.iter().cloned());
+    select_tags.push("direct".to_string());
+
+    let mut all_outbounds = vec![json!({
+        "tag": "proxy",
+        "type": "selector",
+        "outbounds": select_tags,
+    })];
+    if !tags.is_empty() {
+        all_outbounds.push(json!({
+            "tag": "auto",
+            "type": "urltest",
+            "outbounds": tags,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "5m"
+        }));
+    } else {
+        all_outbounds.push(json!({
+            "tag": "auto",
+            "type": "direct"
+        }));
+    }
+
+    if preset == "streaming" {
+        let mut service_tags = vec!["proxy".to_string(), "auto".to_string()];
+        service_tags.extend(tags.iter().cloned());
+        service_tags.push("direct".to_string());
+
+        let mut apple_tags = vec!["direct".to_string(), "proxy".to_string(), "auto".to_string()];
+        apple_tags.extend(tags.iter().cloned());
+
+        for g in ["ai", "netflix", "youtube", "telegram", "google"] {
+            all_outbounds.push(json!({
+                "tag": g,
+                "type": "selector",
+                "outbounds": service_tags
+            }));
+        }
+        all_outbounds.push(json!({
+            "tag": "apple",
+            "type": "selector",
+            "outbounds": apple_tags
+        }));
+    }
+
+    all_outbounds.extend(outbounds);
+    all_outbounds.push(json!({ "tag": "direct", "type": "direct" }));
+    if tpl.enable_adblock
+        || tpl.singbox_custom_rules.to_ascii_lowercase().contains("block")
+        || tpl.singbox_custom_rules.to_ascii_lowercase().contains("reject")
+    {
+        all_outbounds.push(json!({ "tag": "block", "type": "block" }));
+    }
+
+    let mut preset_rules: Vec<JsonValue> = Vec::new();
+    let mut rule_sets: Vec<JsonValue> = Vec::new();
+
+    if tpl.enable_adblock {
+        preset_rules.push(json!({
+            "domain_suffix": ADBLOCK_DOMAINS,
+            "outbound": "block"
+        }));
+    }
+
+    let final_tag = match preset.as_str() {
+        "global_direct" => {
+            preset_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+            preset_rules.push(json!({
+                "domain_suffix": GLOBAL_PROXY_DOMAINS,
+                "outbound": "proxy"
+            }));
+            "direct"
+        }
+        "bypass_cn" => {
+            preset_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+            preset_rules.push(json!({
+                "domain_suffix": CN_DIRECT_DOMAINS,
+                "outbound": "direct"
+            }));
+            preset_rules.push(json!({
+                "rule_set": ["geosite-cn", "geoip-cn"],
+                "outbound": "direct"
+            }));
+            rule_sets.push(json!({
+                "tag": "geosite-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+                "download_detour": "proxy"
+            }));
+            rule_sets.push(json!({
+                "tag": "geoip-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+                "download_detour": "proxy"
+            }));
+            "proxy"
+        }
+        "streaming" => {
+            preset_rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+            preset_rules.push(json!({ "domain_suffix": AI_DOMAINS, "outbound": "ai" }));
+            preset_rules.push(json!({ "domain_suffix": NETFLIX_DOMAINS, "outbound": "netflix" }));
+            preset_rules.push(json!({ "domain_suffix": YOUTUBE_DOMAINS, "outbound": "youtube" }));
+            preset_rules.push(json!({
+                "domain_suffix": TELEGRAM_DOMAINS,
+                "ip_cidr": TELEGRAM_CIDRS,
+                "outbound": "telegram"
+            }));
+            preset_rules.push(json!({ "domain_suffix": GOOGLE_DOMAINS, "outbound": "google" }));
+            preset_rules.push(json!({ "domain_suffix": APPLE_DOMAINS, "outbound": "apple" }));
+            preset_rules.push(json!({ "domain_suffix": CN_DIRECT_DOMAINS, "outbound": "direct" }));
+            preset_rules.push(json!({
+                "rule_set": ["geosite-cn", "geoip-cn"],
+                "outbound": "direct"
+            }));
+            rule_sets.push(json!({
+                "tag": "geosite-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+                "download_detour": "proxy"
+            }));
+            rule_sets.push(json!({
+                "tag": "geoip-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+                "download_detour": "proxy"
+            }));
+            "proxy"
+        }
+        _ => "proxy", // "minimal"
+    };
+
+    let custom_rules = parse_singbox_custom_rules(&tpl.singbox_custom_rules);
+    let mut rules = Vec::new();
+    if tpl.prepend_custom_rules {
+        rules.extend(custom_rules);
+        rules.extend(preset_rules);
+    } else {
+        rules.extend(preset_rules);
+        rules.extend(custom_rules);
+    }
+
+    let mut route = json!({
+        "final": final_tag,
+        "auto_detect_interface": true
+    });
+    if !rules.is_empty() {
+        route["rules"] = JsonValue::Array(rules);
+    }
+    if !rule_sets.is_empty() {
+        route["rule_set"] = JsonValue::Array(rule_sets);
+    }
+
+    let mut cfg = json!({
+        "log": { "level": "info" },
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 7890
+            }
+        ],
+        "outbounds": all_outbounds,
+        "route": route
+    });
+    if !tpl.enable_ipv6 && preset != "minimal" {
+        cfg["dns"] = json!({
+            "strategy": "ipv4_only"
+        });
+    }
+    cfg
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_subscription(
     inbounds: &[Inbound],
@@ -1704,6 +2494,24 @@ pub fn generate_subscription_with_certs(
     sub_id_filter: &str,
     host: &str,
     format: SubFormat,
+) -> SubscriptionPayload {
+    generate_subscription_with_options(
+        inbounds,
+        certs,
+        sub_id_filter,
+        host,
+        format,
+        &SubscriptionTemplateConfig::default(),
+    )
+}
+
+pub fn generate_subscription_with_options(
+    inbounds: &[Inbound],
+    certs: &[CertificateRecord],
+    sub_id_filter: &str,
+    host: &str,
+    format: SubFormat,
+    template: &SubscriptionTemplateConfig,
 ) -> SubscriptionPayload {
     let match_all = sub_id_filter.eq_ignore_ascii_case("all") || sub_id_filter == "*";
 
@@ -1785,53 +2593,7 @@ pub fn generate_subscription_with_certs(
                     proxies.push(p);
                 }
             }
-            let mut selector_members = vec!["⚡ Auto".to_string()];
-            selector_members.extend(names.iter().cloned());
-            selector_members.push("DIRECT".to_string());
-
-            let auto_members = if names.is_empty() {
-                vec!["DIRECT".to_string()]
-            } else {
-                names.clone()
-            };
-
-            // Zero-MMDB pure IP-CIDR + MATCH rules: works out-of-the-box on Classic Clash,
-            // Mihomo, Clash Verge, Stash, ClashX, and Shadowrocket without needing GeoIP.dat!
-            let doc = json!({
-                "mixed-port": 7890,
-                "allow-lan": false,
-                "mode": "rule",
-                "log-level": "info",
-                "dns": {
-                    "enable": true,
-                    "ipv6": false,
-                    "enhanced-mode": "fake-ip",
-                    "fake-ip-range": "198.18.0.1/16",
-                    "nameserver": ["223.5.5.5", "119.29.29.29", "1.1.1.1"]
-                },
-                "proxies": proxies,
-                "proxy-groups": [
-                    {
-                        "name": "🚀 Proxy",
-                        "type": "select",
-                        "proxies": selector_members
-                    },
-                    {
-                        "name": "⚡ Auto",
-                        "type": "url-test",
-                        "url": "https://www.gstatic.com/generate_204",
-                        "interval": 300,
-                        "proxies": auto_members
-                    }
-                ],
-                "rules": [
-                    "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
-                    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-                    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-                    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-                    "MATCH,🚀 Proxy"
-                ]
-            });
+            let doc = build_clash_document(proxies, &names, template);
             let yaml_val: YamlValue =
                 serde_yaml::to_value(&doc).unwrap_or(YamlValue::Mapping(Mapping::new()));
             let raw_body = serde_yaml::to_string(&yaml_val).unwrap_or_default();
@@ -1854,48 +2616,7 @@ pub fn generate_subscription_with_certs(
                     }
                 }
             }
-            let mut select_tags = vec!["auto".to_string()];
-            select_tags.extend(tags.iter().cloned());
-            select_tags.push("direct".to_string());
-
-            let mut all_outbounds = vec![json!({
-                "tag": "proxy",
-                "type": "selector",
-                "outbounds": select_tags,
-            })];
-            if !tags.is_empty() {
-                all_outbounds.push(json!({
-                    "tag": "auto",
-                    "type": "urltest",
-                    "outbounds": tags,
-                    "url": "https://www.gstatic.com/generate_204",
-                    "interval": "5m"
-                }));
-            } else {
-                all_outbounds.push(json!({
-                    "tag": "auto",
-                    "type": "direct"
-                }));
-            }
-            all_outbounds.extend(outbounds);
-            all_outbounds.push(json!({ "tag": "direct", "type": "direct" }));
-
-            let cfg = json!({
-                "log": { "level": "info" },
-                "inbounds": [
-                    {
-                        "type": "mixed",
-                        "tag": "mixed-in",
-                        "listen": "127.0.0.1",
-                        "listen_port": 7890
-                    }
-                ],
-                "outbounds": all_outbounds,
-                "route": {
-                    "final": "proxy",
-                    "auto_detect_interface": true
-                }
-            });
+            let cfg = build_singbox_document(outbounds, &tags, template);
             SubscriptionPayload {
                 content_type: "application/json; charset=utf-8",
                 body: serde_json::to_string_pretty(&cfg).unwrap_or_default(),

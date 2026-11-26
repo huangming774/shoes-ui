@@ -6,10 +6,17 @@
           <template #icon><BulbFilled v-if="isDark" /><BulbOutlined v-else /></template>
           {{ t(isDark ? 'app.themeLight' : 'app.themeDark') }}
         </a-button>
-        <a-radio-group :value="locale" class="panel-language" aria-label="Language / 语言" @change="(e) => setLocale(e.target.value)">
-          <a-radio-button value="zh">中文</a-radio-button>
-          <a-radio-button value="en">EN</a-radio-button>
-        </a-radio-group>
+        <a-select
+          :value="locale"
+          class="panel-language"
+          style="min-width: 126px"
+          aria-label="Language"
+          @change="(val) => setLocale(val)"
+        >
+          <a-select-option v-for="item in SUPPORTED_LOCALES" :key="item.code" :value="item.code">
+            🌐 {{ item.label }}
+          </a-select-option>
+        </a-select>
       </a-space>
     </div>
 
@@ -65,7 +72,7 @@ import { message } from 'ant-design-vue';
 import { BulbFilled, BulbOutlined, LockOutlined, ThunderboltFilled, UserOutlined } from '@ant-design/icons-vue';
 import { useI18n } from 'vue-i18n';
 import { api } from '../api';
-import { setLocale } from '../i18n';
+import { setLocale, SUPPORTED_LOCALES } from '../i18n';
 
 defineProps({ isDark: Boolean });
 const emit = defineEmits(['loggedIn', 'toggleTheme']);

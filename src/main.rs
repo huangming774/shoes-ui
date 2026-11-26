@@ -7,6 +7,7 @@ mod models;
 mod monitor;
 mod ops_util;
 mod process;
+mod reality_probe;
 mod state;
 mod sub_gen;
 mod yaml_gen;
@@ -3382,8 +3383,7 @@ mod tests {
                     password: "stls-inbound-secret".to_string(),
                     handshake_mode: "remote".to_string(),
                     handshake_addr: "www.microsoft.com:443".to_string(),
-                    cert_file: String::new(),
-                    key_file: String::new(),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -3540,6 +3540,1369 @@ mod tests {
             &[bad_mux],
         )
         .is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sni_port443_multiplexing_mtls_pq_kx_and_sudoku_pass_real_shoes_check(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = db::Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let settings = db.get_settings()?;
+        let shoes_bin = std::path::PathBuf::from(&settings.shoes_bin_path);
+        let has_shoes = shoes_bin.is_file();
+
+        // 1. Self-signed server cert + mTLS client cert & fingerprint
+        let (cert_pem, key_pem) = crypto_util::generate_self_signed_cert(&[
+            "trojan.example.com".to_string(),
+            "hy2.example.com".to_string(),
+            "localhost".to_string(),
+        ])?;
+        let cert_path = dir.path().join("sni443.crt");
+        let key_path = dir.path().join("sni443.key");
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
+        db.save_certificate(models::CertificateRecord {
+            id: 0,
+            name: "sni443-cert".to_string(),
+            cert_type: "files".to_string(),
+            domains: vec!["trojan.example.com".to_string(), "hy2.example.com".to_string()],
+            cert_file: cert_path.to_string_lossy().to_string(),
+            key_file: key_path.to_string_lossy().to_string(),
+            email: String::new(),
+            directory_url: String::new(),
+            terms_of_service: String::new(),
+            challenge_type: "http-01".to_string(),
+            http01_listen: String::new(),
+            remark: "SNI 443 cert".to_string(),
+            created_at: 0,
+        })?;
+
+        let (mtls_cert_pem, mtls_key_pem, mtls_fp) =
+            crypto_util::generate_mtls_client_cert("device-laptop")?;
+        assert!(mtls_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(mtls_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(mtls_fp.split(':').count(), 32);
+
+        // Create an outbound group so per-SNI override_rules can route independently
+        db.save_outbound_group(models::OutboundGroupRecord {
+            id: 0,
+            name: "sni-relay-grp".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "direct-exit".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![models::OutboundMember {
+                name: "direct-exit".to_string(),
+                protocol: "direct".to_string(),
+                ..Default::default()
+            }],
+            raw_chains_yaml: String::new(),
+            remark: "SNI override target".to_string(),
+        })?;
+
+        // 2a. TCP 443 #1: VLESS + REALITY (SNI: www.microsoft.com) with custom rules_ref
+        let (rk_priv, rk_pub) = crypto_util::generate_reality_keypair();
+        let mut ib_reality = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Port443-REALITY".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 443,
+            protocol: "vless".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                udp_enabled: true,
+                rules_ref: "sni-relay-grp".to_string(),
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "reality".to_string(),
+                reality: models::RealitySettings {
+                    dest: "www.microsoft.com:443".to_string(),
+                    sni: "www.microsoft.com".to_string(),
+                    private_key: rk_priv,
+                    public_key: rk_pub,
+                    short_ids: vec!["a1b2c3d4".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_reality.clients.push(db::default_client_for_inbound(&ib_reality, 1));
+        let ib_reality = db.create_inbound(ib_reality)?;
+
+        // 2b. TCP 443 #2: Trojan + TLS (SNI: trojan.example.com) + PQ Key Exchange + mTLS fingerprint (with sha256: prefix normalization)
+        let mut ib_tls = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Port443-Trojan-TLS-mTLS-PQ".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 443,
+            protocol: "trojan".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                rules_ref: "direct".to_string(),
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "tls".to_string(),
+                tls: models::TlsSettings {
+                    sni: "trojan.example.com".to_string(),
+                    allow_any_sni: false,
+                    cert_mode: "source".to_string(),
+                    certificate_source: "sni443-cert".to_string(),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                    key_exchange_groups: vec![
+                        "X25519MLKEM768".to_string(),
+                        "X25519".to_string(),
+                    ],
+                    client_fingerprints: vec![format!("sha256:{mtls_fp}")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_tls.clients.push(db::default_client_for_inbound(&ib_tls, 1));
+        let ib_tls = db.create_inbound(ib_tls)?;
+
+        // 2c. TCP 443 #3: Shadowsocks + ShadowTLS v3 (SNI: www.apple.com)
+        let mut ib_stls = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Port443-ShadowTLS".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 443,
+            protocol: "shadowsocks".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                cipher: "aes-256-gcm".to_string(),
+                udp_enabled: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "shadowtls".to_string(),
+                shadowtls: models::ShadowTlsSettings {
+                    sni: "www.apple.com".to_string(),
+                    password: "shared-443-stls-pass".to_string(),
+                    handshake_mode: "remote".to_string(),
+                    handshake_addr: "www.apple.com:443".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_stls.clients.push(db::default_client_for_inbound(&ib_stls, 1));
+        let _ib_stls = db.create_inbound(ib_stls)?;
+
+        // 2d. Duplicate SNI on TCP 443 MUST be rejected by DB port-conflict check!
+        let mut dup_sni = ib_reality.clone();
+        dup_sni.id = 0;
+        dup_sni.tag = String::new();
+        dup_sni.remark = "Port443-DupSNI".to_string();
+        assert!(
+            db.create_inbound(dup_sni).is_err(),
+            "Duplicate SNI 'www.microsoft.com' on 127.0.0.1:443 must be rejected"
+        );
+
+        // 2e. UDP/QUIC 443: Hysteria2 sharing port 443 with TCP + hybrid PQ-KX + mTLS!
+        let mut ib_hy2_443 = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Port443-QUIC-Hy2".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 443,
+            protocol: "hysteria2".to_string(),
+            protocol_settings: models::ProtocolSettings::default(),
+            stream_settings: models::StreamSettings {
+                network: "quic".to_string(),
+                security: "tls".to_string(),
+                tls: models::TlsSettings {
+                    sni: "hy2.example.com".to_string(),
+                    cert_mode: "source".to_string(),
+                    certificate_source: "sni443-cert".to_string(),
+                    key_exchange_groups: vec!["X25519MLKEM768".to_string()],
+                    client_fingerprints: vec![mtls_fp.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_hy2_443.clients.push(db::default_client_for_inbound(&ib_hy2_443, 1));
+        let _ib_hy2_443 = db.create_inbound(ib_hy2_443)?;
+
+        // 2f. Standalone TCP Inbound with Sudoku FinalMask
+        let mut ib_sudoku = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Trojan-Sudoku-Mask".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39445,
+            protocol: "trojan".to_string(),
+            protocol_settings: models::ProtocolSettings::default(),
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "tls".to_string(),
+                tls: models::TlsSettings {
+                    sni: "trojan.example.com".to_string(),
+                    cert_mode: "source".to_string(),
+                    certificate_source: "sni443-cert".to_string(),
+                    ..Default::default()
+                },
+                sudoku: models::SudokuMaskSettings {
+                    enabled: true,
+                    password: "sudoku-mask-secret-key".to_string(),
+                    ascii: "prefer_entropy".to_string(),
+                    custom_table: "xpxvvpvv".to_string(),
+                    custom_tables: Vec::new(),
+                    padding_min: 5,
+                    padding_max: 15,
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_sudoku.clients.push(db::default_client_for_inbound(&ib_sudoku, 1));
+        let ib_sudoku = db.create_inbound(ib_sudoku)?;
+
+        // 3. Validate entire server YAML via real `shoes check` when shoes binary is present!
+        let yaml = yaml_gen::validated_config(&db, &settings).await?;
+        assert!(yaml.contains("tls_targets:"));
+        assert!(yaml.contains("reality_targets:"));
+        assert!(yaml.contains("shadowtls_targets:"));
+        assert!(yaml.contains("override_rules:"));
+        assert!(yaml.contains("sni-relay-grp"));
+        assert!(yaml.contains("X25519MLKEM768"));
+        assert!(yaml.contains(&mtls_fp));
+        assert!(
+            !yaml.contains("sha256:"),
+            "normalized client_fingerprints must strip sha256: prefix"
+        );
+        assert!(yaml.contains("type: sudoku_mask"));
+        assert!(yaml.contains("sudoku-mask-secret-key"));
+        assert!(yaml.contains("custom_table: xpxvvpvv"));
+
+        // Verify only ONE TCP listener on 127.0.0.1:443 (plus one QUIC listener on 127.0.0.1:443)
+        let docs: Vec<serde_yaml::Value> = serde_yaml::from_str(&yaml)?;
+        let tcp_443_count = docs
+            .iter()
+            .filter(|d| {
+                d["address"].as_str() == Some("127.0.0.1:443")
+                    && d["transport"].as_str().unwrap_or("tcp") == "tcp"
+            })
+            .count();
+        let quic_443_count = docs
+            .iter()
+            .filter(|d| {
+                d["address"].as_str() == Some("127.0.0.1:443")
+                    && d["transport"].as_str() == Some("quic")
+            })
+            .count();
+        assert_eq!(tcp_443_count, 1, "expected 3 SNIs merged into 1 TCP 443 listener");
+        assert_eq!(quic_443_count, 1, "expected 1 QUIC 443 listener coexisting with TCP 443");
+
+        // 4. Verify Shoes client export for PQ-KX and Sudoku FinalMask, plus Clash/sing-box omission for Sudoku
+        let tls_share = sub_gen::build_client_share_info(&ib_tls, &ib_tls.clients[0], "example.com");
+        assert!(tls_share.shoes_client_yaml.contains("X25519MLKEM768"));
+
+        let sudoku_share =
+            sub_gen::build_client_share_info(&ib_sudoku, &ib_sudoku.clients[0], "example.com");
+        assert!(sudoku_share.shoes_client_yaml.contains("type: sudoku_mask"));
+        assert!(sudoku_share.shoes_client_yaml.contains("sudoku-mask-secret-key"));
+        assert!(sudoku_share.uri.is_empty(), "Sudoku-masked inbound must not emit raw URI");
+
+        if has_shoes {
+            for (label, snippet) in [
+                ("trojan-pq-kx", &tls_share.shoes_client_yaml),
+                ("trojan-sudoku", &sudoku_share.shoes_client_yaml),
+            ] {
+                let p = dir.path().join(format!("client_{label}.yaml"));
+                std::fs::write(&p, snippet)?;
+                let out = tokio::process::Command::new(&shoes_bin)
+                    .args(["check", &p.to_string_lossy()])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "shoes check rejected exported client '{label}':\n{}\nYAML:\n{}",
+                    String::from_utf8_lossy(&out.stderr),
+                    snippet
+                );
+            }
+        }
+
+        let certs = db.list_certificates()?;
+        let clash_yaml = sub_gen::generate_subscription_with_certs(
+            &[ib_sudoku.clone()],
+            &certs,
+            "*",
+            "example.com",
+            sub_gen::SubFormat::ClashYaml,
+        )
+        .body;
+        assert!(
+            !clash_yaml.contains("Trojan-Sudoku-Mask"),
+            "Clash export must omit Sudoku-masked inbound"
+        );
+        let sb_json: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_certs(
+                &[ib_sudoku.clone()],
+                &certs,
+                "*",
+                "example.com",
+                sub_gen::SubFormat::SingBoxJson,
+            )
+            .body,
+        )?;
+        assert!(
+            !sb_json["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["tag"].as_str().unwrap_or("").contains("Trojan-Sudoku-Mask")),
+            "sing-box export must omit Sudoku-masked inbound"
+        );
+
+        // 5. Negative guards: hybrid-only PQ-KX + TLS Vision; Sudoku on QUIC
+        let mut bad_vision = ib_tls.clone();
+        bad_vision.protocol = "vless".to_string();
+        bad_vision.stream_settings.tls.vision = true;
+        bad_vision.stream_settings.tls.key_exchange_groups = vec!["X25519MLKEM768".to_string()];
+        assert!(yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &certs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[bad_vision],
+        )
+        .is_err());
+
+        let mut bad_sudoku_quic = ib_sudoku.clone();
+        bad_sudoku_quic.protocol = "hysteria2".to_string();
+        bad_sudoku_quic.stream_settings.network = "quic".to_string();
+        assert!(yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &certs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[bad_sudoku_quic],
+        )
+        .is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbound_uri_parser_full_protocols_and_multihop_chains_pass_real_shoes_check(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = db::Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let settings = db.get_settings()?;
+
+        let (_, rk_pub) = crypto_util::generate_reality_keypair();
+        let u_vless = uuid::Uuid::new_v4().to_string();
+        let u_vmess = uuid::Uuid::new_v4().to_string();
+        let u_tuic = uuid::Uuid::new_v4().to_string();
+        let u_xhttp = uuid::Uuid::new_v4().to_string();
+        let u_chain = uuid::Uuid::new_v4().to_string();
+        let vmess_payload = serde_json::json!({
+            "v": "2",
+            "ps": "JP-VMess-WS",
+            "add": "198.51.100.12",
+            "port": "443",
+            "id": u_vmess,
+            "scy": "aes-128-gcm",
+            "net": "ws",
+            "host": "ws.example.com",
+            "path": "/v2ws",
+            "tls": "tls",
+            "sni": "ws.example.com"
+        });
+        let vmess_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vmess_payload.to_string().as_bytes(),
+        );
+        let ss_user = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"aes-256-gcm:ss-pass-123",
+        );
+
+        let uri_block = format!(
+            "vless://{u_vless}@198.51.100.10:443?security=reality&sni=www.microsoft.com&pbk={rk_pub}&sid=1a2b3c4d&flow=xtls-rprx-vision#US-REALITY\n\
+             vmess://{vmess_b64}\n\
+             trojan://tr-pass-123@198.51.100.13:443?sni=tr.example.com&allowInsecure=1#SG-Trojan\n\
+             ss://{ss_user}@198.51.100.14:443?plugin=shadow-tls%3Bhost%3Dwww.apple.com%3Bpassword%3Dstls-secret#HK-SS-STLS\n\
+             hysteria2://hy2-secret@198.51.100.15:443?sni=hy2.example.com&obfs=salamander&obfs-password=obfs-key&mport=20000-20010&insecure=1#JP-Hy2\n\
+             tuic://{u_tuic}:tuic-pass@198.51.100.16:443?sni=tuic.example.com&udp_relay_mode=native&allow_insecure=1#DE-TUIC\n\
+             anytls://any-pass@198.51.100.17:443?sni=any.example.com&insecure=1#UK-AnyTLS"
+        );
+
+        // Test plain multi-line parsing AND Base64 subscription decoding
+        let parsed = ops_util::parse_outbound_share_uris(&uri_block)?;
+        assert_eq!(parsed.len(), 7);
+        assert_eq!(parsed[0].name, "US-REALITY");
+        assert_eq!(parsed[0].protocol, "vless");
+        assert_eq!(parsed[0].security, "reality");
+        assert!(parsed[0].vision);
+        assert_eq!(parsed[1].name, "JP-VMess-WS");
+        assert_eq!(parsed[1].network, "ws");
+        assert_eq!(parsed[2].protocol, "trojan");
+        assert_eq!(parsed[3].security, "shadowtls");
+        assert_eq!(parsed[3].shadowtls_password, "stls-secret");
+        assert_eq!(parsed[4].protocol, "hysteria2");
+        assert_eq!(parsed[4].hy2_obfs_password, "obfs-key");
+        assert_eq!(parsed[4].hy2_hopping_ports, "20000-20010");
+        assert_eq!(parsed[5].protocol, "tuic");
+        assert_eq!(parsed[6].protocol, "anytls");
+
+        let sub_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            uri_block.as_bytes(),
+        );
+        let parsed_b64 = ops_util::parse_outbound_share_uris(&sub_b64)?;
+        assert_eq!(parsed_b64.len(), 7);
+
+        // Save full landing group (including native QUIC Hysteria2 + TUIC) AND a TCP-only landing group for hop-2 chaining
+        db.save_outbound_group(models::OutboundGroupRecord {
+            id: 0,
+            name: "landing-nodes".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "US-REALITY".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: parsed.clone(),
+            raw_chains_yaml: String::new(),
+            remark: "Parsed share URI landing group".to_string(),
+        })?;
+        db.save_outbound_group(models::OutboundGroupRecord {
+            id: 0,
+            name: "tcp-landing".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "TCP-US-REALITY".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: parsed
+                .iter()
+                .filter(|m| !matches!(m.protocol.as_str(), "hysteria2" | "tuic" | "wireguard"))
+                .cloned()
+                .map(|mut m| {
+                    m.name = format!("TCP-{}", m.name);
+                    m
+                })
+                .collect(),
+            raw_chains_yaml: String::new(),
+            remark: "TCP-only landing group for multi-hop hop 2+".to_string(),
+        })?;
+
+        // Build advanced outbound group with XHTTP, Sudoku FinalMask, PQ-KX, and two visual multi-hop chains!
+        let xhttp_member = models::OutboundMember {
+            name: "XHTTP-VLESS".to_string(),
+            protocol: "vless".to_string(),
+            address: "198.51.100.20:443".to_string(),
+            uuid: u_xhttp,
+            security: "tls".to_string(),
+            tls: true,
+            sni: "xhttp.example.com".to_string(),
+            key_exchange_groups: vec!["X25519MLKEM768".to_string(), "X25519".to_string()],
+            network: "xhttp".to_string(),
+            xhttp_path: "/xh".to_string(),
+            xhttp_host: "xhttp.example.com".to_string(),
+            xhttp_mode: "stream-up".to_string(),
+            ..Default::default()
+        };
+
+        let sudoku_member = models::OutboundMember {
+            name: "Sudoku-Trojan".to_string(),
+            protocol: "trojan".to_string(),
+            address: "198.51.100.21:443".to_string(),
+            password: "tr-sudoku-pw".to_string(),
+            security: "tls".to_string(),
+            tls: true,
+            sni: "sudoku.example.com".to_string(),
+            sudoku: models::SudokuMaskSettings {
+                enabled: true,
+                password: "outbound-sudoku-key".to_string(),
+                ascii: "prefer_entropy".to_string(),
+                padding_min: 5,
+                padding_max: 15,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let multihop_socks_to_reality = models::OutboundMember {
+            name: "Chain-Relay-REALITY".to_string(),
+            protocol: "socks".to_string(),
+            address: "198.51.100.30:1080".to_string(),
+            username: "relay-u".to_string(),
+            password: "relay-p".to_string(),
+            extra_hops: vec![models::OutboundHop {
+                protocol: "vless".to_string(),
+                address: "198.51.100.31:443".to_string(),
+                uuid: u_chain,
+                security: "reality".to_string(),
+                sni: "www.microsoft.com".to_string(),
+                reality_public_key: rk_pub.clone(),
+                reality_short_id: "deadbeef".to_string(),
+                vision: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let multihop_to_group = models::OutboundMember {
+            name: "Chain-To-Group".to_string(),
+            protocol: "http".to_string(),
+            address: "198.51.100.32:8080".to_string(),
+            extra_hops: vec![models::OutboundHop {
+                protocol: "group".to_string(),
+                address: "tcp-landing".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        db.save_outbound_group(models::OutboundGroupRecord {
+            id: 0,
+            name: "advanced-chains".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "Chain-Relay-REALITY".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![
+                xhttp_member,
+                sudoku_member,
+                multihop_socks_to_reality,
+                multihop_to_group,
+            ],
+            raw_chains_yaml: String::new(),
+            remark: "Multi-hop + XHTTP + Sudoku outbounds".to_string(),
+        })?;
+
+        // Validate full YAML against real `shoes check` when available
+        let yaml = yaml_gen::validated_config(&db, &settings).await?;
+        assert!(yaml.contains("client_group: landing-nodes"));
+        assert!(yaml.contains("client_group: advanced-chains"));
+        assert!(yaml.contains("type: reality"));
+        assert!(yaml.contains("type: hysteria2"));
+        assert!(yaml.contains("type: tuic"));
+        assert!(yaml.contains("type: anytls"));
+        assert!(yaml.contains("type: xhttp"));
+        assert!(yaml.contains("type: sudoku_mask"));
+        assert!(yaml.contains("outbound-sudoku-key"));
+        assert!(yaml.contains("name: Chain-Relay-REALITY"));
+        assert!(yaml.contains("chain:"));
+        assert!(yaml.contains("name: Chain-To-Group"));
+        assert!(yaml.contains("tcp-landing"));
+        assert!(yaml.contains("transport: quic"));
+
+        // Negative guard: native QUIC at hop 2 must be rejected cleanly
+        let bad_quic_hop2 = models::OutboundGroupRecord {
+            id: 0,
+            name: "bad-hop2".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "Bad-Chain".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![models::OutboundMember {
+                name: "Bad-Chain".to_string(),
+                protocol: "socks".to_string(),
+                address: "198.51.100.30:1080".to_string(),
+                extra_hops: vec![models::OutboundHop {
+                    protocol: "hysteria2".to_string(),
+                    address: "198.51.100.31:443".to_string(),
+                    password: "secret".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            raw_chains_yaml: String::new(),
+            remark: String::new(),
+        };
+        assert!(yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &[],
+            &[],
+            &[],
+            &[bad_quic_hop2],
+            &[],
+            &[],
+        )
+        .is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_server_inbound_multi_peer_conf_and_subscriptions() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = db::Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let settings = db.get_settings()?;
+
+        // 1. Create a WireGuard server inbound without specifying keys or tunnel IPs:
+        //    DB normalization should auto-generate server keypair + 10.77.0.1/32, fd77::1/128
+        //    and auto-allocate Peer 1 to 10.77.0.2/32, fd77::2/128.
+        let mut ib_wg = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "WG-Home-Gateway".to_string(),
+            enable: true,
+            listen: "0.0.0.0".to_string(),
+            port: 51820,
+            protocol: "wireguard".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                wg_mtu: 1408,
+                wg_dns: "1.1.1.1, 8.8.8.8".to_string(),
+                wg_block_private: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "udp".to_string(),
+                security: "none".to_string(),
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib_wg.clients.push(models::ClientRecord {
+            name: "laptop".to_string(),
+            enable: true,
+            ..Default::default()
+        });
+        let ib_wg = db.create_inbound(ib_wg)?;
+
+        assert!(!ib_wg.protocol_settings.wg_server_private_key.is_empty());
+        assert_eq!(
+            ib_wg.protocol_settings.wg_server_public_key,
+            crypto_util::derive_wireguard_public_key(&ib_wg.protocol_settings.wg_server_private_key)?
+        );
+        assert_eq!(
+            ib_wg.protocol_settings.wg_server_addresses,
+            vec!["10.77.0.1/32".to_string(), "fd77::1/128".to_string()]
+        );
+        assert_eq!(ib_wg.clients.len(), 1);
+        assert_eq!(ib_wg.clients[0].wg_allowed_ips, "10.77.0.2/32, fd77::2/128");
+        assert_eq!(
+            ib_wg.clients[0].wg_public_key,
+            crypto_util::derive_wireguard_public_key(&ib_wg.clients[0].wg_private_key)?
+        );
+
+        // 2. Add Peer 2 via db.add_client: should auto-allocate 10.77.0.3/32, fd77::3/128!
+        let ib_wg = db.add_client(
+            ib_wg.id,
+            models::ClientRecord {
+                name: "iphone".to_string(),
+                enable: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(ib_wg.clients.len(), 2);
+        let peer2 = &ib_wg.clients[1];
+        assert_eq!(peer2.wg_allowed_ips, "10.77.0.3/32, fd77::3/128");
+        assert!(!peer2.wg_private_key.is_empty());
+        assert_eq!(
+            peer2.wg_public_key,
+            crypto_util::derive_wireguard_public_key(&peer2.wg_private_key)?
+        );
+
+        // 3. Compile full Shoes server YAML and inspect wireguard server schema
+        let yaml = yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[ib_wg.clone()],
+        )?;
+        let docs: Vec<serde_yaml::Value> = serde_yaml::from_str(&yaml)?;
+        let wg_doc = docs
+            .iter()
+            .find(|d| d["protocol"]["type"].as_str() == Some("wireguard"))
+            .expect("wireguard server entry emitted");
+        assert_eq!(wg_doc["transport"].as_str(), Some("udp"));
+        assert_eq!(wg_doc["address"].as_str(), Some("0.0.0.0:51820"));
+        assert_eq!(
+            wg_doc["protocol"]["private_key"].as_str(),
+            Some(ib_wg.protocol_settings.wg_server_private_key.as_str())
+        );
+        let peers = wg_doc["protocol"]["peers"].as_sequence().expect("peers seq");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(
+            peers[0]["public_key"].as_str(),
+            Some(ib_wg.clients[0].wg_public_key.as_str())
+        );
+        assert_eq!(
+            peers[1]["public_key"].as_str(),
+            Some(ib_wg.clients[1].wg_public_key.as_str())
+        );
+        let rules = wg_doc["rules"].as_sequence().expect("non-empty wireguard rules");
+        assert!(!rules.is_empty(), "wireguard server must emit explicit non-empty rules");
+
+        // 4. Verify official WireGuard App .conf + Shoes YAML + Clash + sing-box + V2Ray skip
+        let share1 = sub_gen::build_client_share_info(&ib_wg, &ib_wg.clients[0], "vpn.example.com");
+        assert!(share1.uri.contains("[Interface]"));
+        assert!(share1.uri.contains(&format!("PrivateKey = {}", ib_wg.clients[0].wg_private_key)));
+        assert!(share1.uri.contains("Address = 10.77.0.2/32, fd77::2/128"));
+        assert!(share1.uri.contains("DNS = 1.1.1.1, 8.8.8.8"));
+        assert!(share1.uri.contains("[Peer]"));
+        assert!(share1.uri.contains(&format!("PublicKey = {}", ib_wg.protocol_settings.wg_server_public_key)));
+        assert!(share1.uri.contains("Endpoint = vpn.example.com:51820"));
+        assert!(share1.uri.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+        assert!(share1.shoes_client_yaml.contains("type: wireguard"));
+        assert!(share1.shoes_client_yaml.contains("vpn.example.com:51820"));
+
+        let clash_yaml = sub_gen::generate_subscription_with_certs(
+            &[ib_wg.clone()],
+            &[],
+            "*",
+            "vpn.example.com",
+            sub_gen::SubFormat::ClashYaml,
+        )
+        .body;
+        assert!(clash_yaml.contains("type: wireguard"));
+        assert!(clash_yaml.contains("10.77.0.2"));
+        assert!(clash_yaml.contains("10.77.0.3"));
+
+        let sb_json: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_certs(
+                &[ib_wg.clone()],
+                &[],
+                "*",
+                "vpn.example.com",
+                sub_gen::SubFormat::SingBoxJson,
+            )
+            .body,
+        )?;
+        let wg_outbounds: Vec<_> = sb_json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["type"] == "wireguard")
+            .collect();
+        assert_eq!(wg_outbounds.len(), 2);
+
+        let v2ray_b64 = sub_gen::generate_subscription_with_certs(
+            &[ib_wg.clone()],
+            &[],
+            "*",
+            "vpn.example.com",
+            sub_gen::SubFormat::V2rayBase64,
+        )
+        .body;
+        let decoded_v2ray = String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, v2ray_b64.trim())?,
+        )?;
+        assert!(
+            decoded_v2ray.trim().is_empty(),
+            "V2Ray Base64 subscription must skip WireGuard .conf entries"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reality_probe_local_tls13_x25519_h2_and_mldsa65_capacity_checks() -> anyhow::Result<()>
+    {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Unit tests for URL/dest normalization and RFC 6125 SAN wildcard matching
+        let (addr, dest, sni) =
+            reality_probe::normalize_probe_target("https://www.microsoft.com/en-us", "")?;
+        assert_eq!(addr, "www.microsoft.com:443");
+        assert_eq!(dest, "www.microsoft.com:443");
+        assert_eq!(sni, "www.microsoft.com");
+
+        assert!(reality_probe::sni_matches_cert(
+            "api.example.com",
+            &["*.example.com".to_string()],
+            ""
+        ));
+        assert!(!reality_probe::sni_matches_cert(
+            "a.b.example.com",
+            &["*.example.com".to_string()],
+            ""
+        ));
+
+        // 2. Unit test for flight layout + ML-DSA-65 capacity + HelloRetryRequest detection
+        let fake_ccs = vec![20u8, 3, 3, 0, 1, 1];
+        // Synthetic TLS 1.3 ServerHello with X25519 key_share (0x001d, 32B) and supported_versions 0x0304
+        let build_sh = |is_hrr: bool| -> Vec<u8> {
+            let mut ext = Vec::new();
+            // supported_versions (43) = 0x0304
+            ext.extend_from_slice(&[0, 43, 0, 2, 0x03, 0x04]);
+            // key_share (51) = X25519 (0x001d) + 32 bytes
+            ext.extend_from_slice(&[0, 51, 0, 36, 0x00, 0x1d, 0, 32]);
+            ext.extend_from_slice(&[0x42; 32]);
+
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+            if is_hrr {
+                body.extend_from_slice(&[
+                    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02,
+                    0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e,
+                    0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+                ]);
+            } else {
+                body.extend_from_slice(&[0x11; 32]);
+            }
+            body.push(0); // session_id len
+            body.extend_from_slice(&[0x13, 0x01, 0x00]); // cipher suite + compression
+            body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+            body.extend_from_slice(&ext);
+
+            let mut hs = vec![2u8]; // ServerHello
+            let blen = body.len();
+            hs.extend_from_slice(&[(blen >> 16) as u8, (blen >> 8) as u8, blen as u8]);
+            hs.extend_from_slice(&body);
+
+            let mut rec = vec![22u8, 3, 3];
+            rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+            rec.extend_from_slice(&hs);
+            rec
+        };
+        let make_app = |payload_len: usize| -> Vec<u8> {
+            let mut r = vec![23u8, 3, 3];
+            r.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            r.extend(std::iter::repeat_n(0xaa, payload_len));
+            r
+        };
+
+        let combined_large = reality_probe::analyze_server_flight(&[
+            build_sh(false),
+            fake_ccs.clone(),
+            make_app(4200),
+        ]);
+        assert!(combined_large.server_hello_tls13);
+        assert!(combined_large.server_hello_x25519);
+        assert!(!combined_large.hello_retry);
+        assert_eq!(combined_large.flight_mode, "combined");
+        assert!(combined_large.shoes_layout_valid);
+        assert!(combined_large.cert_capacity_bytes >= 3750);
+
+        let hrr_flight = reality_probe::analyze_server_flight(&[build_sh(true)]);
+        assert!(hrr_flight.hello_retry);
+
+        // 3. Spin up a REAL local TLS 1.3 + X25519 + ALPN h2 server and probe it end-to-end!
+        let (cert_pem, key_pem) =
+            crypto_util::generate_self_signed_cert(&["probe.example.com".to_string()])?;
+        let cert_der = acme_util::extract_pem_blocks(&cert_pem, "CERTIFICATE")
+            .into_iter()
+            .next()
+            .expect("cert der");
+        let key_der = acme_util::extract_pem_blocks(&key_pem, "PRIVATE KEY")
+            .into_iter()
+            .next()
+            .expect("key der");
+
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+        let mut srv_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der)),
+            )?;
+        srv_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let srv_cfg = Arc::new(srv_cfg);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv_task = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                if let Ok(mut conn) = rustls::ServerConnection::new(srv_cfg) {
+                    let mut buf = [0u8; 4096];
+                    while conn.is_handshaking() {
+                        if let Ok(n) = sock.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            let mut cur = std::io::Cursor::new(&buf[..n]);
+                            while (cur.position() as usize) < n {
+                                let _ = conn.read_tls(&mut cur);
+                                let _ = conn.process_new_packets();
+                            }
+                            let mut out = Vec::new();
+                            while conn.wants_write() {
+                                let _ = conn.write_tls(&mut out);
+                            }
+                            if !out.is_empty() {
+                                let _ = sock.write_all(&out).await;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let res = reality_probe::probe_reality_target(
+            &format!("127.0.0.1:{port}"),
+            "probe.example.com",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        let _ = srv_task.await;
+
+        assert!(res.reachable, "probe should connect to local TLS server: {:?}", res.error);
+        assert_eq!(res.tls_version, "TLSv1.3");
+        assert_eq!(res.alpn, "h2");
+        assert!(res.x25519, "expected X25519 negotiated");
+        assert!(!res.hello_retry);
+        assert!(res.sni_matched, "cert SAN probe.example.com must match SNI");
+        assert!(res.cert_self_signed, "self-signed test cert must be flagged");
+        assert!(res.tcp_ms.is_some() && res.tls_ms.is_some());
+        assert!(res.flight_records >= 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscription_rule_templates_clash_and_singbox_presets_and_custom_rules() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let db = db::Database::open(&dir.path().join("panel.db"), dir.path())?;
+
+        // Create a sample VLESS + REALITY inbound
+        let (rk_priv, rk_pub) = crypto_util::generate_reality_keypair();
+        let mut ib = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "Tokyo-VLESS".to_string(),
+            enable: true,
+            listen: "0.0.0.0".to_string(),
+            port: 443,
+            protocol: "vless".to_string(),
+            protocol_settings: models::ProtocolSettings::default(),
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "reality".to_string(),
+                reality: models::RealitySettings {
+                    dest: "www.microsoft.com:443".to_string(),
+                    sni: "www.microsoft.com".to_string(),
+                    private_key: rk_priv,
+                    public_key: rk_pub,
+                    short_ids: vec!["a1b2c3d4".to_string()],
+                    vision: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        ib.clients.push(db::default_client_for_inbound(&ib, 1));
+        let ib = db.create_inbound(ib)?;
+
+        // Persist custom subscription template in SQLite and verify round-trip
+        let tpl = models::SubscriptionTemplateConfig {
+            preset: "streaming".to_string(),
+            prepend_custom_rules: true,
+            enable_adblock: true,
+            enable_ipv6: true,
+            clash_custom_rules: "# corp bypass\nDOMAIN-SUFFIX,corp.example.internal,DIRECT\n- IP-CIDR,100.64.0.0/10,DIRECT,no-resolve".to_string(),
+            clash_extra_groups_yaml: "- name: 🎮 Gaming\n  type: select\n  proxies:\n    - 🚀 Proxy\n    - DIRECT".to_string(),
+            singbox_custom_rules: "DOMAIN-SUFFIX,corp.example.internal,DIRECT\nDOMAIN-KEYWORD,myai,🤖 AI\nIP-CIDR,100.64.0.0/10,direct".to_string(),
+        };
+        let saved = db.save_sub_template(&tpl)?;
+        assert_eq!(saved.preset, "streaming");
+        assert_eq!(db.get_settings()?.sub_template.preset, "streaming");
+
+        // 1. Streaming preset + custom rules (Clash YAML)
+        let clash_streaming = sub_gen::generate_subscription_with_options(
+            &[ib.clone()],
+            &[],
+            "*",
+            "node.example.com",
+            sub_gen::SubFormat::ClashYaml,
+            &saved,
+        )
+        .body;
+        let clash_doc: serde_yaml::Value = serde_yaml::from_str(&clash_streaming)?;
+        let groups = clash_doc["proxy-groups"].as_sequence().unwrap();
+        let group_names: Vec<&str> = groups
+            .iter()
+            .filter_map(|g| g["name"].as_str())
+            .collect();
+        assert!(group_names.contains(&"🤖 AI"));
+        assert!(group_names.contains(&"🎬 Netflix"));
+        assert!(group_names.contains(&"📺 YouTube"));
+        assert!(group_names.contains(&"✈️ Telegram"));
+        assert!(group_names.contains(&"🌍 Google"));
+        assert!(group_names.contains(&"🍎 Apple"));
+        assert!(group_names.contains(&"🎮 Gaming"), "extra Clash group YAML must be appended");
+        let rules: Vec<&str> = clash_doc["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            rules[0], "DOMAIN-SUFFIX,corp.example.internal,DIRECT",
+            "prepended custom rule must be first"
+        );
+        assert!(rules.iter().any(|r| r.contains("doubleclick.net,REJECT")));
+        assert!(rules.iter().any(|r| r.contains("openai.com,🤖 AI")));
+        assert!(rules.iter().any(|r| r.contains("GEOIP,CN,🎯 Direct,no-resolve")));
+        assert_eq!(*rules.last().unwrap(), "MATCH,🚀 Proxy");
+        assert_eq!(clash_doc["dns"]["ipv6"].as_bool(), Some(true));
+
+        // 2. Streaming preset + custom rules (sing-box JSON)
+        let sb_streaming = sub_gen::generate_subscription_with_options(
+            &[ib.clone()],
+            &[],
+            "*",
+            "node.example.com",
+            sub_gen::SubFormat::SingBoxJson,
+            &saved,
+        )
+        .body;
+        let sb_json: serde_json::Value = serde_json::from_str(&sb_streaming)?;
+        let out_tags: Vec<&str> = sb_json["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        assert!(out_tags.contains(&"ai"));
+        assert!(out_tags.contains(&"netflix"));
+        assert!(out_tags.contains(&"youtube"));
+        assert!(out_tags.contains(&"telegram"));
+        assert!(out_tags.contains(&"block"));
+        let sb_rules = sb_json["route"]["rules"].as_array().unwrap();
+        assert_eq!(sb_rules[0]["domain_suffix"], serde_json::json!(["corp.example.internal"]));
+        assert_eq!(sb_rules[0]["outbound"], "direct");
+        assert_eq!(sb_rules[1]["domain_keyword"], serde_json::json!(["myai"]));
+        assert_eq!(sb_rules[1]["outbound"], "ai");
+        let rule_sets = sb_json["route"]["rule_set"].as_array().unwrap();
+        assert_eq!(rule_sets.len(), 2);
+
+        // 3. Global Direct preset check (final = DIRECT / direct)
+        let gd_tpl = models::SubscriptionTemplateConfig {
+            preset: "global_direct".to_string(),
+            ..Default::default()
+        };
+        let clash_gd = sub_gen::generate_subscription_with_options(
+            &[ib.clone()],
+            &[],
+            "*",
+            "node.example.com",
+            sub_gen::SubFormat::ClashYaml,
+            &gd_tpl,
+        )
+        .body;
+        assert!(clash_gd.contains("MATCH,DIRECT"));
+        assert!(clash_gd.contains("DOMAIN-SUFFIX,openai.com,🚀 Proxy"));
+
+        let sb_gd: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_options(
+                &[ib],
+                &[],
+                "*",
+                "node.example.com",
+                sub_gen::SubFormat::SingBoxJson,
+                &gd_tpl,
+            )
+            .body,
+        )?;
+        assert_eq!(sb_gd["route"]["final"], "direct");
+
+        // 4. Per-subscription template field persisted cleanly in DB
+        let sub = db.save_subscription(models::SubscriptionRecord {
+            id: 0,
+            sub_id: "vip-cn".to_string(),
+            token: String::new(),
+            name: "VIP Bypass CN".to_string(),
+            enable: true,
+            template: "bypass_cn".to_string(),
+            created_at: 0,
+        })?;
+        assert_eq!(sub.template, "bypass_cn");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_inbound_ops_and_3xui_share_uri_migration_pass_real_shoes_check(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = db::Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let settings = db.get_settings()?;
+
+        // 1. Parse a realistic 3x-ui /panel/api/inbounds/list JSON response containing:
+        //    - Multi-client VLESS + REALITY + Vision (2 clients -> auto-split onto 2 ports!)
+        //    - VMess + WebSocket
+        //    - dokodemo-door -> portforward
+        //    - Unsupported gRPC transport -> fallback to TCP with warning
+        let (rk_priv, rk_pub) = crypto_util::generate_reality_keypair();
+        let u1 = uuid::Uuid::new_v4().to_string();
+        let u2 = uuid::Uuid::new_v4().to_string();
+        let u3 = uuid::Uuid::new_v4().to_string();
+
+        let xui_json = serde_json::json!({
+            "success": true,
+            "obj": [
+                {
+                    "remark": "3xui-REALITY",
+                    "port": 39510,
+                    "protocol": "vless",
+                    "enable": true,
+                    "total": 107374182400_i64,
+                    "expiryTime": 0,
+                    "settings": serde_json::json!({
+                        "decryption": "none",
+                        "clients": [
+                            { "id": u1, "email": "alice", "flow": "xtls-rprx-vision", "subId": "team-a" },
+                            { "id": u2, "email": "bob", "flow": "xtls-rprx-vision", "subId": "team-b" }
+                        ]
+                    }).to_string(),
+                    "streamSettings": serde_json::json!({
+                        "network": "tcp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "target": "www.microsoft.com:443",
+                            "serverNames": ["www.microsoft.com"],
+                            "privateKey": rk_priv,
+                            "shortIds": ["1a2b3c4d"],
+                            "settings": { "publicKey": rk_pub, "fingerprint": "chrome" }
+                        }
+                    }).to_string()
+                },
+                {
+                    "remark": "3xui-VMess-WS",
+                    "port": 39520,
+                    "protocol": "vmess",
+                    "enable": true,
+                    "settings": serde_json::json!({
+                        "clients": [{ "id": u3, "email": "carol", "subId": "default" }]
+                    }).to_string(),
+                    "streamSettings": serde_json::json!({
+                        "network": "ws",
+                        "security": "none",
+                        "wsSettings": { "path": "/vmessws", "headers": { "Host": "cdn.example.com" } }
+                    }).to_string()
+                },
+                {
+                    "remark": "3xui-Forward",
+                    "port": 39525,
+                    "protocol": "dokodemo-door",
+                    "enable": true,
+                    "settings": serde_json::json!({ "address": "127.0.0.1", "port": 8080 }).to_string(),
+                    "streamSettings": "{}"
+                },
+                {
+                    "remark": "3xui-gRPC-Fallback",
+                    "port": 39530,
+                    "protocol": "trojan",
+                    "enable": true,
+                    "settings": serde_json::json!({
+                        "clients": [{ "password": "grpc-trojan-password", "email": "dave" }]
+                    }).to_string(),
+                    "streamSettings": serde_json::json!({
+                        "network": "grpc",
+                        "security": "none"
+                    }).to_string()
+                }
+            ]
+        })
+        .to_string();
+
+        let preview_3xui = ops_util::parse_migration_inbounds(&xui_json, &[])?;
+        assert_eq!(preview_3xui.source_format, "3x-ui");
+        assert_eq!(
+            preview_3xui.items.len(),
+            5,
+            "2 split VLESS clients + VMess + PortForward + Trojan = 5 inbounds"
+        );
+        assert_eq!(preview_3xui.items[0].inbound.port, 39510);
+        assert_eq!(preview_3xui.items[0].inbound.clients[0].uuid, u1);
+        assert!(preview_3xui.items[0].inbound.stream_settings.reality.vision);
+        assert_eq!(preview_3xui.items[1].inbound.port, 39511);
+        assert_eq!(preview_3xui.items[1].inbound.clients[0].uuid, u2);
+        assert_eq!(preview_3xui.items[2].inbound.stream_settings.ws.path, "/vmessws");
+        assert_eq!(preview_3xui.items[3].inbound.protocol, "portforward");
+        assert_eq!(
+            preview_3xui.items[3].inbound.protocol_settings.forward_targets,
+            vec!["127.0.0.1:8080".to_string()]
+        );
+        assert_eq!(preview_3xui.items[4].inbound.stream_settings.network, "tcp");
+        assert!(
+            preview_3xui.items[4]
+                .warnings
+                .iter()
+                .any(|w| w.contains("grpc")),
+            "gRPC fallback must emit a warning"
+        );
+
+        // Save all 5 migrated 3x-ui inbounds into DB
+        let mut ids = Vec::new();
+        for item in preview_3xui.items {
+            let created = db.create_inbound(item.inbound)?;
+            ids.push(created.id);
+        }
+
+        // 2. Parse external Share URIs (including one colliding on port 39510!) and import
+        let existing = db.list_inbounds()?;
+        let u_share = uuid::Uuid::new_v4().to_string();
+        let share_text = format!(
+            "vless://{u_share}@198.51.100.10:39510?security=reality&sni=www.apple.com&pbk={rk_pub}&sid=deadbeef&flow=xtls-rprx-vision#Migrated-URI-REALITY\n\
+             hysteria2://hy2-mig-pw@198.51.100.11:39540?sni=hy2.example.com&mport=39541-39545#Migrated-Hy2"
+        );
+        let preview_uri = ops_util::parse_migration_inbounds(&share_text, &existing)?;
+        assert_eq!(preview_uri.source_format, "share-uri");
+        assert_eq!(preview_uri.items.len(), 2);
+        // Distinct SNI on port 39510 (www.apple.com vs www.microsoft.com) CAN share port 39510!
+        assert!(!preview_uri.items[0].port_conflict);
+        assert!(
+            preview_uri.items[0]
+                .warnings
+                .iter()
+                .any(|w| w.contains("fresh server private/public keypair")),
+            "REALITY URI import must warn about regenerated server keypair"
+        );
+        assert_eq!(preview_uri.items[1].inbound.protocol, "hysteria2");
+        assert_eq!(preview_uri.items[1].inbound.stream_settings.tls.cert_mode, "auto");
+
+        for item in preview_uri.items {
+            let created = db.create_inbound(item.inbound)?;
+            ids.push(created.id);
+        }
+
+        // Validate ALL 7 migrated inbounds (3x-ui + Share URIs) via REAL `shoes check`!
+        let yaml = yaml_gen::validated_config(&db, &settings).await?;
+        assert!(yaml.contains("reality_targets:"));
+        assert!(yaml.contains("www.microsoft.com"));
+        assert!(yaml.contains("www.apple.com"));
+        assert!(yaml.contains("/vmessws"));
+        assert!(yaml.contains("type: portforward"));
+        assert!(yaml.contains("type: hysteria2"));
+
+        // 3. Batch operations: disable -> enable -> extend_expiry (resurrect expired!) -> reset_traffic -> delete
+        let target_ids = vec![ids[0], ids[1]];
+        assert_eq!(db.batch_set_inbounds_enable(&target_ids, false)?, 2);
+        assert!(!db.get_inbound(ids[0])?.unwrap().enable);
+
+        // Simulate expired inbound #0 (expired 1 day ago, disabled)
+        let mut ib0 = db.get_inbound(ids[0])?.unwrap();
+        let past_ms = chrono::Utc::now().timestamp_millis() - 86_400_000;
+        ib0.expiry_time = past_ms;
+        ib0.enable = false;
+        db.update_inbound(ib0.id, ib0)?;
+
+        // Batch extend by +30 days with apply_to_clients=true and re_enable_expired=true
+        let now_before = chrono::Utc::now().timestamp_millis();
+        assert_eq!(
+            db.batch_extend_inbounds_expiry(&target_ids, Some(30), None, true, true)?,
+            2
+        );
+        let after0 = db.get_inbound(ids[0])?.unwrap();
+        assert!(after0.enable, "expired inbound should be auto re-enabled after extension");
+        assert!(after0.expiry_time >= now_before + 29 * 86_400_000);
+        assert!(after0.clients[0].expiry_time >= now_before + 29 * 86_400_000);
+
+        // Batch reset traffic
+        let mut deltas = std::collections::HashMap::new();
+        deltas.insert(after0.tag.clone(), (5000u64, 9000u64));
+        db.add_traffic_deltas(&deltas, None)?;
+        assert_eq!(db.batch_reset_inbounds_traffic(&target_ids)?, 2);
+        let reset0 = db.get_inbound(ids[0])?.unwrap();
+        assert_eq!(reset0.up_bytes, 0);
+        assert_eq!(reset0.down_bytes, 0);
+
+        // Batch delete
+        assert_eq!(db.batch_delete_inbounds(&target_ids)?, 2);
+        assert!(db.get_inbound(ids[0])?.is_none());
+        assert!(db.get_inbound(ids[1])?.is_none());
 
         Ok(())
     }

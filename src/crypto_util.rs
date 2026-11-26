@@ -106,6 +106,52 @@ pub fn generate_wireguard_keypair() -> (String, String, String) {
     )
 }
 
+/// Derives the standard padded Base64 WireGuard public key from a 32-byte Base64 private key.
+pub fn derive_wireguard_public_key(private_key_b64: &str) -> Result<String> {
+    let bytes = STANDARD
+        .decode(private_key_b64.trim())
+        .map_err(|e| anyhow!("invalid WireGuard base64 private key: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("WireGuard private key must be 32 bytes"))?;
+    let secret = StaticSecret::from(arr);
+    let public = PublicKey::from(&secret);
+    Ok(STANDARD.encode(public.as_bytes()))
+}
+
+/// Generates an ECDSA P-256 client certificate + private key PEM for mTLS authentication
+/// along with its SHA-256 DER fingerprint formatted as `AA:BB:...` (accepted by `shoes`).
+pub fn generate_mtls_client_cert(common_name: &str) -> Result<(String, String, String)> {
+    let cn = if common_name.trim().is_empty() {
+        "shoes-mtls-client"
+    } else {
+        common_name.trim()
+    };
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::days(1);
+    let end = now + chrono::Duration::days(365);
+    params.not_before = rcgen::date_time_ymd(start.year(), start.month() as u8, start.day() as u8);
+    params.not_after = rcgen::date_time_ymd(end.year(), end.month() as u8, end.day() as u8);
+
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    let der = cert.der();
+    let digest = ring::digest::digest(&ring::digest::SHA256, der.as_ref());
+    let fp = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    Ok((cert.pem(), key_pair.serialize_pem(), fp))
+}
+
 pub fn generate_ss2022_password(cipher: &str) -> Result<String> {
     let key_len = match cipher {
         "2022-blake3-aes-128-gcm" => 16,

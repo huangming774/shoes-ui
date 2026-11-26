@@ -181,11 +181,11 @@
         </div>
         <div>
           <dt>{{ t('dashboard.hostUptime') }}</dt>
-          <dd>{{ formatDuration(sys.host_uptime_secs, locale === 'zh') }}</dd>
+          <dd>{{ formatDuration(sys.host_uptime_secs, locale.startsWith('zh')) }}</dd>
         </div>
         <div>
           <dt>{{ t('dashboard.panelUptime') }}</dt>
-          <dd>{{ formatDuration(sys.panel_uptime_secs, locale === 'zh') }}</dd>
+          <dd>{{ formatDuration(sys.panel_uptime_secs, locale.startsWith('zh')) }}</dd>
         </div>
       </dl>
     </a-card>
