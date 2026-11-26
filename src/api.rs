@@ -137,7 +137,8 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/keygen/vless-encryption", get(api_keygen_vless_encryption))
         .route("/keygen/mldsa65", get(api_keygen_mldsa65))
         .route("/keygen/mtls-client", get(api_keygen_mtls_client))
-        .route("/tools/probe-reality", post(api_probe_reality))
+        .route("/tools/probe-reality", post(api_probe_reality));
+    let certs_api = Router::new()
         // Certificates
         .route(
             "/certificates",
@@ -177,7 +178,10 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             get(api_list_routing_rules).post(api_save_routing_rule),
         )
         .route("/routing-rules/{id}", delete(api_delete_routing_rule));
-    let config_api = inbound_api.merge(routing_api).route_layer(middleware::from_fn(
+    let config_api = inbound_api
+        .merge(certs_api)
+        .merge(routing_api)
+        .route_layer(middleware::from_fn(
         |req: Request, next: Next| async move {
             if req.method().is_safe() {
                 return Ok(next.run(req).await);
@@ -1391,17 +1395,18 @@ async fn save_cert_with_rollback(
     state: &AppState,
     cert: CertificateRecord,
 ) -> Result<CertificateRecord, (StatusCode, Json<Value>)> {
+    let _operation = state.proc_mgr.operation.lock().await;
     let previous = if cert.id > 0 {
-        state.db.get_certificate(cert.id).ok().flatten()
+        state.db.get_certificate(cert.id).map_err(internal_err)?
     } else {
         None
     };
     let saved = state.db.save_certificate(cert).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
-            let _ = state.db.restore_certificate(&prev);
+            state.db.restore_certificate(&prev).map_err(internal_err)?;
         } else {
-            let _ = state.db.delete_certificate(saved.id);
+            state.db.delete_certificate(saved.id).map_err(internal_err)?;
         }
         return Err(bad_req(e));
     }
@@ -1772,13 +1777,14 @@ async fn api_delete_cert(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let _operation = state.proc_mgr.operation.lock().await;
     let existing = state
         .db
         .get_certificate(id)
         .map_err(internal_err)?
         .ok_or_else(|| bad_req("Certificate not found"))?;
 
-    let inbounds = state.db.list_inbounds().unwrap_or_default();
+    let inbounds = state.db.list_inbounds().map_err(internal_err)?;
     let used_by = inbounds_referencing_cert(&inbounds, &existing.name);
     if !used_by.is_empty() {
         return Err(bad_req(format!(
@@ -1800,8 +1806,8 @@ async fn api_delete_cert(
     }
 
     state.db.delete_certificate(id).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        let _ = state.db.restore_certificate(&existing);
+    if let Err(e) = state.proc_mgr.reload_config_locked().await {
+        state.db.restore_certificate(&existing).map_err(internal_err)?;
         return Err(bad_req(e));
     }
     ok_json(true)
@@ -1904,7 +1910,6 @@ async fn api_save_rule_source(
     State(state): State<Arc<AppState>>,
     Json(mut g): Json<RuleSourceGroupRecord>,
 ) -> ApiResult {
-    let _operation = state.proc_mgr.operation.lock().await;
     if g.name.trim().is_empty() {
         return Err(bad_req("Rule source group name must not be empty"));
     }
@@ -1913,13 +1918,9 @@ async fn api_save_rule_source(
             "Rule source group must contain at least one URL or local file source",
         ));
     }
-    let previous = if g.id > 0 {
-        state.db.get_rule_source_group(g.id).map_err(internal_err)?
-    } else {
-        None
-    };
 
-    // For panel-managed remote URLs, download and cache before running `shoes check`
+    // Download and cache panel-managed remote URLs before taking the process operation lock
+    // so slow external downloads do not block inbound edits, Shoes lifecycle, watchdog, or quotas.
     if g.enable {
         let needs_panel_sync = g
             .items
@@ -1932,12 +1933,18 @@ async fn api_save_rule_source(
         }
     }
 
+    let _operation = state.proc_mgr.operation.lock().await;
+    let previous = if g.id > 0 {
+        state.db.get_rule_source_group(g.id).map_err(internal_err)?
+    } else {
+        None
+    };
     let saved = state.db.save_rule_source_group(g).map_err(bad_req)?;
     if let Err(e) = state.proc_mgr.reload_config_locked().await {
         if let Some(prev) = previous {
-            let _ = state.db.save_rule_source_group(prev);
+            state.db.save_rule_source_group(prev).map_err(internal_err)?;
         } else {
-            let _ = state.db.delete_rule_source_group(saved.id);
+            state.db.delete_rule_source_group(saved.id).map_err(internal_err)?;
         }
         return Err(bad_req(e));
     }
@@ -1948,22 +1955,48 @@ async fn api_sync_rule_source(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
-    let _operation = state.proc_mgr.operation.lock().await;
     let mut group = state
         .db
         .get_rule_source_group(id)
         .map_err(internal_err)?
         .ok_or_else(|| bad_req("Rule source group not found"))?;
+    let initial_sources: Vec<(String, String, String)> = group
+        .items
+        .iter()
+        .map(|i| (i.source_type.clone(), i.sync_mode.clone(), i.url.clone()))
+        .collect();
     let changed = sync_rule_source_group(&state.db.data_dir, &mut group)
         .await
         .map_err(bad_req)?;
+
+    let _operation = state.proc_mgr.operation.lock().await;
+    let Some(latest) = state.db.get_rule_source_group(id).map_err(internal_err)? else {
+        return Err(bad_req("Rule source group not found"));
+    };
+    let latest_sources: Vec<(String, String, String)> = latest
+        .items
+        .iter()
+        .map(|i| (i.source_type.clone(), i.sync_mode.clone(), i.url.clone()))
+        .collect();
+    if latest_sources != initial_sources {
+        return Err(bad_req(
+            "Rule source group was modified while syncing; please retry",
+        ));
+    }
     state
         .db
-        .update_rule_source_items(group.id, &group.items)
+        .update_rule_source_items(latest.id, &group.items)
         .map_err(internal_err)?;
-    if group.enable {
-        state.proc_mgr.reload_config_locked().await.map_err(bad_req)?;
+    if latest.enable {
+        if let Err(e) = state.proc_mgr.reload_config_locked().await {
+            state
+                .db
+                .update_rule_source_items(latest.id, &latest.items)
+                .map_err(internal_err)?;
+            return Err(bad_req(e));
+        }
     }
+    group.enable = latest.enable;
     ok_json(json!({ "group": group, "changed": changed }))
 }
 
@@ -2597,6 +2630,17 @@ async fn rejected_config_mutations_restore_original_rows_through_http() -> anyho
     let dir = tempfile::tempdir()?;
     let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
     let dns = db.save_dns_group(serde_json::from_value(json!({"name":"saved-dns"}))?)?;
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost".to_string()])?;
+    let cert_path = dir.path().join("certs").join("saved-cert.crt");
+    let key_path = dir.path().join("certs").join("saved-cert.key");
+    write_cert_and_key_atomic(&cert_path, &key_path, &cert_pem, &key_pem)?;
+    let cert = db.save_certificate(serde_json::from_value(json!({
+        "name": "saved-cert",
+        "cert_type": "files",
+        "cert_file": cert_path.to_string_lossy().replace('\\', "/"),
+        "key_file": key_path.to_string_lossy().replace('\\', "/"),
+        "domains": ["localhost"]
+    }))?)?;
     let ib = db.create_inbound(serde_json::from_value(json!({
         "protocol":"anytls","remark":"saved-inbound","port":21000,
         "clients":[{"name":"one","password":"one"},{"name":"two","password":"two"}]
@@ -2609,6 +2653,8 @@ async fn rejected_config_mutations_restore_original_rows_through_http() -> anyho
     let app = build_inner_router(state);
     for (method, path, body) in [
         ("DELETE", format!("/api/dns-groups/{}", dns.id), Value::Null),
+        ("DELETE", format!("/api/certificates/{}", cert.id), Value::Null),
+        ("POST", "/api/certificates/self-signed".to_owned(), json!({"name":"rejected-cert","domains":["localhost"]})),
         ("DELETE", format!("/api/clients/{}", ib.clients[0].id), Value::Null),
         ("POST", format!("/api/inbounds/{}/clients", ib.id), json!({"name":"new","password":"new"})),
         ("POST", "/api/inbounds/batch".to_owned(), json!({"action":"delete","ids":[ib.id]})),
@@ -2620,6 +2666,102 @@ async fn rejected_config_mutations_restore_original_rows_through_http() -> anyho
         assert_eq!(app.clone().oneshot(req).await?.status(), StatusCode::BAD_REQUEST);
         assert_eq!(serde_json::to_value(db.get_inbound(ib.id)?)?, serde_json::to_value(&ib)?);
         assert_eq!(serde_json::to_value(db.get_dns_group(dns.id)?)?, serde_json::to_value(&dns)?);
+        assert_eq!(serde_json::to_value(db.list_certificates()?)?, serde_json::to_value([&cert])?);
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn rule_source_remote_sync_does_not_hold_operation_lock() -> anyhow::Result<()> {
+    use crate::{db::Database, monitor::RuntimeMonitor, process::ShoesProcessManager};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+    db.set_setting_kv("shoes_bin_path", "")?;
+    let manager = ShoesProcessManager::new(db.clone());
+    let monitor = RuntimeMonitor::new(db.clone(), manager.clone());
+    let state = AppState::new(db.clone(), manager.clone(), monitor, &db.get_settings()?);
+    let token = state.sessions.create_session("admin", 1);
+    let app = build_inner_router(state);
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let s_flag = started.clone();
+    let r_flag = release.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rule_url = format!("http://{}/rules.txt", listener.local_addr()?);
+    let mock = Router::new().route(
+        "/rules.txt",
+        get(move || {
+            let s = s_flag.clone();
+            let r = r_flag.clone();
+            async move {
+                s.notify_one();
+                r.notified().await;
+                "+.example.com\n"
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await });
+
+    // 1. POST /api/rule-sources must not hold operation lock while downloading
+    let save_req = Request::builder()
+        .method("POST")
+        .uri("/api/rule-sources")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "name": "remote-test",
+                "enable": true,
+                "items": [{
+                    "source_type": "url",
+                    "sync_mode": "panel",
+                    "url": rule_url,
+                    "format": "mihomo_text"
+                }]
+            })
+            .to_string(),
+        ))?;
+    let save_task = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(save_req).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+    let guard = manager
+        .operation
+        .try_lock()
+        .expect("operation lock must not be held during rule source download on save");
+    drop(guard);
+    release.notify_one();
+    assert_eq!(save_task.await??.status(), StatusCode::OK);
+
+    let group_id = db.list_rule_source_groups()?[0].id;
+
+    // 2. POST /api/rule-sources/{id}/sync must not hold operation lock while downloading
+    let sync_req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/rule-sources/{group_id}/sync"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())?;
+    let sync_task = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(sync_req).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified()).await?;
+    let guard = manager
+        .operation
+        .try_lock()
+        .expect("operation lock must not be held during rule source download on sync");
+    drop(guard);
+    release.notify_one();
+    assert_eq!(sync_task.await??.status(), StatusCode::OK);
+
+    server.abort();
     Ok(())
 }
