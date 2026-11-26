@@ -99,6 +99,7 @@ export const api = {
   genMtlsClient: (cn = '') =>
     apiFetch(`/keygen/mtls-client${cn ? `?cn=${encodeURIComponent(cn)}` : ''}`),
   probeReality: (payload) => apiFetch('/tools/probe-reality', { method: 'POST', body: payload }),
+  probeEgress: (payload) => apiFetch('/tools/probe-egress', { method: 'POST', body: payload }),
 
   listCerts: () => apiFetch('/certificates'),
   acmeMeta: (directory_url = '') =>

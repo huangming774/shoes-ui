@@ -3014,3 +3014,156 @@ pub async fn sync_and_apply_config(db: &Database, shoes_pid: Option<u32>) -> Res
     let _ = shoes_pid;
     Ok(yaml)
 }
+
+/// Builds a minimal, isolated Shoes YAML configuration for ephemeral egress probing:
+/// binds a single authenticated loopback HTTP proxy (`127.0.0.1:<listen_port>`)
+/// and routes all destinations through `target_group_name` (optionally pinned to a single
+/// member and/or DNS IPv4/IPv6 strategy) without touching the live running Shoes instance.
+#[allow(clippy::too_many_arguments)]
+pub fn build_egress_probe_yaml(
+    listen_port: u16,
+    proxy_user: &str,
+    proxy_pass: &str,
+    target_group_name: &str,
+    member_override: Option<&str>,
+    ip_strategy_override: Option<&str>,
+    settings: &PanelSettings,
+    dns_groups: &[DnsGroupRecord],
+    outbound_groups: &[OutboundGroupRecord],
+) -> Result<String> {
+    let target_name = target_group_name.trim();
+    if target_name.is_empty() {
+        return Err(anyhow!("Target outbound group name must not be empty"));
+    }
+
+    let mut target_found = false;
+    let mut active_groups: Vec<OutboundGroupRecord> = Vec::new();
+    let mut group_names: HashSet<String> = HashSet::new();
+
+    for g in outbound_groups {
+        let is_target = g.name.trim() == target_name;
+        if !g.enable && !is_target {
+            continue;
+        }
+        let mut cloned = g.clone();
+        if is_target {
+            target_found = true;
+            if let Some(mname) = member_override.map(str::trim).filter(|s| !s.is_empty()) {
+                if !cloned.raw_chains_yaml.trim().is_empty() {
+                    if cloned.group_type == "selector" {
+                        cloned.default_member = mname.to_string();
+                    }
+                } else {
+                    let matched: Vec<_> = cloned
+                        .members
+                        .iter()
+                        .filter(|m| m.name.trim() == mname)
+                        .cloned()
+                        .collect();
+                    if matched.is_empty() {
+                        return Err(anyhow!(
+                            "Member '{mname}' not found in outbound group '{target_name}'"
+                        ));
+                    }
+                    cloned.members = matched;
+                    cloned.group_type = "selector".to_string();
+                    cloned.default_member = mname.to_string();
+                }
+            }
+        }
+        group_names.insert(cloned.name.trim().to_string());
+        active_groups.push(cloned);
+    }
+
+    if !target_found {
+        return Err(anyhow!("Outbound group '{target_name}' not found"));
+    }
+
+    let mut top_entries: Vec<Value> = Vec::new();
+    let enabled_dns_names: HashSet<String> = dns_groups
+        .iter()
+        .filter(|g| g.enable)
+        .map(|g| g.name.trim().to_string())
+        .collect();
+
+    // Global DNS settings (either forced IPv4/IPv6 strategy override, or inherited from panel settings)
+    if let Some(st) = ip_strategy_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let validated = validate_ip_strategy(st)?
+            .ok_or_else(|| anyhow!("Invalid ip_strategy override '{st}'"))?;
+        let mut sys = Mapping::new();
+        insert(&mut sys, "url", str_val("system"));
+        insert(&mut sys, "ip_strategy", str_val(validated));
+        let mut default_dns = Mapping::new();
+        insert(
+            &mut default_dns,
+            "servers",
+            Value::Sequence(vec![Value::Mapping(sys)]),
+        );
+        if !settings.core_global.default_dns_hosts.is_empty() {
+            let hosts_map = build_hosts_map(&settings.core_global.default_dns_hosts)?;
+            if !hosts_map.is_empty() {
+                insert(&mut default_dns, "hosts", Value::Mapping(hosts_map));
+            }
+        }
+        let mut gs = Mapping::new();
+        insert(&mut gs, "default_dns", Value::Mapping(default_dns));
+        let mut wrap = Mapping::new();
+        insert(&mut wrap, "global_settings", Value::Mapping(gs));
+        top_entries.push(Value::Mapping(wrap));
+    } else {
+        let mut dns_only = CoreGlobalSettings::default();
+        dns_only.default_dns_group = settings.core_global.default_dns_group.clone();
+        dns_only.default_dns_ip_strategy = settings.core_global.default_dns_ip_strategy.clone();
+        dns_only.default_dns_servers = settings.core_global.default_dns_servers.clone();
+        dns_only.default_dns_hosts = settings.core_global.default_dns_hosts.clone();
+        if let Some(gs_entry) = build_global_settings_entry(
+            Path::new("."),
+            &dns_only,
+            &enabled_dns_names,
+            &group_names,
+            false,
+        )? {
+            top_entries.push(gs_entry);
+        }
+    }
+
+    for g in &active_groups {
+        top_entries.push(build_outbound_group_entry(g)?);
+    }
+    if ip_strategy_override.map(str::trim).unwrap_or("").is_empty() {
+        for dg in dns_groups.iter().filter(|g| g.enable) {
+            top_entries.push(build_dns_group_entry(dg, &group_names)?);
+        }
+    }
+
+    // Ephemeral loopback HTTP proxy routing all destinations via target_name
+    let mut proto = Mapping::new();
+    insert(&mut proto, "type", str_val("http"));
+    if !proxy_user.is_empty() || !proxy_pass.is_empty() {
+        insert(&mut proto, "username", str_val(proxy_user));
+        insert(&mut proto, "password", str_val(proxy_pass));
+    }
+
+    let mut cond = Mapping::new();
+    insert(&mut cond, "any_destination", bool_val(true));
+    let mut rule = Mapping::new();
+    insert(&mut rule, "conditions", Value::Mapping(cond));
+    insert(&mut rule, "action", str_val("allow"));
+    insert(&mut rule, "client_chain", str_val(target_name));
+
+    let mut server = Mapping::new();
+    insert(
+        &mut server,
+        "address",
+        str_val(&format!("127.0.0.1:{listen_port}")),
+    );
+    insert(&mut server, "protocol", Value::Mapping(proto));
+    insert(&mut server, "rules", Value::Sequence(vec![Value::Mapping(rule)]));
+    top_entries.push(Value::Mapping(server));
+
+    let yaml = serde_yaml::to_string(&top_entries)?;
+    Ok(yaml)
+}

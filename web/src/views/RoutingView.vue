@@ -34,7 +34,10 @@
               </a-space>
             </template>
             <template v-else-if="column.key === 'actions'">
-              <a-space>
+              <a-space size="small">
+                <a-button size="small" type="primary" ghost @click="probeOutboundUnlock(record)">
+                  🔍 {{ t('routing.egressProbeBtn') }}
+                </a-button>
                 <a-button size="small" @click="openEditGroup(record)">{{ t('app.edit') }}</a-button>
                 <a-popconfirm :title="t('app.deleteConfirm')" @confirm="delGroup(record)">
                   <a-button size="small" danger>{{ t('app.delete') }}</a-button>
@@ -321,7 +324,233 @@
         </a-card>
       </a-tab-pane>
 
-      <!-- Tab 5: Full YAML Preview -->
+      <!-- Tab 5: VPS Egress Quality & Streaming / AI Unlock Diagnostics -->
+      <a-tab-pane key="egress" :tab="`🔍 ${t('routing.egressTab')}`">
+        <a-alert
+          type="info"
+          show-icon
+          :message="t('routing.egressTip')"
+          style="margin-bottom: 14px; font-size: 12px"
+        />
+
+        <a-card size="small" style="margin-bottom: 14px">
+          <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between">
+            <a-space wrap align="center">
+              <a-checkbox v-model:checked="egressOpts.includeDirectV4">Direct (IPv4)</a-checkbox>
+              <a-checkbox v-model:checked="egressOpts.includeDirectV6">Direct (IPv6)</a-checkbox>
+              <a-select
+                v-model:value="egressOpts.selectedGroups"
+                mode="multiple"
+                allow-clear
+                style="min-width: 240px"
+                :placeholder="t('routing.egressSelectGroups')"
+              >
+                <a-select-option v-for="g in groups" :key="g.name" :value="g.name">
+                  {{ g.name }}{{ g.enable ? '' : ' (OFF)' }}
+                </a-select-option>
+              </a-select>
+              <a-select
+                v-if="egressOpts.selectedGroups.length > 0"
+                v-model:value="egressOpts.groupIpVersion"
+                style="width: 135px"
+              >
+                <a-select-option value="auto">{{ t('routing.egressIpAuto') }}</a-select-option>
+                <a-select-option value="ipv4">IPv4 Only</a-select-option>
+                <a-select-option value="ipv6">IPv6 Only</a-select-option>
+              </a-select>
+            </a-space>
+
+            <a-space wrap>
+              <a-button type="primary" :loading="egressProbing" @click="runEgressProbe(false)">
+                🔍 {{ t('routing.egressRunBtn') }}
+              </a-button>
+              <a-button :loading="egressProbing" @click="runEgressProbe(true)">
+                ⚡ {{ t('routing.egressCompareAllBtn') }}
+              </a-button>
+              <a-button v-if="!hasWarpGroup" type="dashed" :loading="warpBusy" @click="openQuickWarpGroup">
+                ⚡ {{ t('routing.quickWarpBtn') }}
+              </a-button>
+            </a-space>
+          </div>
+        </a-card>
+
+        <div v-if="egressProbing && !egressReport" style="padding: 36px 0; text-align: center">
+          <a-spin size="large" :tip="t('routing.egressRunningTip')" />
+        </div>
+
+        <a-empty v-else-if="!egressReport" :description="t('routing.egressEmptyTip')" style="padding: 28px 0" />
+
+        <template v-else>
+          <!-- Closed-Loop Routing Recommendations Banner -->
+          <a-alert
+            v-if="(egressReport.recommendations || []).length > 0"
+            type="success"
+            show-icon
+            style="margin-bottom: 14px"
+            :message="t('routing.egressRecTitle')"
+          >
+            <template #description>
+              <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px">
+                <a-button
+                  v-for="rec in egressReport.recommendations"
+                  :key="`${rec.service}-${rec.best_group}`"
+                  size="small"
+                  type="primary"
+                  ghost
+                  @click="openRuleFromUnlock(rec.service, rec.best_group, rec.suggested_rule_source, rec.suggested_domains)"
+                >
+                  ➕ {{ t('routing.egressRouteVia', { service: rec.service_name, group: rec.best_group }) }}
+                  <span v-if="rec.best_region" style="opacity: 0.8"> ({{ rec.best_region }})</span>
+                </a-button>
+              </div>
+            </template>
+          </a-alert>
+
+          <a-alert
+            v-else-if="directHasBlockedServices && !hasWarpGroup"
+            type="warning"
+            show-icon
+            style="margin-bottom: 14px"
+            :message="t('routing.egressWarpSuggest')"
+          >
+            <template #action>
+              <a-button size="small" type="primary" :loading="warpBusy" @click="openQuickWarpGroup">
+                ⚡ {{ t('routing.quickWarpBtn') }}
+              </a-button>
+            </template>
+          </a-alert>
+
+          <!-- Egress IP & Network Quality Summary Cards -->
+          <a-row :gutter="[12, 12]" style="margin-bottom: 14px">
+            <a-col
+              v-for="rep in egressReport.reports || []"
+              :key="rep.target_id"
+              :xs="24"
+              :md="(egressReport.reports || []).length === 1 ? 24 : 12"
+              :lg="(egressReport.reports || []).length >= 3 ? 8 : 12"
+            >
+              <a-card size="small" style="height: 100%">
+                <template #title>
+                  <a-space size="small">
+                    <a-badge :status="rep.ok ? 'success' : 'error'" />
+                    <span>{{ rep.label }}</span>
+                    <a-tag
+                      v-if="rep.ip_info?.warp_status === 'on' || rep.ip_info?.warp_status === 'plus'"
+                      :color="rep.ip_info.warp_status === 'plus' ? 'purple' : 'orange'"
+                    >
+                      WARP {{ rep.ip_info.warp_status.toUpperCase() }}
+                    </a-tag>
+                  </a-space>
+                </template>
+                <template #extra>
+                  <span style="font-size: 11px; opacity: 0.65">{{ rep.elapsed_ms }}ms</span>
+                </template>
+
+                <a-alert
+                  v-if="!rep.ok && rep.error"
+                  type="error"
+                  show-icon
+                  :message="rep.error"
+                  style="font-size: 12px"
+                />
+                <div v-else style="font-size: 12px; display: flex; flex-direction: column; gap: 5px">
+                  <div>
+                    <span style="opacity: 0.65">IPv4: </span>
+                    <code v-if="rep.ip_info?.ipv4">{{ rep.ip_info.ipv4 }}</code>
+                    <span v-else style="opacity: 0.45">-</span>
+                    <a-tag v-if="rep.ip_info?.ipv4_latency_ms != null" size="small" style="margin-left: 6px">
+                      {{ rep.ip_info.ipv4_latency_ms }}ms
+                    </a-tag>
+                  </div>
+                  <div>
+                    <span style="opacity: 0.65">IPv6: </span>
+                    <code v-if="rep.ip_info?.ipv6" style="word-break: break-all">{{ rep.ip_info.ipv6 }}</code>
+                    <span v-else style="opacity: 0.45">-</span>
+                    <a-tag v-if="rep.ip_info?.ipv6_latency_ms != null" size="small" style="margin-left: 6px">
+                      {{ rep.ip_info.ipv6_latency_ms }}ms
+                    </a-tag>
+                  </div>
+                  <div>
+                    <span style="opacity: 0.65">{{ t('routing.egressLocation') }}: </span>
+                    <b>{{ [rep.ip_info?.country_code, rep.ip_info?.city || rep.ip_info?.country].filter(Boolean).join(' · ') || '-' }}</b>
+                    <a-tag v-if="rep.ip_info?.cf_colo" size="small" color="cyan" style="margin-left: 6px">
+                      CF {{ rep.ip_info.cf_colo }}
+                    </a-tag>
+                  </div>
+                  <div>
+                    <span style="opacity: 0.65">ASN / ISP: </span>
+                    <span>{{ [rep.ip_info?.asn, rep.ip_info?.org || rep.ip_info?.isp].filter(Boolean).join(' · ') || '-' }}</span>
+                  </div>
+                </div>
+              </a-card>
+            </a-col>
+          </a-row>
+
+          <!-- Streaming & AI Unlock Matrix -->
+          <a-table
+            :data-source="egressMatrixRows"
+            :columns="egressMatrixColumns"
+            :loading="egressProbing"
+            row-key="service"
+            size="small"
+            :pagination="false"
+            :scroll="(egressReport.reports || []).length > 2 ? { x: 760 } : { x: 560 }"
+          >
+            <template #bodyCell="{ column, record }">
+              <template v-if="column.key === 'service'">
+                <b>{{ record.name }}</b>
+              </template>
+
+              <template v-else-if="column.key === 'action'">
+                <a-button
+                  v-if="record.rec"
+                  size="small"
+                  type="primary"
+                  ghost
+                  @click="openRuleFromUnlock(record.service, record.rec.best_group, record.rec.suggested_rule_source, record.rec.suggested_domains)"
+                >
+                  ➕ → {{ record.rec.best_group }}
+                </a-button>
+                <a-button
+                  v-else-if="groups.length > 0"
+                  size="small"
+                  @click="openRuleFromService(record.service)"
+                >
+                  ➕ {{ t('routing.egressAddRuleShort') }}
+                </a-button>
+                <span v-else style="opacity: 0.45">-</span>
+              </template>
+
+              <template v-else-if="record.byTarget[column.key]">
+                <div>
+                  <a-tag :color="unlockStatusColor(record.byTarget[column.key].status)">
+                    {{ unlockStatusLabel(record.byTarget[column.key].status) }}
+                    <template v-if="record.byTarget[column.key].region">
+                      [{{ record.byTarget[column.key].region }}]
+                    </template>
+                  </a-tag>
+                </div>
+                <div style="font-size: 11px; opacity: 0.72; margin-top: 2px">
+                  {{ record.byTarget[column.key].detail }}
+                  <span v-if="record.byTarget[column.key].latency_ms != null">
+                    · {{ record.byTarget[column.key].latency_ms }}ms
+                  </span>
+                </div>
+              </template>
+
+              <template v-else>
+                <span style="opacity: 0.45">-</span>
+              </template>
+            </template>
+          </a-table>
+
+          <div style="margin-top: 8px; font-size: 11px; opacity: 0.65; text-align: right">
+            {{ t('routing.egressCheckedAt') }}: {{ formatTimestamp(egressReport.checked_at) }}
+          </div>
+        </template>
+      </a-tab-pane>
+
+      <!-- Tab 6: Full YAML Preview -->
       <a-tab-pane key="yaml" :tab="t('routing.yamlTab')">
         <div style="display: flex; justify-content: space-between; margin-bottom: 10px">
           <code>{{ previewPath }}</code>
@@ -1153,6 +1382,20 @@ const RULE_SOURCE_PRESETS = [
     format: 'srs',
   },
   {
+    name: 'geosite-disney',
+    label: 'Disney+ (.srs)',
+    remark: 'Disney+ streaming domains',
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/disney.srs',
+    format: 'srs',
+  },
+  {
+    name: 'geosite-youtube',
+    label: 'YouTube (.srs)',
+    remark: 'YouTube domains',
+    url: 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/youtube.srs',
+    format: 'srs',
+  },
+  {
     name: 'geosite-cn',
     label: 'GeoSite CN (.srs)',
     remark: 'China mainland domains',
@@ -1276,7 +1519,7 @@ const groupColumns = computed(() => [
   { title: t('routing.groupName'), dataIndex: 'name', key: 'name', width: 150 },
   { title: t('routing.groupType'), key: 'group_type', width: 120 },
   { title: t('routing.members'), key: 'members' },
-  { title: t('app.actions'), key: 'actions', width: 160 },
+  { title: t('app.actions'), key: 'actions', width: 245 },
 ]);
 
 const ruleSourceColumns = computed(() => [
@@ -1347,6 +1590,13 @@ async function loadAll() {
   ruleSources.value = rss;
   rules.value = rs;
   dnsGroups.value = dgs;
+  if (!egressOptsInitialized.value && gs.length > 0) {
+    const warp = gs.find((g) => g.enable && g.name.toLowerCase().includes('warp'));
+    const firstEnabled = gs.find((g) => g.enable);
+    if (warp) egressOpts.selectedGroups = [warp.name];
+    else if (firstEnabled) egressOpts.selectedGroups = [firstEnabled.name];
+    egressOptsInitialized.value = true;
+  }
   const map = cp?.proxies || {};
   liveGroups.value = Object.values(map).filter((p) => ['Selector', 'URLTest', 'LoadBalance'].includes(p.type));
   if (st?.settings) {
@@ -2144,5 +2394,194 @@ async function triggerReload() {
   } catch (e) {
     message.error(e.message);
   }
+}
+
+// ==================== VPS Egress Quality & Streaming / AI Unlock Diagnostics ====================
+
+const egressProbing = ref(false);
+const egressReport = ref(null);
+const egressOptsInitialized = ref(false);
+const egressOpts = reactive({
+  includeDirectV4: true,
+  includeDirectV6: true,
+  selectedGroups: [],
+  groupIpVersion: 'auto',
+});
+
+const SERVICE_ROUTING_META = {
+  chatgpt: {
+    name: 'ChatGPT / OpenAI',
+    priority: 20,
+    ruleSource: 'geosite-openai',
+    domains: ['openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com'],
+  },
+  claude: {
+    name: 'Claude / Anthropic',
+    priority: 22,
+    ruleSource: 'geosite-anthropic',
+    domains: ['anthropic.com', 'claude.ai'],
+  },
+  gemini: {
+    name: 'Google Gemini',
+    priority: 24,
+    ruleSource: 'geosite-google-gemini',
+    domains: ['gemini.google.com', 'generativelanguage.googleapis.com', 'aistudio.google.com'],
+  },
+  netflix: {
+    name: 'Netflix',
+    priority: 30,
+    ruleSource: 'geosite-netflix',
+    domains: ['netflix.com', 'nflxvideo.net', 'nflxso.net', 'nflximg.net'],
+  },
+  disney: {
+    name: 'Disney+',
+    priority: 32,
+    ruleSource: 'geosite-disney',
+    domains: ['disneyplus.com', 'disney-plus.net', 'bamgrid.com', 'dssott.com'],
+  },
+  youtube: {
+    name: 'YouTube Premium',
+    priority: 34,
+    ruleSource: 'geosite-youtube',
+    domains: ['youtube.com', 'googlevideo.com', 'ytimg.com', 'youtu.be'],
+  },
+};
+
+const hasWarpGroup = computed(() =>
+  groups.value.some(
+    (g) =>
+      g.name.toLowerCase().includes('warp') ||
+      (g.members || []).some((m) => m.protocol === 'wireguard')
+  )
+);
+
+const directHasBlockedServices = computed(() => {
+  const reports = egressReport.value?.reports || [];
+  return reports
+    .filter((r) => r.kind === 'direct' && r.ok)
+    .some((r) => (r.services || []).some((s) => s.status === 'blocked' || s.status === 'partial'));
+});
+
+const egressMatrixColumns = computed(() => {
+  const reps = egressReport.value?.reports || [];
+  const wide = reps.length > 2;
+  const cols = [
+    { title: t('routing.egressServiceCol'), key: 'service', width: 148, ...(wide ? { fixed: 'left' } : {}) },
+  ];
+  for (const r of reps) {
+    cols.push({ title: r.label, key: r.target_id, width: 175 });
+  }
+  cols.push({ title: t('app.actions'), key: 'action', width: 112, ...(wide ? { fixed: 'right' } : {}) });
+  return cols;
+});
+
+const egressMatrixRows = computed(() => {
+  const reps = egressReport.value?.reports || [];
+  const recs = egressReport.value?.recommendations || [];
+  const recMap = Object.fromEntries(recs.map((r) => [r.service, r]));
+  const order = ['chatgpt', 'claude', 'gemini', 'netflix', 'disney', 'youtube'];
+  return order.map((svc) => {
+    const byTarget = {};
+    let name = SERVICE_ROUTING_META[svc]?.name || svc;
+    for (const rep of reps) {
+      const found = (rep.services || []).find((s) => s.service === svc);
+      if (found) {
+        byTarget[rep.target_id] = found;
+        if (found.name) name = found.name;
+      }
+    }
+    return {
+      service: svc,
+      name,
+      byTarget,
+      rec: recMap[svc] || null,
+    };
+  });
+});
+
+function unlockStatusColor(status) {
+  if (status === 'unlocked') return 'success';
+  if (status === 'partial') return 'warning';
+  if (status === 'blocked') return 'error';
+  return 'default';
+}
+
+function unlockStatusLabel(status) {
+  if (status === 'unlocked') return t('routing.egressUnlocked');
+  if (status === 'partial') return t('routing.egressPartial');
+  if (status === 'blocked') return t('routing.egressBlocked');
+  return t('routing.egressError');
+}
+
+async function runEgressProbe(compareAll = false) {
+  egressProbing.value = true;
+  try {
+    let payload;
+    if (compareAll) {
+      payload = { compare_all: true, timeout_ms: 10000 };
+    } else {
+      const targets = [];
+      if (egressOpts.includeDirectV4) {
+        targets.push({ kind: 'direct', ip_version: 'ipv4' });
+      }
+      if (egressOpts.includeDirectV6) {
+        targets.push({ kind: 'direct', ip_version: 'ipv6' });
+      }
+      for (const gname of egressOpts.selectedGroups) {
+        targets.push({
+          kind: 'outbound_group',
+          group_name: gname,
+          ip_version: egressOpts.groupIpVersion || 'auto',
+        });
+      }
+      if (targets.length === 0) {
+        message.warning(t('routing.egressSelectTargetWarn'));
+        egressProbing.value = false;
+        return;
+      }
+      payload = { targets, timeout_ms: 10000 };
+    }
+    egressReport.value = await api.probeEgress(payload);
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    egressProbing.value = false;
+  }
+}
+
+async function probeOutboundUnlock(rec) {
+  activeTab.value = 'egress';
+  egressOpts.includeDirectV4 = true;
+  egressOpts.includeDirectV6 = false;
+  egressOpts.selectedGroups = [rec.name];
+  egressOptsInitialized.value = true;
+  await runEgressProbe(false);
+}
+
+function openRuleFromUnlock(service, targetGroup, suggestedRuleSource, suggestedDomains) {
+  const meta = SERVICE_ROUTING_META[service] || { name: service, priority: 30, ruleSource: '', domains: [] };
+  const rsName = suggestedRuleSource || meta.ruleSource;
+  const hasRs = rsName && ruleSources.value.some((r) => r.enable && r.name === rsName);
+  const domains = suggestedDomains?.length ? suggestedDomains : meta.domains;
+  Object.assign(ruleForm, {
+    id: 0,
+    priority: meta.priority,
+    enable: true,
+    remark: `${meta.name} → ${targetGroup}`,
+    match_type: hasRs ? 'rule_source_group' : 'domain_suffix',
+    match_value: hasRs ? rsName : domains.join(', '),
+    action: 'allow',
+    outbound: targetGroup,
+    no_resolve: false,
+    override_address: '',
+  });
+  ruleModalOpen.value = true;
+}
+
+function openRuleFromService(service) {
+  const warp = groups.value.find((g) => g.enable && g.name.toLowerCase().includes('warp'));
+  const target = warp?.name || groups.value.find((g) => g.enable)?.name || groups.value[0]?.name || 'direct';
+  const meta = SERVICE_ROUTING_META[service] || {};
+  openRuleFromUnlock(service, target, meta.ruleSource, meta.domains);
 }
 </script>

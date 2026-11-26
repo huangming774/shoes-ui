@@ -3,6 +3,7 @@ mod api;
 mod auth;
 mod crypto_util;
 mod db;
+mod egress_probe;
 mod models;
 mod monitor;
 mod ops_util;

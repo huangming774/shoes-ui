@@ -137,7 +137,8 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/keygen/vless-encryption", get(api_keygen_vless_encryption))
         .route("/keygen/mldsa65", get(api_keygen_mldsa65))
         .route("/keygen/mtls-client", get(api_keygen_mtls_client))
-        .route("/tools/probe-reality", post(api_probe_reality));
+        .route("/tools/probe-reality", post(api_probe_reality))
+        .route("/tools/probe-egress", post(api_probe_egress));
     let certs_api = Router::new()
         // Certificates
         .route(
@@ -1318,6 +1319,62 @@ async fn api_probe_reality(Json(req): Json<ProbeRealityReq>) -> ApiResult {
         "results": results,
         "candidates": DEFAULT_REALITY_CANDIDATES,
     }))
+}
+
+#[derive(Deserialize, Default)]
+struct ProbeEgressReq {
+    #[serde(default)]
+    targets: Vec<crate::egress_probe::EgressProbeTargetReq>,
+    #[serde(default)]
+    compare_all: bool,
+    #[serde(default)]
+    timeout_ms: u64,
+}
+
+async fn api_probe_egress(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ProbeEgressReq>,
+) -> ApiResult {
+    use crate::egress_probe::{probe_egress_batch, EgressProbeTargetReq};
+
+    let timeout_ms = if req.timeout_ms == 0 {
+        8000
+    } else {
+        req.timeout_ms.clamp(3500, 15_000)
+    };
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
+    let mut targets = req.targets;
+    if targets.is_empty() {
+        targets.push(EgressProbeTargetReq {
+            kind: "direct".to_string(),
+            group_name: String::new(),
+            member_name: String::new(),
+            ip_version: "ipv4".to_string(),
+        });
+        targets.push(EgressProbeTargetReq {
+            kind: "direct".to_string(),
+            group_name: String::new(),
+            member_name: String::new(),
+            ip_version: "ipv6".to_string(),
+        });
+        if req.compare_all {
+            let mut groups = state.db.list_outbound_groups().map_err(internal_err)?;
+            groups.retain(|g| g.enable);
+            groups.sort_by_key(|g| (!g.name.to_ascii_lowercase().contains("warp"), g.id));
+            for g in groups.into_iter().take(4) {
+                targets.push(EgressProbeTargetReq {
+                    kind: "outbound_group".to_string(),
+                    group_name: g.name,
+                    member_name: String::new(),
+                    ip_version: "auto".to_string(),
+                });
+            }
+        }
+    }
+
+    let report = probe_egress_batch(state.db.clone(), targets, timeout).await;
+    ok_json(report)
 }
 
 // ==================== Certificates ====================
@@ -2763,5 +2820,51 @@ async fn rule_source_remote_sync_does_not_hold_operation_lock() -> anyhow::Resul
     assert_eq!(sync_task.await??.status(), StatusCode::OK);
 
     server.abort();
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn egress_probe_http_endpoint_handles_unknown_group_gracefully() -> anyhow::Result<()> {
+    use crate::{db::Database, monitor::RuntimeMonitor, process::ShoesProcessManager};
+    use tower::ServiceExt;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir()?;
+    let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+    db.set_setting_kv("shoes_bin_path", "")?;
+    let manager = ShoesProcessManager::new(db.clone());
+    let monitor = RuntimeMonitor::new(db.clone(), manager.clone());
+    let state = AppState::new(db.clone(), manager, monitor, &db.get_settings()?);
+    let token = state.sessions.create_session("admin", 1);
+    let app = build_inner_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/tools/probe-egress")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "targets": [{
+                    "kind": "outbound_group",
+                    "group_name": "nonexistent-warp",
+                    "ip_version": "auto"
+                }],
+                "timeout_ms": 4000
+            })
+            .to_string(),
+        ))?;
+    let resp = app.oneshot(req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await?;
+    let body: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["reports"].as_array().map(|a| a.len()), Some(1));
+    assert_eq!(body["data"]["reports"][0]["ok"], false);
+    assert!(body["data"]["reports"][0]["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("shoes binary not found"));
     Ok(())
 }
