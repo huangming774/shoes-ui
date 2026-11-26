@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::db::Database;
 use crate::models::{
-    CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, OutboundMember, PanelSettings,
-    RoutingRuleRecord, DEFAULT_LETSENCRYPT_DIR,
+    CertificateRecord, ClientRecord, CoreGlobalSettings, DnsGroupRecord, DnsServerItem, Inbound,
+    OutboundGroupRecord, OutboundMember, PanelSettings, RoutingRuleRecord, RuleSourceGroupRecord,
+    DEFAULT_LETSENCRYPT_DIR,
 };
 
 fn str_val(s: &str) -> Value {
@@ -27,10 +28,25 @@ fn insert(map: &mut Mapping, k: &str, v: Value) {
     map.insert(str_val(k), v);
 }
 
+#[allow(dead_code)]
 pub fn build_shoes_yaml(
     data_dir: &Path,
     settings: &PanelSettings,
     certs: &[CertificateRecord],
+    groups: &[OutboundGroupRecord],
+    rules: &[RoutingRuleRecord],
+    inbounds: &[Inbound],
+) -> Result<String> {
+    build_shoes_yaml_full(data_dir, settings, certs, &[], &[], groups, rules, inbounds)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_shoes_yaml_full(
+    data_dir: &Path,
+    settings: &PanelSettings,
+    certs: &[CertificateRecord],
+    dns_groups: &[DnsGroupRecord],
+    rule_sources: &[RuleSourceGroupRecord],
     groups: &[OutboundGroupRecord],
     rules: &[RoutingRuleRecord],
     inbounds: &[Inbound],
@@ -61,6 +77,42 @@ pub fn build_shoes_yaml(
         top_entries.push(Value::Mapping(cache_map));
     }
 
+    // Collect enabled names first for cross-references
+    let enabled_group_names: HashSet<String> = groups
+        .iter()
+        .filter(|g| g.enable)
+        .map(|g| g.name.trim().to_string())
+        .collect();
+    let enabled_dns_names: HashSet<String> = dns_groups
+        .iter()
+        .filter(|g| g.enable)
+        .map(|g| g.name.trim().to_string())
+        .collect();
+    let enabled_rule_source_names: HashSet<String> = rule_sources
+        .iter()
+        .filter(|g| g.enable)
+        .map(|g| g.name.trim().to_string())
+        .collect();
+
+    // Check whether any enabled rule_source uses native Shoes remote mode on Unix
+    let has_native_remote_rules = rule_sources.iter().any(|g| {
+        g.enable
+            && g.items
+                .iter()
+                .any(|item| item.source_type == "url" && item.sync_mode == "shoes_native")
+    });
+
+    // 1b. Managed global_settings (limits, QUIC tuning, NTP, default_dns, rule_cache_dir)
+    if let Some(gs_entry) = build_global_settings_entry(
+        data_dir,
+        &settings.core_global,
+        &enabled_dns_names,
+        &enabled_group_names,
+        has_native_remote_rules,
+    )? {
+        top_entries.push(gs_entry);
+    }
+
     // Collect certificate sources actively referenced by enabled inbounds.
     let mut referenced_cert_sources = HashSet::new();
     for ib in inbounds.iter().filter(|i| i.enable) {
@@ -68,7 +120,7 @@ pub fn build_shoes_yaml(
             continue;
         }
         let has_enabled_clients = ib.clients.iter().any(|c| c.enable)
-            || matches!(ib.protocol.as_str(), "socks" | "http" | "mixed");
+            || matches!(ib.protocol.as_str(), "socks" | "http" | "mixed" | "portforward");
         if !has_enabled_clients {
             continue;
         }
@@ -102,17 +154,33 @@ pub fn build_shoes_yaml(
     }
 
     // 3. Outbound client_group entries
-    let mut enabled_group_names = HashSet::new();
     for g in groups.iter().filter(|g| g.enable) {
-        enabled_group_names.insert(g.name.trim().to_string());
         top_entries.push(build_outbound_group_entry(g)?);
+    }
+
+    // 3b. Managed dns_group entries
+    for dg in dns_groups.iter().filter(|g| g.enable) {
+        top_entries.push(build_dns_group_entry(dg, &enabled_group_names)?);
+    }
+
+    // 3c. Managed rule_source_group entries (GeoIP / GeoSite / SRS / MRS / YAML)
+    for rsg in rule_sources.iter().filter(|g| g.enable) {
+        top_entries.push(build_rule_source_group_entry(
+            data_dir,
+            rsg,
+            &enabled_group_names,
+        )?);
     }
 
     // 4. Shared routing rule_group (`panel-routing`) if enabled routing rules exist
     let enabled_rules: Vec<&RoutingRuleRecord> = rules.iter().filter(|r| r.enable).collect();
     let has_panel_routing = !enabled_rules.is_empty();
     if has_panel_routing {
-        top_entries.push(build_rule_group_entry(&enabled_rules, &enabled_group_names)?);
+        top_entries.push(build_rule_group_entry(
+            &enabled_rules,
+            &enabled_group_names,
+            &enabled_rule_source_names,
+        )?);
     }
 
     // 5. Enabled Inbound Server entries
@@ -122,6 +190,7 @@ pub fn build_shoes_yaml(
             ib,
             has_panel_routing,
             &enabled_group_names,
+            &enabled_dns_names,
             &acme_cert_names,
         )
         .with_context(|| format!("inbound '{}' (port {})", ib.remark, ib.port))?
@@ -401,11 +470,109 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
     if !m.name.trim().is_empty() {
         insert(&mut hop, "name", str_val(m.name.trim()));
     }
+    if !m.bind_interface.trim().is_empty() {
+        insert(&mut hop, "bind_interface", str_val(m.bind_interface.trim()));
+    }
 
     if m.protocol == "direct" {
         let mut p = Mapping::new();
         insert(&mut p, "type", str_val("direct"));
         insert(&mut hop, "protocol", Value::Mapping(p));
+    } else if m.protocol == "wireguard" {
+        if m.address.trim().is_empty() {
+            return Err(anyhow!(
+                "WireGuard outbound '{}' requires peer endpoint (host:port)",
+                m.name
+            ));
+        }
+        if m.wg_private_key.trim().is_empty() || m.wg_public_key.trim().is_empty() {
+            return Err(anyhow!(
+                "WireGuard outbound '{}' requires both private_key and peer public_key",
+                m.name
+            ));
+        }
+        let addrs: Vec<String> = m
+            .wg_addresses
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if addrs.is_empty() {
+            return Err(anyhow!(
+                "WireGuard outbound '{}' requires at least one tunnel interface address (e.g. 172.16.0.2/32)",
+                m.name
+            ));
+        }
+        if m.tls || m.h2mux.enabled {
+            return Err(anyhow!(
+                "WireGuard outbound '{}' cannot be wrapped with TLS or H2Mux",
+                m.name
+            ));
+        }
+
+        insert(&mut hop, "address", str_val(m.address.trim()));
+
+        let mut wg = Mapping::new();
+        insert(&mut wg, "type", str_val("wireguard"));
+        insert(&mut wg, "private_key", str_val(m.wg_private_key.trim()));
+        insert(&mut wg, "public_key", str_val(m.wg_public_key.trim()));
+        if !m.wg_preshared_key.trim().is_empty() {
+            insert(
+                &mut wg,
+                "pre_shared_key",
+                str_val(m.wg_preshared_key.trim()),
+            );
+        }
+        insert(
+            &mut wg,
+            "addresses",
+            Value::Sequence(addrs.into_iter().map(|s| str_val(&s)).collect()),
+        );
+        let allowed: Vec<String> = m
+            .wg_allowed_ips
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allowed = if allowed.is_empty() {
+            vec!["0.0.0.0/0".to_string(), "::/0".to_string()]
+        } else {
+            allowed
+        };
+        insert(
+            &mut wg,
+            "allowed_ips",
+            Value::Sequence(allowed.into_iter().map(|s| str_val(&s)).collect()),
+        );
+        if m.wg_mtu > 0 {
+            if !(1280..=1420).contains(&m.wg_mtu) {
+                return Err(anyhow!(
+                    "WireGuard outbound '{}' MTU must be between 1280 and 1420",
+                    m.name
+                ));
+            }
+            insert(&mut wg, "mtu", num_u64(m.wg_mtu as u64));
+        }
+        if m.wg_keepalive > 0 {
+            insert(
+                &mut wg,
+                "persistent_keepalive",
+                num_u64(m.wg_keepalive as u64),
+            );
+        }
+        if m.wg_tcp_buffer_size.is_some() || m.wg_tcp_memory_bytes.is_some() {
+            let mut rl = Mapping::new();
+            if let Some(buf) = m.wg_tcp_buffer_size.filter(|&v| v > 0) {
+                insert(&mut rl, "tcp_buffer_size", num_u64(buf as u64));
+            }
+            if let Some(mem) = m.wg_tcp_memory_bytes.filter(|&v| v > 0) {
+                insert(&mut rl, "tcp_memory_bytes", num_u64(mem));
+            }
+            if !rl.is_empty() {
+                insert(&mut wg, "resource_limits", Value::Mapping(rl));
+            }
+        }
+        insert(&mut hop, "protocol", Value::Mapping(wg));
     } else {
         if m.address.trim().is_empty() {
             return Err(anyhow!(
@@ -481,7 +648,28 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             ));
         }
 
-        let final_proto = if m.tls {
+        if m.shadowtls && m.tls {
+            return Err(anyhow!(
+                "Outbound member '{}' cannot enable both TLS and ShadowTLS at the same time",
+                m.name
+            ));
+        }
+        let final_proto = if m.shadowtls {
+            if m.shadowtls_password.trim().is_empty() {
+                return Err(anyhow!(
+                    "Outbound member '{}' with ShadowTLS v3 requires shadowtls_password",
+                    m.name
+                ));
+            }
+            let mut stls = Mapping::new();
+            insert(&mut stls, "type", str_val("shadowtls"));
+            insert(&mut stls, "password", str_val(m.shadowtls_password.trim()));
+            if !m.sni.trim().is_empty() {
+                insert(&mut stls, "sni_hostname", str_val(m.sni.trim()));
+            }
+            insert(&mut stls, "protocol", Value::Mapping(inner));
+            Value::Mapping(stls)
+        } else if m.tls {
             let mut tls_map = Mapping::new();
             insert(&mut tls_map, "type", str_val("tls"));
             insert(&mut tls_map, "verify", bool_val(m.verify));
@@ -500,6 +688,401 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
     Ok(Value::Mapping(wrapper))
 }
 
+fn validate_ip_strategy(s: &str) -> Result<Option<&'static str>> {
+    match s.trim() {
+        "" => Ok(None),
+        "ipv4_then_ipv6" => Ok(Some("ipv4_then_ipv6")),
+        "ipv6_then_ipv4" => Ok(Some("ipv6_then_ipv4")),
+        "ipv4_only" => Ok(Some("ipv4_only")),
+        "ipv6_only" => Ok(Some("ipv6_only")),
+        "ipv4_and_ipv6" => Ok(Some("ipv4_and_ipv6")),
+        other => Err(anyhow!(
+            "Unsupported DNS ip_strategy '{other}' (expected ipv4_then_ipv6, ipv6_then_ipv4, ipv4_only, ipv6_only, or ipv4_and_ipv6)"
+        )),
+    }
+}
+
+fn build_hosts_map(hosts: &std::collections::BTreeMap<String, Vec<String>>) -> Result<Mapping> {
+    let mut out = Mapping::new();
+    for (raw_host, raw_ips) in hosts {
+        let host = raw_host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            continue;
+        }
+        if host.contains('*') || host.parse::<IpAddr>().is_ok() {
+            return Err(anyhow!(
+                "Invalid static DNS host '{host}' (must be an exact ASCII/punycode hostname without wildcards)"
+            ));
+        }
+        let mut ips = Vec::new();
+        for raw_ip in raw_ips {
+            let trimmed = raw_ip.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed: IpAddr = trimmed.parse().with_context(|| {
+                format!("Invalid IP '{trimmed}' in static DNS host '{host}'")
+            })?;
+            if parsed.is_unspecified() {
+                return Err(anyhow!(
+                    "Static DNS host '{host}' cannot use unspecified IP '{trimmed}'"
+                ));
+            }
+            ips.push(str_val(trimmed));
+        }
+        if ips.is_empty() {
+            return Err(anyhow!(
+                "Static DNS host '{host}' must specify at least one valid IP address"
+            ));
+        }
+        insert(&mut out, &host, Value::Sequence(ips));
+    }
+    Ok(out)
+}
+
+fn build_dns_server_value(
+    item: &DnsServerItem,
+    group_names: &HashSet<String>,
+) -> Result<Value> {
+    let url = item.url.trim();
+    if url.is_empty() {
+        return Err(anyhow!("DNS server URL must not be empty"));
+    }
+    let is_system = url == "system";
+    if !is_system
+        && !url.starts_with("udp://")
+        && !url.starts_with("tcp://")
+        && !url.starts_with("tls://")
+        && !url.starts_with("https://")
+        && !url.starts_with("h3://")
+    {
+        return Err(anyhow!(
+            "Invalid DNS server URL '{url}' (expected system, udp://, tcp://, tls://, https://, or h3://)"
+        ));
+    }
+    let strategy = validate_ip_strategy(&item.ip_strategy)?;
+    let server_name = item.server_name.trim();
+    let bootstrap_url = item.bootstrap_url.trim();
+    let client_chain = item.client_chain.trim();
+
+    if !client_chain.is_empty() && !client_chain.eq_ignore_ascii_case("direct") {
+        if is_system || url.starts_with("udp://") || url.starts_with("h3://") {
+            return Err(anyhow!(
+                "DNS server '{url}': client_chain is only supported for tcp://, tls://, and https:// upstreams"
+            ));
+        }
+        if !group_names.contains(client_chain) {
+            return Err(anyhow!(
+                "DNS server '{url}' references unknown or disabled outbound group '{client_chain}'"
+            ));
+        }
+    }
+
+    let has_options = strategy.is_some()
+        || !server_name.is_empty()
+        || !bootstrap_url.is_empty()
+        || (!client_chain.is_empty() && !client_chain.eq_ignore_ascii_case("direct"))
+        || item.timeout_secs.is_some()
+        || item.connect_timeout_secs.is_some()
+        || item.attempts.is_some()
+        || (is_system && item.native_cache_secs.is_some());
+
+    if !has_options {
+        return Ok(str_val(url));
+    }
+
+    let mut m = Mapping::new();
+    insert(&mut m, "url", str_val(url));
+    if let Some(st) = strategy {
+        insert(&mut m, "ip_strategy", str_val(st));
+    }
+    if !server_name.is_empty() && !is_system {
+        insert(&mut m, "server_name", str_val(server_name));
+    }
+    if !bootstrap_url.is_empty() && !is_system {
+        insert(&mut m, "bootstrap_url", str_val(bootstrap_url));
+    }
+    if !client_chain.is_empty() && !client_chain.eq_ignore_ascii_case("direct") {
+        insert(&mut m, "client_chain", str_val(client_chain));
+    }
+    if let Some(t) = item.timeout_secs {
+        insert(&mut m, "timeout_secs", num_u64(t as u64));
+    }
+    if let Some(ct) = item.connect_timeout_secs {
+        insert(&mut m, "connect_timeout_secs", num_u64(ct as u64));
+    }
+    if let Some(att) = item.attempts.filter(|&v| v > 0) {
+        insert(&mut m, "attempts", num_u64(att as u64));
+    }
+    if is_system {
+        if let Some(nc) = item.native_cache_secs {
+            insert(&mut m, "native_cache_secs", num_u64(nc as u64));
+        }
+    }
+    Ok(Value::Mapping(m))
+}
+
+fn build_dns_group_entry(
+    g: &DnsGroupRecord,
+    group_names: &HashSet<String>,
+) -> Result<Value> {
+    let mut m = Mapping::new();
+    insert(&mut m, "dns_group", str_val(g.name.trim()));
+    if !g.hosts.is_empty() {
+        let hosts_map = build_hosts_map(&g.hosts)?;
+        if !hosts_map.is_empty() {
+            insert(&mut m, "hosts", Value::Mapping(hosts_map));
+        }
+    }
+    if g.servers.is_empty() {
+        insert(&mut m, "dns_servers", str_val("system"));
+    } else {
+        let mut seq = Vec::new();
+        for s in &g.servers {
+            seq.push(build_dns_server_value(s, group_names)?);
+        }
+        insert(&mut m, "dns_servers", Value::Sequence(seq));
+    }
+    Ok(Value::Mapping(m))
+}
+
+fn build_global_settings_entry(
+    data_dir: &Path,
+    cg: &CoreGlobalSettings,
+    dns_names: &HashSet<String>,
+    group_names: &HashSet<String>,
+    has_native_remote_rules: bool,
+) -> Result<Option<Value>> {
+    let mut gs = Mapping::new();
+
+    if let Some(v) = cg.max_connections.filter(|&v| v > 0) {
+        insert(&mut gs, "max_connections", num_u64(v));
+    }
+    if let Some(v) = cg.max_connections_per_ip.filter(|&v| v > 0) {
+        insert(&mut gs, "max_connections_per_ip", num_u64(v));
+    }
+    if let Some(v) = cg.max_streams.filter(|&v| v > 0) {
+        insert(&mut gs, "max_streams", num_u64(v));
+    }
+    if let Some(v) = cg.max_streams_per_connection.filter(|&v| v > 0) {
+        if v > 65_535 {
+            return Err(anyhow!(
+                "global_settings.max_streams_per_connection must be in 1..=65535"
+            ));
+        }
+        insert(&mut gs, "max_streams_per_connection", num_u64(v));
+    }
+    if let Some(v) = cg.max_udp_destinations.filter(|&v| v > 0) {
+        insert(&mut gs, "max_udp_destinations", num_u64(v));
+    }
+    if let Some(v) = cg.quic_memory_bytes.filter(|&v| v > 0) {
+        insert(&mut gs, "quic_memory_bytes", num_u64(v));
+    }
+
+    for (name, opt, min, max) in [
+        ("quic_receive_window", cg.quic_receive_window, 65_536u64, 64 << 20),
+        ("quic_send_window", cg.quic_send_window, 65_536u64, 64 << 20),
+        ("quic_stream_window", cg.quic_stream_window, 16_384u64, 64 << 20),
+        (
+            "quic_dns_memory_bytes",
+            cg.quic_dns_memory_bytes,
+            1 << 20,
+            1 << 30,
+        ),
+        ("quic_socket_buffer", cg.quic_socket_buffer, 65_536u64, 16 << 20),
+        ("reload_grace_secs", cg.reload_grace_secs, 0u64, 86_400),
+    ] {
+        if let Some(v) = opt {
+            if !(min..=max).contains(&v) {
+                return Err(anyhow!(
+                    "global_settings.{name} must be in {min}..={max}"
+                ));
+            }
+            insert(&mut gs, name, num_u64(v));
+        }
+    }
+
+    if cg.ntp_enabled {
+        let raw_server = cg.ntp_server.trim();
+        if raw_server.is_empty() {
+            return Err(anyhow!("NTP server address is required when NTP is enabled"));
+        }
+        let server = if raw_server.contains(':') {
+            raw_server.to_string()
+        } else {
+            format!("{raw_server}:123")
+        };
+        let mut ntp = Mapping::new();
+        insert(&mut ntp, "server", str_val(&server));
+        insert(
+            &mut ntp,
+            "interval_secs",
+            num_u64(cg.ntp_interval_secs.clamp(60, 86_400)),
+        );
+        insert(
+            &mut ntp,
+            "timeout_secs",
+            num_u64(cg.ntp_timeout_secs.clamp(1, 30)),
+        );
+        insert(&mut gs, "ntp", Value::Mapping(ntp));
+    }
+
+    // Default DNS
+    let mut default_dns = Mapping::new();
+    let dns_grp = cg.default_dns_group.trim();
+    if !dns_grp.is_empty() {
+        if !dns_names.contains(dns_grp) {
+            return Err(anyhow!(
+                "global_settings.default_dns references unknown or disabled DNS group '{dns_grp}'"
+            ));
+        }
+        insert(&mut default_dns, "servers", str_val(dns_grp));
+    } else if !cg.default_dns_servers.is_empty() {
+        let mut seq = Vec::new();
+        for s in &cg.default_dns_servers {
+            seq.push(build_dns_server_value(s, group_names)?);
+        }
+        insert(&mut default_dns, "servers", Value::Sequence(seq));
+    } else if let Some(st) = validate_ip_strategy(&cg.default_dns_ip_strategy)? {
+        let mut sys = Mapping::new();
+        insert(&mut sys, "url", str_val("system"));
+        insert(&mut sys, "ip_strategy", str_val(st));
+        insert(
+            &mut default_dns,
+            "servers",
+            Value::Sequence(vec![Value::Mapping(sys)]),
+        );
+    }
+    if !cg.default_dns_hosts.is_empty() {
+        let hosts_map = build_hosts_map(&cg.default_dns_hosts)?;
+        if !hosts_map.is_empty() {
+            insert(&mut default_dns, "hosts", Value::Mapping(hosts_map));
+        }
+    }
+    if !default_dns.is_empty() {
+        insert(&mut gs, "default_dns", Value::Mapping(default_dns));
+    }
+
+    // Optional native rule_cache_dir (Unix only in shoes)
+    let cache_dir_str = if !cg.rule_cache_dir.trim().is_empty() {
+        Some(cg.rule_cache_dir.trim().to_string())
+    } else if has_native_remote_rules && cfg!(unix) {
+        let dir = data_dir.join("rule-cache");
+        let _ = ensure_private_dir(&dir);
+        Some(
+            std::path::absolute(&dir)
+                .unwrap_or(dir)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        )
+    } else {
+        None
+    };
+    if let Some(dir) = cache_dir_str {
+        insert(&mut gs, "rule_cache_dir", str_val(&dir));
+    }
+
+    if gs.is_empty() {
+        Ok(None)
+    } else {
+        let mut wrapper = Mapping::new();
+        insert(&mut wrapper, "global_settings", Value::Mapping(gs));
+        Ok(Some(Value::Mapping(wrapper)))
+    }
+}
+
+fn build_rule_source_group_entry(
+    data_dir: &Path,
+    g: &RuleSourceGroupRecord,
+    group_names: &HashSet<String>,
+) -> Result<Value> {
+    if g.items.is_empty() {
+        return Err(anyhow!(
+            "Rule source group '{}' must contain at least one rule source item",
+            g.name
+        ));
+    }
+    let mut seq = Vec::new();
+    for (idx, item) in g.items.iter().enumerate() {
+        let mut rm = Mapping::new();
+        if item.source_type == "url" && item.sync_mode == "shoes_native" {
+            let url = item.url.trim();
+            if url.is_empty() {
+                return Err(anyhow!(
+                    "Rule source group '{}' item #{idx}: URL is required",
+                    g.name
+                ));
+            }
+            insert(&mut rm, "url", str_val(url));
+            if !item.update_interval.trim().is_empty() {
+                insert(&mut rm, "update_interval", str_val(item.update_interval.trim()));
+            }
+            let mut dl = Mapping::new();
+            let chain = item.download_chain.trim();
+            if chain.is_empty() || chain.eq_ignore_ascii_case("direct") {
+                insert(&mut dl, "client_chain", str_val("direct"));
+            } else if group_names.contains(chain) {
+                insert(&mut dl, "client_chain", str_val(chain));
+            } else {
+                return Err(anyhow!(
+                    "Rule source '{}' references unknown or disabled download outbound group '{chain}'",
+                    g.name
+                ));
+            }
+            let bs = if item.bootstrap_url.trim().is_empty() {
+                "system"
+            } else {
+                item.bootstrap_url.trim()
+            };
+            insert(&mut dl, "bootstrap_url", str_val(bs));
+            insert(&mut rm, "download", Value::Mapping(dl));
+        } else {
+            let path = if item.source_type == "local" {
+                item.path.trim().replace('\\', "/")
+            } else if !item.path.trim().is_empty() {
+                item.path.trim().replace('\\', "/")
+            } else {
+                crate::ops_util::managed_rule_file_path(data_dir, &g.name, idx, item)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
+            if path.is_empty() {
+                return Err(anyhow!(
+                    "Rule source group '{}' item #{idx}: local file path is empty (sync the remote URL first)",
+                    g.name
+                ));
+            }
+            insert(&mut rm, "path", str_val(&path));
+        }
+
+        if !item.format.trim().is_empty() && item.format.trim() != "auto" {
+            insert(&mut rm, "format", str_val(item.format.trim()));
+        }
+        if !item.behavior.trim().is_empty() {
+            insert(&mut rm, "behavior", str_val(item.behavior.trim()));
+        }
+        if !item.code.trim().is_empty() {
+            insert(&mut rm, "code", str_val(item.code.trim()));
+        }
+        let attrs: Vec<Value> = item
+            .attributes
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(str_val)
+            .collect();
+        if !attrs.is_empty() {
+            insert(&mut rm, "attributes", Value::Sequence(attrs));
+        }
+        seq.push(Value::Mapping(rm));
+    }
+
+    let mut out = Mapping::new();
+    insert(&mut out, "rule_source_group", str_val(g.name.trim()));
+    insert(&mut out, "rules", Value::Sequence(seq));
+    Ok(Value::Mapping(out))
+}
+
 fn split_items(s: &str) -> Vec<String> {
     s.split([',', '\n', ';'])
         .map(|part| part.trim().to_string())
@@ -510,6 +1093,7 @@ fn split_items(s: &str) -> Vec<String> {
 fn build_rule_group_entry(
     rules: &[&RoutingRuleRecord],
     group_names: &HashSet<String>,
+    rule_source_names: &HashSet<String>,
 ) -> Result<Value> {
     let mut seq = Vec::new();
     let mut has_catch_all = false;
@@ -530,7 +1114,22 @@ fn build_rule_group_entry(
                 insert(&mut cond, "any_destination", bool_val(true));
                 insert(&mut rm, "conditions", Value::Mapping(cond));
             }
-            "domain" => {
+            "rule_source_group" => {
+                let target = r.match_value.trim();
+                if target.is_empty() {
+                    continue;
+                }
+                if !rule_source_names.contains(target) {
+                    return Err(anyhow!(
+                        "Routing rule '{}' references unknown or disabled rule_source_group '{target}'",
+                        r.remark
+                    ));
+                }
+                let mut cond = Mapping::new();
+                insert(&mut cond, "rule_source_group", str_val(target));
+                insert(&mut rm, "conditions", Value::Mapping(cond));
+            }
+            "domain" | "domain_suffix" | "domain_keyword" | "ip_cidr" => {
                 let list = split_items(&r.match_value);
                 if list.is_empty() {
                     continue;
@@ -538,7 +1137,24 @@ fn build_rule_group_entry(
                 let mut cond = Mapping::new();
                 insert(
                     &mut cond,
-                    "domain",
+                    r.match_type.as_str(),
+                    Value::Sequence(list.into_iter().map(|v| str_val(&v)).collect()),
+                );
+                insert(&mut rm, "conditions", Value::Mapping(cond));
+            }
+            "network" => {
+                let list: Vec<String> = split_items(&r.match_value)
+                    .into_iter()
+                    .map(|v| v.to_ascii_lowercase())
+                    .filter(|v| matches!(v.as_str(), "tcp" | "udp"))
+                    .collect();
+                if list.is_empty() {
+                    continue;
+                }
+                let mut cond = Mapping::new();
+                insert(
+                    &mut cond,
+                    "network",
                     Value::Sequence(list.into_iter().map(|v| str_val(&v)).collect()),
                 );
                 insert(&mut rm, "conditions", Value::Mapping(cond));
@@ -589,10 +1205,21 @@ fn build_rule_group_entry(
             }
         }
 
+        if r.no_resolve {
+            insert(&mut rm, "no_resolve", bool_val(true));
+        }
+
         if r.action == "block" {
             insert(&mut rm, "action", str_val("block"));
         } else {
             insert(&mut rm, "action", str_val("allow"));
+            if !r.override_address.trim().is_empty() {
+                insert(
+                    &mut rm,
+                    "override_address",
+                    str_val(r.override_address.trim()),
+                );
+            }
             apply_outbound_to_rule(&mut rm, r.outbound.trim(), group_names)?;
         }
         seq.push(Value::Mapping(rm));
@@ -636,11 +1263,78 @@ fn apply_outbound_to_rule(
     Ok(())
 }
 
+/// Validates and normalizes an inbound port range string (e.g. `"20000-20100"` or `"20000,20010-20020"`),
+/// ensuring the primary `port` is included and total expanded ports stay within safe bounds.
+pub fn normalize_port_range_spec(port: u16, raw: &str) -> Result<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    let mut total_ports: usize = 0;
+    let mut includes_primary = false;
+
+    for token in trimmed.split([',', ';', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((a, b)) = token.split_once('-') {
+            let start: u16 = a
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid port range start in '{token}'"))?;
+            let end: u16 = b
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid port range end in '{token}'"))?;
+            if start == 0 || end == 0 || start > end {
+                return Err(anyhow!(
+                    "Invalid port range '{token}': ports must be in 1..=65535 with start <= end"
+                ));
+            }
+            let count = usize::from(end - start) + 1;
+            total_ports = total_ports.saturating_add(count);
+            if port >= start && port <= end {
+                includes_primary = true;
+            }
+            parts.push(if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            });
+        } else {
+            let p: u16 = token
+                .parse()
+                .with_context(|| format!("Invalid port number '{token}' in port_range"))?;
+            if p == 0 {
+                return Err(anyhow!("Port 0 is invalid in port_range"));
+            }
+            total_ports = total_ports.saturating_add(1);
+            if p == port {
+                includes_primary = true;
+            }
+            parts.push(p.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    if !includes_primary {
+        parts.insert(0, port.to_string());
+        total_ports = total_ports.saturating_add(1);
+    }
+    if total_ports > 2048 {
+        return Err(anyhow!(
+            "port_range expands to {total_ports} ports (maximum supported per inbound is 2048)"
+        ));
+    }
+    Ok(Some(parts.join(",")))
+}
+
 fn build_inbound_entry(
     data_dir: &Path,
     ib: &Inbound,
     has_panel_routing: bool,
     group_names: &HashSet<String>,
+    dns_names: &HashSet<String>,
     acme_cert_names: &HashSet<String>,
 ) -> Result<Option<Value>> {
     // Allow full raw YAML override for advanced power-user protocols
@@ -655,7 +1349,9 @@ fn build_inbound_entry(
     }
 
     let enabled_clients: Vec<&ClientRecord> = ib.clients.iter().filter(|c| c.enable).collect();
-    if enabled_clients.is_empty() && !matches!(ib.protocol.as_str(), "socks" | "http" | "mixed") {
+    if enabled_clients.is_empty()
+        && !matches!(ib.protocol.as_str(), "socks" | "http" | "mixed" | "portforward")
+    {
         // No enabled credentials -> do not open listener
         return Ok(None);
     }
@@ -663,6 +1359,7 @@ fn build_inbound_entry(
     let primary = enabled_clients.first().copied();
     let ps = &ib.protocol_settings;
     let ss = &ib.stream_settings;
+    let has_vless_enc = ib.has_vless_native_encryption();
 
     if ss.h2mux.enabled && ib.has_vless_vision() {
         return Err(anyhow!(
@@ -677,10 +1374,39 @@ fn build_inbound_entry(
             let c = primary.unwrap();
             insert(&mut inner, "type", str_val("vless"));
             insert(&mut inner, "user_id", str_val(c.uuid.trim()));
+            if has_vless_enc {
+                if !ps.fallback.trim().is_empty() {
+                    return Err(anyhow!(
+                        "VLESS native encryption (decryption) cannot be combined with fallback"
+                    ));
+                }
+                insert(&mut inner, "decryption", str_val(ps.vless_decryption.trim()));
+                if ps.vless_native_vision {
+                    insert(&mut inner, "vision", bool_val(true));
+                }
+            }
             insert(&mut inner, "udp_enabled", bool_val(ps.udp_enabled));
-            if !ps.fallback.trim().is_empty() {
+            if !has_vless_enc && !ps.fallback.trim().is_empty() {
                 insert(&mut inner, "fallback", str_val(ps.fallback.trim()));
             }
+        }
+        "portforward" => {
+            let targets: Vec<String> = ps
+                .forward_targets
+                .iter()
+                .flat_map(|s| split_items(s))
+                .collect();
+            if targets.is_empty() {
+                return Err(anyhow!(
+                    "PortForward inbound requires at least one target address (host:port)"
+                ));
+            }
+            insert(&mut inner, "type", str_val("portforward"));
+            insert(
+                &mut inner,
+                "targets",
+                Value::Sequence(targets.into_iter().map(|t| str_val(&t)).collect()),
+            );
         }
         "vmess" => {
             let c = primary.unwrap();
@@ -905,10 +1631,12 @@ fn build_inbound_entry(
     } else {
         ib.listen.trim()
     };
+    let port_spec = normalize_port_range_spec(ib.port, &ps.port_range)?
+        .unwrap_or_else(|| ib.port.to_string());
     let bind_addr = if bind_ip.contains(':') && !bind_ip.starts_with('[') {
-        format!("[{bind_ip}]:{}", ib.port)
+        format!("[{bind_ip}]:{port_spec}")
     } else {
-        format!("{bind_ip}:{}", ib.port)
+        format!("{bind_ip}:{port_spec}")
     };
     insert(&mut server, "address", str_val(&bind_addr));
     if ps.sniff {
@@ -961,7 +1689,7 @@ fn build_inbound_entry(
                 Value::Sequence(alpn.iter().map(|a| str_val(a)).collect()),
             );
         }
-        if ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision {
+        if ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision && !has_vless_enc {
             insert(&mut target, "vision", bool_val(true));
         }
         insert(&mut target, "protocol", transported);
@@ -1034,7 +1762,7 @@ fn build_inbound_entry(
         };
         insert(&mut rtarget, "short_ids", Value::Sequence(sids));
         insert(&mut rtarget, "dest", str_val(&dest));
-        if ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision {
+        if ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision && !has_vless_enc {
             insert(&mut rtarget, "vision", bool_val(true));
         }
         insert(&mut rtarget, "protocol", transported);
@@ -1044,6 +1772,54 @@ fn build_inbound_entry(
         let mut tls_outer = Mapping::new();
         insert(&mut tls_outer, "type", str_val("tls"));
         insert(&mut tls_outer, "reality_targets", Value::Mapping(targets));
+        insert(&mut server, "protocol", Value::Mapping(tls_outer));
+    } else if ss.security == "shadowtls" {
+        let st = &ss.shadowtls;
+        let sni = st.sni.trim();
+        if sni.is_empty() {
+            return Err(anyhow!("ShadowTLS v3 requires an SNI hostname"));
+        }
+        if st.password.trim().is_empty() {
+            return Err(anyhow!("ShadowTLS v3 requires a password"));
+        }
+        let mut handshake = Mapping::new();
+        if st.handshake_mode.trim() == "local" {
+            if st.cert_file.trim().is_empty() || st.key_file.trim().is_empty() {
+                return Err(anyhow!(
+                    "ShadowTLS v3 local handshake requires both cert_file and key_file"
+                ));
+            }
+            insert(
+                &mut handshake,
+                "cert",
+                str_val(&st.cert_file.trim().replace('\\', "/")),
+            );
+            insert(
+                &mut handshake,
+                "key",
+                str_val(&st.key_file.trim().replace('\\', "/")),
+            );
+        } else {
+            let raw_addr = if st.handshake_addr.trim().is_empty() {
+                format!("{sni}:443")
+            } else if st.handshake_addr.trim().contains(':') {
+                st.handshake_addr.trim().to_string()
+            } else {
+                format!("{}:443", st.handshake_addr.trim())
+            };
+            insert(&mut handshake, "address", str_val(&raw_addr));
+        }
+
+        let mut st_target = Mapping::new();
+        insert(&mut st_target, "password", str_val(st.password.trim()));
+        insert(&mut st_target, "handshake", Value::Mapping(handshake));
+        insert(&mut st_target, "protocol", transported);
+
+        let mut targets = Mapping::new();
+        insert(&mut targets, sni, Value::Mapping(st_target));
+        let mut tls_outer = Mapping::new();
+        insert(&mut tls_outer, "type", str_val("tls"));
+        insert(&mut tls_outer, "shadowtls_targets", Value::Mapping(targets));
         insert(&mut server, "protocol", Value::Mapping(tls_outer));
     } else {
         insert(&mut server, "protocol", transported);
@@ -1072,6 +1848,21 @@ fn build_inbound_entry(
         }
     } else if has_panel_routing {
         insert(&mut server, "rules", str_val("panel-routing"));
+    }
+
+    // 4b. Attach per-inbound DNS override if configured
+    let dref = ps.dns_group.trim();
+    if dref == "__system__" {
+        insert(&mut server, "dns", Value::Mapping(Mapping::new()));
+    } else if !dref.is_empty() {
+        if !dns_names.contains(dref) {
+            return Err(anyhow!(
+                "Inbound references unknown or disabled DNS group '{dref}'"
+            ));
+        }
+        let mut dm = Mapping::new();
+        insert(&mut dm, "servers", str_val(dref));
+        insert(&mut server, "dns", Value::Mapping(dm));
     }
 
     Ok(Some(Value::Mapping(server)))
@@ -1144,11 +1935,22 @@ fn ensure_auto_quic_cert(data_dir: &Path) -> Result<()> {
 /// Render and check the candidate without modifying the active configuration.
 pub async fn validated_config(db: &Database, settings: &PanelSettings) -> Result<String> {
     let certs = db.list_certificates()?;
+    let dns_groups = db.list_dns_groups()?;
+    let rule_sources = db.list_rule_source_groups()?;
     let groups = db.list_outbound_groups()?;
     let rules = db.list_routing_rules()?;
     let inbounds = db.list_inbounds()?;
 
-    let yaml = build_shoes_yaml(&db.data_dir, settings, &certs, &groups, &rules, &inbounds)?;
+    let yaml = build_shoes_yaml_full(
+        &db.data_dir,
+        settings,
+        &certs,
+        &dns_groups,
+        &rule_sources,
+        &groups,
+        &rules,
+        &inbounds,
+    )?;
 
     if inbounds.iter().any(|ib| ib.enable && ib.uses_auto_quic_cert()
         && ib.protocol_settings.raw_override_yaml.trim().is_empty()

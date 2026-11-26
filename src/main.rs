@@ -534,6 +534,7 @@ async fn main() -> Result<()> {
     let state = AppState::new(db.clone(), proc_mgr.clone(), monitor, &settings);
     acme_util::spawn_cert_maintenance_loop(state.clone());
     ops_util::spawn_auto_backup_loop(state.clone());
+    ops_util::spawn_rule_source_loop(state.clone());
 
     // Ensure initial shoes.config.yaml is generated and optionally auto-start shoes
     if let Err(e) = proc_mgr.reload_config().await {
@@ -1062,6 +1063,7 @@ mod tests {
                     tls: false,
                     sni: String::new(),
                     verify: true,
+                    ..Default::default()
                 }],
                 raw_chains_yaml: String::new(),
                 remark: String::new(),
@@ -1077,6 +1079,7 @@ mod tests {
                 match_value: "10.0.0.0/8, 192.168.0.0/16".to_string(),
                 action: "block".to_string(),
                 outbound: "direct".to_string(),
+                ..Default::default()
             })
             .unwrap();
 
@@ -2634,6 +2637,7 @@ mod tests {
                         max_streams: 0,
                         padding: true,
                     },
+                    ..Default::default()
                 },
                 OutboundMember {
                     name: "up-trojan".into(),
@@ -2653,6 +2657,7 @@ mod tests {
                         max_streams: 0,
                         padding: false,
                     },
+                    ..Default::default()
                 },
             ],
             raw_chains_yaml: String::new(),
@@ -2804,6 +2809,722 @@ mod tests {
         let _ = cli_child.kill().await;
         let _ = srv_child.kill().await;
         echo_task.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_limits_ntp_dns_hosts_and_remote_ruleset_pass_real_shoes_check() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+
+        // 1. Local mock HTTP server serving a valid sing-box JSON rule-set
+        let mock_app = axum::Router::new().route(
+            "/openai.json",
+            axum::routing::get(|| async {
+                r#"{"version":2,"rules":[{"domain_suffix":["openai.com","chatgpt.com"]}]}"#
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mock_addr = mock_listener.local_addr()?;
+        let mock_task = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_app).await;
+        });
+
+        // 2. Configure DNS group with DoH + IPv4-only strategy + static unlock hosts
+        let mut dns_hosts = std::collections::BTreeMap::new();
+        dns_hosts.insert(
+            "netflix.example".to_string(),
+            vec!["203.0.113.10".to_string(), "203.0.113.11".to_string()],
+        );
+        let dns_group = db.save_dns_group(models::DnsGroupRecord {
+            id: 0,
+            name: "cf-ipv4".to_string(),
+            enable: true,
+            servers: vec![models::DnsServerItem {
+                url: "https://1.1.1.1/dns-query".to_string(),
+                ip_strategy: "ipv4_only".to_string(),
+                server_name: "cloudflare-dns.com".to_string(),
+                bootstrap_url: "udp://1.1.1.1".to_string(),
+                client_chain: String::new(),
+                timeout_secs: Some(5),
+                connect_timeout_secs: Some(5),
+                attempts: Some(1),
+                native_cache_secs: None,
+            }],
+            hosts: dns_hosts,
+            remark: "Cloudflare DoH IPv4 only".to_string(),
+            created_at: 0,
+        })?;
+        assert_eq!(dns_group.name, "cf-ipv4");
+
+        // 3. Create & sync a panel-managed remote rule_source_group
+        let mut rsg = models::RuleSourceGroupRecord {
+            id: 0,
+            name: "geosite-openai".to_string(),
+            enable: true,
+            items: vec![models::RuleSourceItem {
+                source_type: "url".to_string(),
+                sync_mode: "panel".to_string(),
+                url: format!("http://{mock_addr}/openai.json"),
+                path: String::new(),
+                format: "singbox_json".to_string(),
+                behavior: String::new(),
+                code: String::new(),
+                attributes: Vec::new(),
+                update_interval: "24h".to_string(),
+                download_chain: "direct".to_string(),
+                bootstrap_url: "system".to_string(),
+                last_updated_at: 0,
+                file_size: 0,
+                last_error: String::new(),
+            }],
+            remark: "OpenAI rule set".to_string(),
+            created_at: 0,
+        };
+        let changed = ops_util::sync_rule_source_group(dir.path(), &mut rsg).await?;
+        assert!(changed);
+        assert!(rsg.items[0].file_size > 20);
+        assert!(std::path::Path::new(&rsg.items[0].path).is_file());
+        let saved_rsg = db.save_rule_source_group(rsg)?;
+        assert_eq!(saved_rsg.name, "geosite-openai");
+
+        // 4. Add routing rules referencing the rule_source_group + ip_cidr with no_resolve + domain_suffix
+        db.save_routing_rule(models::RoutingRuleRecord {
+            id: 0,
+            priority: 10,
+            enable: true,
+            remark: "Block private LAN".to_string(),
+            match_type: "ip_cidr".to_string(),
+            match_value: "10.0.0.0/8, 192.168.0.0/16".to_string(),
+            action: "block".to_string(),
+            outbound: "direct".to_string(),
+            no_resolve: true,
+            override_address: String::new(),
+        })?;
+        db.save_routing_rule(models::RoutingRuleRecord {
+            id: 0,
+            priority: 20,
+            enable: true,
+            remark: "Route OpenAI via rule set".to_string(),
+            match_type: "rule_source_group".to_string(),
+            match_value: "geosite-openai".to_string(),
+            action: "allow".to_string(),
+            outbound: "direct".to_string(),
+            no_resolve: false,
+            override_address: String::new(),
+        })?;
+
+        // 5. Configure global_settings (admission limits, QUIC memory/window, NTP, default_dns + global hosts)
+        let mut settings = db.get_settings()?;
+        settings.core_global = models::CoreGlobalSettings {
+            max_connections: Some(2048),
+            max_connections_per_ip: Some(64),
+            max_streams: Some(4096),
+            max_streams_per_connection: Some(256),
+            max_udp_destinations: Some(1024),
+            quic_memory_bytes: Some(256 * 1024 * 1024),
+            quic_receive_window: Some(4 * 1024 * 1024),
+            quic_send_window: Some(4 * 1024 * 1024),
+            quic_stream_window: Some(512 * 1024),
+            quic_dns_memory_bytes: None,
+            quic_socket_buffer: Some(8 * 1024 * 1024),
+            reload_grace_secs: Some(120),
+            ntp_enabled: true,
+            ntp_server: "time.cloudflare.com:123".to_string(),
+            ntp_interval_secs: 1800,
+            ntp_timeout_secs: 5,
+            default_dns_group: "cf-ipv4".to_string(),
+            default_dns_ip_strategy: String::new(),
+            default_dns_servers: Vec::new(),
+            default_dns_hosts: {
+                let mut h = std::collections::BTreeMap::new();
+                h.insert("unlock.example".to_string(), vec!["198.51.100.7".to_string()]);
+                h
+            },
+            rule_cache_dir: String::new(),
+        };
+        db.save_settings(&settings)?;
+
+        // 6. Add an inbound bound to the named DNS group
+        let mut ib = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "SOCKS-DNS-RuleSet".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39100,
+            protocol: "socks".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                dns_group: "cf-ipv4".to_string(),
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings::default(),
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        let client = db::default_client_for_inbound(&ib, 1);
+        ib.clients.push(client);
+        db.create_inbound(ib)?;
+
+        // 7. Validate full generated YAML with real shoes binary (`shoes check`)!
+        let reloaded = db.get_settings()?;
+        assert_eq!(reloaded.core_global.max_connections_per_ip, Some(64));
+        assert!(reloaded.core_global.ntp_enabled);
+        let yaml = yaml_gen::validated_config(&db, &reloaded).await?;
+        assert!(yaml.contains("max_connections_per_ip: 64"));
+        assert!(yaml.contains("quic_memory_bytes: 268435456"));
+        assert!(yaml.contains("time.cloudflare.com:123"));
+        assert!(yaml.contains("dns_group: cf-ipv4"));
+        assert!(yaml.contains("ip_strategy: ipv4_only"));
+        assert!(yaml.contains("unlock.example"));
+        assert!(yaml.contains("rule_source_group: geosite-openai"));
+        assert!(yaml.contains("no_resolve: true"));
+
+        mock_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn wireguard_conf_parser_keygen_and_yaml_schema() -> anyhow::Result<()> {
+        let (priv_k, pub_k, psk) = crypto_util::generate_wireguard_keypair();
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &priv_k)?.len(),
+            32
+        );
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &pub_k)?.len(),
+            32
+        );
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &psk)?.len(),
+            32
+        );
+
+        let conf = format!(
+            "[Interface]\nPrivateKey = {priv_k}\nAddress = 172.16.0.2/32, 2606:4700:110:8a36:df92:102a:9602:fa18/128\nMTU = 1280\n\n[Peer]\nPublicKey = {pub_k}\nPresharedKey = {psk}\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = engage.cloudflareclient.com:2408\nPersistentKeepalive = 25\n"
+        );
+        let parsed = ops_util::parse_wireguard_conf(&conf)?;
+        assert_eq!(parsed.address, "engage.cloudflareclient.com:2408");
+        assert_eq!(parsed.wg_private_key, priv_k);
+        assert_eq!(parsed.wg_public_key, pub_k);
+        assert_eq!(parsed.wg_preshared_key, psk);
+        assert_eq!(parsed.wg_addresses.len(), 2);
+        assert_eq!(parsed.wg_mtu, 1280);
+        assert_eq!(parsed.wg_keepalive, 25);
+
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let settings = db.get_settings()?;
+        let wg_group = models::OutboundGroupRecord {
+            id: 1,
+            name: "warp".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "warp-cf".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![models::OutboundMember {
+                name: "warp-cf".to_string(),
+                protocol: "wireguard".to_string(),
+                address: parsed.address,
+                uuid: String::new(),
+                username: String::new(),
+                password: String::new(),
+                cipher: String::new(),
+                tls: false,
+                sni: String::new(),
+                verify: true,
+                h2mux: models::H2MuxSettings::default(),
+                bind_interface: "eth0".to_string(),
+                wg_private_key: parsed.wg_private_key,
+                wg_public_key: parsed.wg_public_key,
+                wg_preshared_key: parsed.wg_preshared_key,
+                wg_addresses: parsed.wg_addresses,
+                wg_allowed_ips: parsed.wg_allowed_ips,
+                wg_mtu: parsed.wg_mtu,
+                wg_keepalive: parsed.wg_keepalive,
+                wg_tcp_buffer_size: Some(262_144),
+                wg_tcp_memory_bytes: Some(268_435_456),
+                ..Default::default()
+            }],
+            raw_chains_yaml: String::new(),
+            remark: "Cloudflare WARP".to_string(),
+        };
+
+        let yaml = yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &[],
+            &[],
+            &[],
+            &[wg_group],
+            &[],
+            &[],
+        )?;
+        assert!(yaml.contains("client_group: warp"));
+        assert!(yaml.contains("type: wireguard"));
+        assert!(yaml.contains("engage.cloudflareclient.com:2408"));
+        assert!(yaml.contains("bind_interface: eth0"));
+        assert!(yaml.contains("mtu: 1280"));
+        assert!(yaml.contains("persistent_keepalive: 25"));
+        assert!(yaml.contains("tcp_buffer_size: 262144"));
+        assert!(yaml.contains("tcp_memory_bytes: 268435456"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_completions_vless_enc_mldsa65_portrange_portforward_shadowtls_pass_real_shoes_check()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+        let settings = db.get_settings()?;
+        let shoes_bin = std::path::PathBuf::from(&settings.shoes_bin_path);
+        anyhow::ensure!(
+            shoes_bin.is_file(),
+            "shoes binary not found at {}",
+            shoes_bin.display()
+        );
+
+        // 1. Generate real VLESS native encryption credentials (ML-KEM-768, native, 0-RTT)
+        let enc_out = tokio::process::Command::new(&shoes_bin)
+            .args([
+                "generate-vless-encryption",
+                "--auth",
+                "mlkem768",
+                "--mode",
+                "native",
+                "--rtt",
+                "0rtt",
+                "--lifetime",
+                "600s",
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(enc_out.status.success(), "generate-vless-encryption failed");
+        let enc_stdout = String::from_utf8_lossy(&enc_out.stdout);
+        let mut vless_encryption = String::new();
+        let mut vless_decryption = String::new();
+        for line in enc_stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("encryption:") {
+                vless_encryption = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("decryption:") {
+                vless_decryption = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            }
+        }
+        assert!(vless_encryption.starts_with("mlkem768x25519plus."));
+        assert!(vless_decryption.starts_with("mlkem768x25519plus."));
+
+        // 2. Generate real ML-DSA-65 post-quantum REALITY keypair
+        let mldsa_out = tokio::process::Command::new(&shoes_bin)
+            .arg("generate-reality-mldsa65-keypair")
+            .output()
+            .await?;
+        anyhow::ensure!(
+            mldsa_out.status.success(),
+            "generate-reality-mldsa65-keypair failed"
+        );
+        let mldsa_stdout = String::from_utf8_lossy(&mldsa_out.stdout);
+        let mut mldsa65_seed = String::new();
+        let mut mldsa65_verify = String::new();
+        for line in mldsa_stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("mldsa65_seed:") {
+                mldsa65_seed = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("mldsa65_verify:") {
+                mldsa65_verify = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            }
+        }
+        assert!(!mldsa65_seed.is_empty());
+        assert!(!mldsa65_verify.is_empty());
+
+        // 3. Create self-signed certificate source for Hysteria2
+        let (cert_pem, key_pem) =
+            crypto_util::generate_self_signed_cert(&["localhost".to_string(), "127.0.0.1".to_string()])?;
+        let cert_path = dir.path().join("hy2-self.crt");
+        let key_path = dir.path().join("hy2-self.key");
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
+        db.save_certificate(models::CertificateRecord {
+            id: 0,
+            name: "hy2-self".to_string(),
+            cert_type: "files".to_string(),
+            domains: vec!["localhost".to_string()],
+            cert_file: cert_path.to_string_lossy().to_string(),
+            key_file: key_path.to_string_lossy().to_string(),
+            email: String::new(),
+            directory_url: String::new(),
+            terms_of_service: String::new(),
+            challenge_type: "http-01".to_string(),
+            http01_listen: String::new(),
+            remark: "Test self-signed".to_string(),
+            created_at: 0,
+        })?;
+
+        // 4. Create Outbound Group with ShadowTLS v3 wrapping Shadowsocks
+        db.save_outbound_group(models::OutboundGroupRecord {
+            id: 0,
+            name: "stls-relay".to_string(),
+            enable: true,
+            group_type: "selector".to_string(),
+            default_member: "hk-stls".to_string(),
+            test_url: "https://www.gstatic.com/generate_204".to_string(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![models::OutboundMember {
+                name: "hk-stls".to_string(),
+                protocol: "shadowsocks".to_string(),
+                address: "198.51.100.55:443".to_string(),
+                cipher: "aes-256-gcm".to_string(),
+                password: "ss-relay-password".to_string(),
+                shadowtls: true,
+                shadowtls_password: "stls-outbound-secret".to_string(),
+                sni: "www.microsoft.com".to_string(),
+                ..Default::default()
+            }],
+            raw_chains_yaml: String::new(),
+            remark: "ShadowTLS v3 relay".to_string(),
+        })?;
+
+        // 5a. VLESS + Native Encryption + Native Vision (plain TCP, no outer TLS)
+        let mut ib_vless_enc = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "VLESS-NativeEnc".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39201,
+            protocol: "vless".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                vless_decryption: vless_decryption.clone(),
+                vless_encryption: vless_encryption.clone(),
+                vless_native_vision: true,
+                udp_enabled: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "none".to_string(),
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        let c1 = db::default_client_for_inbound(&ib_vless_enc, 1);
+        ib_vless_enc.clients.push(c1);
+        let ib_vless_enc = db.create_inbound(ib_vless_enc)?;
+
+        // 5b. VLESS + REALITY + ML-DSA-65
+        let (rk_priv, rk_pub) = crypto_util::generate_reality_keypair();
+        let mut ib_mldsa = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "VLESS-REALITY-MLDSA65".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39202,
+            protocol: "vless".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                udp_enabled: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "reality".to_string(),
+                reality: models::RealitySettings {
+                    sni: "www.microsoft.com".to_string(),
+                    dest: "www.microsoft.com:443".to_string(),
+                    private_key: rk_priv,
+                    public_key: rk_pub,
+                    short_ids: vec!["0123456789abcdef".to_string()],
+                    vision: true,
+                    fingerprint: "chrome".to_string(),
+                    mldsa65_seed: mldsa65_seed.clone(),
+                    mldsa65_verify: mldsa65_verify.clone(),
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        let c2 = db::default_client_for_inbound(&ib_mldsa, 1);
+        ib_mldsa.clients.push(c2);
+        let ib_mldsa = db.create_inbound(ib_mldsa)?;
+
+        // 5c. Hysteria2 + Port Range Hopping
+        let mut ib_hy2 = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "HY2-Hopping".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39300,
+            protocol: "hysteria2".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                port_range: "39300-39305".to_string(),
+                udp_enabled: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "quic".to_string(),
+                security: "tls".to_string(),
+                tls: models::TlsSettings {
+                    sni: "localhost".to_string(),
+                    allow_any_sni: true,
+                    cert_mode: "source".to_string(),
+                    certificate_source: "hy2-self".to_string(),
+                    allow_insecure: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        let c3 = db::default_client_for_inbound(&ib_hy2, 1);
+        ib_hy2.clients.push(c3);
+        let ib_hy2 = db.create_inbound(ib_hy2)?;
+
+        // 5d. PortForward (multi-target round-robin routed via stls-relay, no clients)
+        let ib_pf = db.create_inbound(models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "PF-Relay".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39204,
+            protocol: "portforward".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                forward_targets: vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()],
+                rules_ref: "stls-relay".to_string(),
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "none".to_string(),
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        })?;
+
+        // 5e. Shadowsocks + ShadowTLS v3 (Remote Handshake)
+        let mut ib_stls = models::Inbound {
+            id: 0,
+            tag: String::new(),
+            remark: "SS-ShadowTLSv3".to_string(),
+            enable: true,
+            listen: "127.0.0.1".to_string(),
+            port: 39205,
+            protocol: "shadowsocks".to_string(),
+            protocol_settings: models::ProtocolSettings {
+                cipher: "aes-256-gcm".to_string(),
+                udp_enabled: true,
+                ..Default::default()
+            },
+            stream_settings: models::StreamSettings {
+                network: "tcp".to_string(),
+                security: "shadowtls".to_string(),
+                shadowtls: models::ShadowTlsSettings {
+                    sni: "www.microsoft.com".to_string(),
+                    password: "stls-inbound-secret".to_string(),
+                    handshake_mode: "remote".to_string(),
+                    handshake_addr: "www.microsoft.com:443".to_string(),
+                    cert_file: String::new(),
+                    key_file: String::new(),
+                },
+                ..Default::default()
+            },
+            up_bytes: 0,
+            down_bytes: 0,
+            total_quota_bytes: 0,
+            expiry_time: 0,
+            auto_reset_day: 0,
+            last_reset_month: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            clients: Vec::new(),
+        };
+        let c5 = db::default_client_for_inbound(&ib_stls, 1);
+        ib_stls.clients.push(c5);
+        let ib_stls = db.create_inbound(ib_stls)?;
+
+        // 6. Validate entire server YAML via real `shoes check`!
+        let yaml = yaml_gen::validated_config(&db, &settings).await?;
+        assert!(yaml.contains(&format!("decryption: {vless_decryption}")));
+        assert!(yaml.contains(&format!("mldsa65_seed: {mldsa65_seed}")));
+        assert!(yaml.contains("127.0.0.1:39300-39305"));
+        assert!(yaml.contains("type: portforward"));
+        assert!(yaml.contains("127.0.0.1:8080"));
+        assert!(yaml.contains("shadowtls_targets:"));
+        assert!(yaml.contains("stls-inbound-secret"));
+        assert!(yaml.contains("type: shadowtls"));
+        assert!(yaml.contains("stls-outbound-secret"));
+
+        // 7. Verify all 4 subscription export formats
+        let all_ibs = vec![ib_vless_enc.clone(), ib_mldsa.clone(), ib_hy2.clone(), ib_pf.clone(), ib_stls.clone()];
+        let certs = db.list_certificates()?;
+
+        // 7a. Per-node URIs & Shoes client YAML
+        let enc_share = sub_gen::build_client_share_info(&ib_vless_enc, &ib_vless_enc.clients[0], "example.com");
+        assert!(enc_share.uri.contains("encryption="), "missing encryption= in {}", enc_share.uri);
+        assert!(enc_share.uri.contains("flow=xtls-rprx-vision"), "missing native vision flow in {}", enc_share.uri);
+        assert!(enc_share.shoes_client_yaml.contains(&vless_encryption));
+        assert!(enc_share.shoes_client_yaml.contains("vision: true"));
+
+        let mldsa_share = sub_gen::build_client_share_info(&ib_mldsa, &ib_mldsa.clients[0], "example.com");
+        assert!(mldsa_share.uri.contains(&format!("pqv={mldsa65_verify}")), "missing pqv in {}", mldsa_share.uri);
+        assert!(mldsa_share.shoes_client_yaml.contains(&format!("mldsa65_verify: {mldsa65_verify}")));
+
+        let hy2_share = sub_gen::build_client_share_info(&ib_hy2, &ib_hy2.clients[0], "example.com");
+        assert!(hy2_share.uri.contains("mport=39300-39305"), "missing mport in {}", hy2_share.uri);
+        assert!(hy2_share.shoes_client_yaml.contains("hopping:"));
+        assert!(hy2_share.shoes_client_yaml.contains("39300-39305"));
+
+        let stls_share = sub_gen::build_client_share_info(&ib_stls, &ib_stls.clients[0], "example.com");
+        assert!(stls_share.uri.contains("plugin=shadow-tls"), "missing shadow-tls plugin in {}", stls_share.uri);
+        assert!(stls_share.shoes_client_yaml.contains("type: shadowtls"));
+        assert!(stls_share.shoes_client_yaml.contains("stls-inbound-secret"));
+
+        // 7b. Validate each exported Shoes client YAML directly with real `shoes check`!
+        for (label, snippet) in [
+            ("vless-native-enc", &enc_share.shoes_client_yaml),
+            ("vless-reality-mldsa65", &mldsa_share.shoes_client_yaml),
+            ("hy2-port-hopping", &hy2_share.shoes_client_yaml),
+            ("ss-shadowtls-v3", &stls_share.shoes_client_yaml),
+        ] {
+            let client_cfg_path = dir.path().join(format!("client_{label}.yaml"));
+            std::fs::write(&client_cfg_path, snippet)?;
+            let cli_check = tokio::process::Command::new(&shoes_bin)
+                .args(["check", &client_cfg_path.to_string_lossy()])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                cli_check.status.success(),
+                "shoes check rejected exported Shoes client config '{label}':\n{}\nYAML:\n{}",
+                String::from_utf8_lossy(&cli_check.stderr),
+                snippet
+            );
+        }
+
+        // 7c. Clash / Mihomo YAML export
+        let clash_yaml = sub_gen::generate_subscription_with_certs(
+            &all_ibs,
+            &certs,
+            "*",
+            "example.com",
+            sub_gen::SubFormat::ClashYaml,
+        )
+        .body;
+        assert!(clash_yaml.contains(&vless_encryption));
+        assert!(clash_yaml.contains("ports: 39300-39305"));
+        assert!(clash_yaml.contains("hop-interval: 30"));
+        assert!(clash_yaml.contains("plugin: shadow-tls"));
+        assert!(!clash_yaml.contains("PF-Relay"), "portforward must not be exported to Clash");
+
+        // 7d. sing-box JSON export
+        let sb_json: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_certs(
+                &all_ibs,
+                &certs,
+                "*",
+                "example.com",
+                sub_gen::SubFormat::SingBoxJson,
+            )
+            .body,
+        )?;
+        let outbounds = sb_json["outbounds"].as_array().unwrap();
+        assert!(
+            !outbounds.iter().any(|o| o["tag"].as_str().unwrap_or("").contains("VLESS-NativeEnc")),
+            "sing-box must omit VLESS native encryption"
+        );
+        assert!(
+            !outbounds.iter().any(|o| o["tag"].as_str().unwrap_or("").contains("PF-Relay")),
+            "sing-box must omit portforward"
+        );
+        let hy2_sb = outbounds.iter().find(|o| o["type"] == "hysteria2").unwrap();
+        assert_eq!(hy2_sb["server_ports"], serde_json::json!(["39300:39305"]));
+        assert_eq!(hy2_sb["hop_interval"], "30s");
+        let stls_detour = outbounds.iter().find(|o| o["type"] == "shadowtls").unwrap();
+        assert_eq!(stls_detour["version"], 3);
+        assert_eq!(stls_detour["password"], "stls-inbound-secret");
+        let ss_sb = outbounds.iter().find(|o| o["type"] == "shadowsocks").unwrap();
+        assert_eq!(ss_sb["detour"], stls_detour["tag"]);
+        assert!(ss_sb.get("server").is_none());
+
+        // 8. Negative guards
+        assert_eq!(
+            yaml_gen::normalize_port_range_spec(20000, "20010-20020")?,
+            Some("20000,20010-20020".to_string())
+        );
+        assert!(yaml_gen::normalize_port_range_spec(20000, "20000-25000").is_err());
+
+        let mut bad_fallback = ib_vless_enc.clone();
+        bad_fallback.protocol_settings.fallback = "127.0.0.1:80".to_string();
+        assert!(yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &certs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[bad_fallback],
+        )
+        .is_err());
+
+        let mut bad_mux = ib_vless_enc.clone();
+        bad_mux.stream_settings.h2mux.enabled = true;
+        assert!(yaml_gen::build_shoes_yaml_full(
+            dir.path(),
+            &settings,
+            &certs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[bad_mux],
+        )
+        .is_err());
 
         Ok(())
     }

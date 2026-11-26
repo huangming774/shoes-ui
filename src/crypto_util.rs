@@ -85,6 +85,27 @@ pub fn derive_reality_public_key(private_key_b64: &str) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(public.as_bytes()))
 }
 
+/// Generates a standard WireGuard Curve25519 keypair + optional pre-shared key
+/// encoded in standard padded Base64 (matching `wg genkey` / `wg pubkey` / `wg genpsk`).
+pub fn generate_wireguard_keypair() -> (String, String, String) {
+    let mut priv_bytes = [0u8; 32];
+    let mut psk_bytes = [0u8; 32];
+    let mut rng = rand::thread_rng();
+    rng.fill_bytes(&mut priv_bytes);
+    rng.fill_bytes(&mut psk_bytes);
+    priv_bytes[0] &= 248;
+    priv_bytes[31] &= 127;
+    priv_bytes[31] |= 64;
+
+    let secret = StaticSecret::from(priv_bytes);
+    let public = PublicKey::from(&secret);
+    (
+        STANDARD.encode(secret.to_bytes()),
+        STANDARD.encode(public.as_bytes()),
+        STANDARD.encode(psk_bytes),
+    )
+}
+
 pub fn generate_ss2022_password(cipher: &str) -> Result<String> {
     let key_len = match cipher {
         "2022-blake3-aes-128-gcm" => 16,

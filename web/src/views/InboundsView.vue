@@ -60,7 +60,13 @@
           <template v-else-if="column.key === 'remark'">
             <div style="font-weight: 600">{{ record.remark }}</div>
             <div style="font-size: 11px; opacity: 0.6">
-              <code>{{ record.tag }}</code> · {{ record.clients?.length || 0 }} client(s)
+              <code>{{ record.tag }}</code> ·
+              <template v-if="record.protocol === 'portforward'">
+                {{ (record.protocol_settings?.forward_targets || []).length }} target(s)
+              </template>
+              <template v-else>
+                {{ record.clients?.length || 0 }} client(s)
+              </template>
             </div>
           </template>
 
@@ -71,17 +77,39 @@
           </template>
 
           <template v-else-if="column.key === 'port'">
-            <a-tag color="default" style="font-family: monospace; font-size: 13px; font-weight: 600">
-              {{ record.port }}
-            </a-tag>
+            <div>
+              <a-tag color="default" style="font-family: monospace; font-size: 13px; font-weight: 600">
+                {{ record.port }}
+              </a-tag>
+              <div v-if="record.protocol_settings?.port_range?.trim()" style="margin-top: 3px">
+                <a-tag color="blue" style="font-family: monospace; font-size: 11px; margin: 0">
+                  ⇄ {{ record.protocol_settings.port_range.trim() }}
+                </a-tag>
+              </div>
+            </div>
           </template>
 
           <template v-else-if="column.key === 'transport'">
-            <a-space :size="4" wrap>
+            <a-space v-if="record.protocol === 'portforward'" :size="4" wrap>
+              <a-tag color="blue">FORWARD</a-tag>
+              <a-tag
+                v-for="(tgt, ti) in (record.protocol_settings?.forward_targets || []).slice(0, 2)"
+                :key="ti"
+                style="font-family: monospace; font-size: 11px"
+              >
+                → {{ tgt }}
+              </a-tag>
+              <a-tag v-if="(record.protocol_settings?.forward_targets || []).length > 2" color="default">
+                +{{ (record.protocol_settings?.forward_targets || []).length - 2 }}
+              </a-tag>
+            </a-space>
+            <a-space v-else :size="4" wrap>
               <a-tag>{{ transportLabel(record) }}</a-tag>
               <a-tag v-if="securityLabel(record)" :color="securityColor(record)">
                 {{ securityLabel(record) }}
               </a-tag>
+              <a-tag v-if="hasVlessNativeEnc(record)" color="volcano">VLESS-ENC</a-tag>
+              <a-tag v-if="hasMldsa65(record)" color="geekblue">ML-DSA-65</a-tag>
               <a-tag v-if="hasVision(record)" color="purple">Vision</a-tag>
               <a-tag v-if="hasH2Mux(record)" color="cyan">H2Mux</a-tag>
             </a-space>
@@ -128,7 +156,7 @@
 
           <template v-else-if="column.key === 'actions'">
             <a-space :size="6">
-              <a-tooltip :title="t('inbounds.qrShare')">
+              <a-tooltip v-if="record.protocol !== 'portforward'" :title="t('inbounds.qrShare')">
                 <a-button size="small" type="primary" ghost @click="openShare(record)">
                   QR
                 </a-button>
@@ -145,7 +173,7 @@
                 <a-button size="small">⋯</a-button>
                 <template #overlay>
                   <a-menu>
-                    <a-menu-item v-if="record.multi_user_supported" @click="openAddClient(record)">
+                    <a-menu-item v-if="record.multi_user_supported && record.protocol !== 'portforward'" @click="openAddClient(record)">
                       + {{ t('inbounds.addClient') }}
                     </a-menu-item>
                     <a-menu-item @click="handleResetTraffic(record)">
@@ -162,9 +190,28 @@
           </template>
         </template>
 
-        <!-- Expanded Second Layer: Clients Table -->
+        <!-- Expanded Second Layer: Clients Table / PortForward Targets -->
         <template #expandedRowRender="{ record }">
-          <div style="padding: 6px 12px">
+          <div v-if="record.protocol === 'portforward'" style="padding: 8px 14px">
+            <div style="font-size: 12px; opacity: 0.8; margin-bottom: 8px">
+              ℹ️ {{ t('inbounds.forwardTip') }}
+            </div>
+            <a-space wrap>
+              <span style="font-size: 12px; font-weight: 600">Targets:</span>
+              <a-tag
+                v-for="(tgt, ti) in record.protocol_settings?.forward_targets || []"
+                :key="ti"
+                color="geekblue"
+                style="font-family: monospace"
+              >
+                {{ tgt }}
+              </a-tag>
+              <a-tag v-if="record.protocol_settings?.rules_ref" color="purple">
+                Outbound: {{ record.protocol_settings.rules_ref }}
+              </a-tag>
+            </a-space>
+          </div>
+          <div v-else style="padding: 6px 12px">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px; flex-wrap: wrap">
               <span style="font-size: 12px; opacity: 0.78">
                 ℹ️ {{ record.multi_user_supported ? t('inbounds.multiUserHint') : t('inbounds.singleUserHint') }}
@@ -234,6 +281,7 @@
       :record="editingInbound"
       :certs="certs"
       :outbound-groups="outboundGroups"
+      :dns-groups="dnsGroups"
       @saved="loadData"
       @certs-changed="loadCerts"
     />
@@ -320,6 +368,7 @@ const loading = ref(false);
 const inbounds = ref([]);
 const certs = ref([]);
 const outboundGroups = ref([]);
+const dnsGroups = ref([]);
 const search = ref('');
 const protoFilter = ref('');
 
@@ -394,15 +443,17 @@ async function loadCerts() {
 async function loadData() {
   loading.value = true;
   try {
-    const [ibs, cs, gs, st] = await Promise.all([
+    const [ibs, cs, gs, dgs, st] = await Promise.all([
       api.listInbounds(),
       api.listCerts().catch(() => []),
       api.listOutboundGroups().catch(() => []),
+      api.listDnsGroups().catch(() => []),
       api.getSettings().catch(() => null),
     ]);
     inbounds.value = ibs;
     certs.value = cs;
     outboundGroups.value = gs;
+    dnsGroups.value = dgs;
     if (st?.effective_share_host) {
       currentShareHost.value = st.effective_share_host;
     } else if (ibs[0]?.share_host) {
@@ -432,11 +483,27 @@ function securityColor(ib) {
   const s = securityLabel(ib);
   if (s === 'REALITY') return 'gold';
   if (s === 'TLS') return 'green';
+  if (s === 'SHADOWTLS') return 'magenta';
   return 'default';
+}
+
+function hasVlessNativeEnc(ib) {
+  const dec = (ib.protocol_settings?.vless_decryption || '').trim();
+  return ib.protocol === 'vless' && Boolean(dec) && dec.toLowerCase() !== 'none';
+}
+
+function hasMldsa65(ib) {
+  return (
+    ib.stream_settings?.security === 'reality' &&
+    Boolean((ib.stream_settings?.reality?.mldsa65_seed || '').trim())
+  );
 }
 
 function hasVision(ib) {
   if (ib.protocol !== 'vless' || ib.stream_settings?.network !== 'tcp') return false;
+  if (hasVlessNativeEnc(ib)) {
+    return Boolean(ib.protocol_settings?.vless_native_vision);
+  }
   return (
     (ib.stream_settings?.security === 'reality' && ib.stream_settings?.reality?.vision) ||
     (ib.stream_settings?.security === 'tls' && ib.stream_settings?.tls?.vision)
@@ -448,6 +515,7 @@ function hasH2Mux(ib) {
   const p = ib.protocol;
   const net = ib.stream_settings?.network || 'tcp';
   const sec = ib.stream_settings?.security || 'none';
+  if (sec === 'shadowtls') return false;
   if (['vless', 'vmess', 'trojan'].includes(p)) return ['tcp', 'ws'].includes(net);
   if (p === 'shadowsocks') return net === 'tcp' && sec === 'none';
   return false;

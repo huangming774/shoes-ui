@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::crypto_util::{generate_random_alnum, generate_uuid, hash_password, verify_password};
 use crate::models::{
-    CertificateRecord, ClientRecord, Inbound, InboundTotals, OutboundGroupRecord, PanelSettings,
-    RoutingRuleRecord, StreamSettings, SubscriptionRecord,
+    CertificateRecord, ClientRecord, CoreGlobalSettings, DnsGroupRecord, Inbound, InboundTotals,
+    OutboundGroupRecord, PanelSettings, RoutingRuleRecord, RuleSourceGroupRecord, RuleSourceItem,
+    StreamSettings, SubscriptionRecord,
 };
 
 pub struct Database {
@@ -144,7 +145,28 @@ impl Database {
                 match_type TEXT NOT NULL,
                 match_value TEXT NOT NULL DEFAULT '',
                 action TEXT NOT NULL DEFAULT 'allow',
-                outbound TEXT NOT NULL DEFAULT 'direct'
+                outbound TEXT NOT NULL DEFAULT 'direct',
+                no_resolve INTEGER NOT NULL DEFAULT 0,
+                override_address TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS dns_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                enable INTEGER NOT NULL DEFAULT 1,
+                servers_json TEXT NOT NULL DEFAULT '[]',
+                hosts_json TEXT NOT NULL DEFAULT '{}',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rule_source_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                enable INTEGER NOT NULL DEFAULT 1,
+                items_json TEXT NOT NULL DEFAULT '[]',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -156,6 +178,27 @@ impl Database {
                 created_at INTEGER NOT NULL
             );",
         )?;
+
+        // Lightweight column migrations for older databases
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(routing_rules)")?;
+            let cols: std::collections::HashSet<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !cols.contains("no_resolve") {
+                conn.execute(
+                    "ALTER TABLE routing_rules ADD COLUMN no_resolve INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !cols.contains("override_address") {
+                conn.execute(
+                    "ALTER TABLE routing_rules ADD COLUMN override_address TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+        }
 
         // Seed default admin user (`admin` / `admin`) if users table is empty
         let user_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
@@ -209,6 +252,7 @@ impl Database {
                 ("tg_bot_token", ""),
                 ("tg_chat_id", ""),
                 ("tg_backup_enabled", "false"),
+                ("core_global_settings", "{}"),
             ] {
                 insert.execute(params![key, value])?;
             }
@@ -374,6 +418,10 @@ impl Database {
             tg_bot_token: map.remove("tg_bot_token").unwrap_or_default(),
             tg_chat_id: map.remove("tg_chat_id").unwrap_or_default(),
             tg_backup_enabled: map.remove("tg_backup_enabled").as_deref() == Some("true"),
+            core_global: map
+                .remove("core_global_settings")
+                .and_then(|raw| serde_json::from_str::<CoreGlobalSettings>(&raw).ok())
+                .unwrap_or_default(),
         };
         Ok(settings)
     }
@@ -508,6 +556,10 @@ impl Database {
             (
                 "tg_backup_enabled",
                 if s.tg_backup_enabled { "true" } else { "false" }.to_string(),
+            ),
+            (
+                "core_global_settings",
+                serde_json::to_string(&s.core_global).unwrap_or_else(|_| "{}".to_string()),
             ),
         ];
         for (k, v) in pairs {
@@ -1421,7 +1473,8 @@ impl Database {
     pub fn list_routing_rules(&self) -> Result<Vec<RoutingRuleRecord>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, priority, enable, remark, match_type, match_value, action, outbound
+            "SELECT id, priority, enable, remark, match_type, match_value, action, outbound,
+                    no_resolve, override_address
              FROM routing_rules ORDER BY priority ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1434,6 +1487,8 @@ impl Database {
                 match_value: r.get(5)?,
                 action: r.get(6)?,
                 outbound: r.get(7)?,
+                no_resolve: r.get::<_, i64>(8)? != 0,
+                override_address: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1445,8 +1500,9 @@ impl Database {
             conn.execute(
                 "UPDATE routing_rules SET
                     priority = ?1, enable = ?2, remark = ?3, match_type = ?4,
-                    match_value = ?5, action = ?6, outbound = ?7
-                 WHERE id = ?8",
+                    match_value = ?5, action = ?6, outbound = ?7, no_resolve = ?8,
+                    override_address = ?9
+                 WHERE id = ?10",
                 params![
                     r.priority,
                     if r.enable { 1 } else { 0 },
@@ -1455,6 +1511,8 @@ impl Database {
                     r.match_value.trim(),
                     r.action.trim(),
                     r.outbound.trim(),
+                    if r.no_resolve { 1 } else { 0 },
+                    r.override_address.trim(),
                     r.id
                 ],
             )?;
@@ -1462,8 +1520,9 @@ impl Database {
         } else {
             conn.execute(
                 "INSERT INTO routing_rules (
-                    priority, enable, remark, match_type, match_value, action, outbound
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    priority, enable, remark, match_type, match_value, action, outbound,
+                    no_resolve, override_address
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     r.priority,
                     if r.enable { 1 } else { 0 },
@@ -1471,7 +1530,9 @@ impl Database {
                     r.match_type.trim(),
                     r.match_value.trim(),
                     r.action.trim(),
-                    r.outbound.trim()
+                    r.outbound.trim(),
+                    if r.no_resolve { 1 } else { 0 },
+                    r.override_address.trim()
                 ],
             )?;
             conn.last_insert_rowid()
@@ -1486,6 +1547,171 @@ impl Database {
     pub fn delete_routing_rule(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM routing_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ==================== DNS Groups ====================
+
+    pub fn list_dns_groups(&self) -> Result<Vec<DnsGroupRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, enable, servers_json, hosts_json, remark, created_at
+             FROM dns_groups ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let s_str: String = r.get(3)?;
+            let h_str: String = r.get(4)?;
+            Ok(DnsGroupRecord {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                enable: r.get::<_, i64>(2)? != 0,
+                servers: serde_json::from_str(&s_str).unwrap_or_default(),
+                hosts: serde_json::from_str(&h_str).unwrap_or_default(),
+                remark: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn save_dns_group(&self, g: DnsGroupRecord) -> Result<DnsGroupRecord> {
+        let name = g.name.trim();
+        if name.is_empty() || name.eq_ignore_ascii_case("system") {
+            return Err(anyhow!(
+                "DNS group name must be non-empty and cannot be reserved name 'system'"
+            ));
+        }
+        let s_json = serde_json::to_string(&g.servers)?;
+        let h_json = serde_json::to_string(&g.hosts)?;
+        let now = Utc::now().timestamp_millis();
+        let conn = self.conn.lock();
+        let id = if g.id > 0 {
+            conn.execute(
+                "UPDATE dns_groups SET name = ?1, enable = ?2, servers_json = ?3, hosts_json = ?4, remark = ?5
+                 WHERE id = ?6",
+                params![
+                    name,
+                    if g.enable { 1 } else { 0 },
+                    s_json,
+                    h_json,
+                    g.remark.trim(),
+                    g.id
+                ],
+            )?;
+            g.id
+        } else {
+            conn.execute(
+                "INSERT INTO dns_groups (name, enable, servers_json, hosts_json, remark, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    name,
+                    if g.enable { 1 } else { 0 },
+                    s_json,
+                    h_json,
+                    g.remark.trim(),
+                    now
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+        drop(conn);
+        self.list_dns_groups()?
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| anyhow!("failed to reload DNS group"))
+    }
+
+    pub fn delete_dns_group(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM dns_groups WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ==================== Rule Source Groups (GeoIP / GeoSite / SRS / MRS) ====================
+
+    pub fn list_rule_source_groups(&self) -> Result<Vec<RuleSourceGroupRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, enable, items_json, remark, created_at
+             FROM rule_source_groups ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let items_str: String = r.get(3)?;
+            Ok(RuleSourceGroupRecord {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                enable: r.get::<_, i64>(2)? != 0,
+                items: serde_json::from_str(&items_str).unwrap_or_default(),
+                remark: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_rule_source_group(&self, id: i64) -> Result<Option<RuleSourceGroupRecord>> {
+        Ok(self
+            .list_rule_source_groups()?
+            .into_iter()
+            .find(|item| item.id == id))
+    }
+
+    pub fn save_rule_source_group(
+        &self,
+        g: RuleSourceGroupRecord,
+    ) -> Result<RuleSourceGroupRecord> {
+        let name = g.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Rule source group name must not be empty"));
+        }
+        let items_json = serde_json::to_string(&g.items)?;
+        let now = Utc::now().timestamp_millis();
+        let conn = self.conn.lock();
+        let id = if g.id > 0 {
+            conn.execute(
+                "UPDATE rule_source_groups SET name = ?1, enable = ?2, items_json = ?3, remark = ?4
+                 WHERE id = ?5",
+                params![
+                    name,
+                    if g.enable { 1 } else { 0 },
+                    items_json,
+                    g.remark.trim(),
+                    g.id
+                ],
+            )?;
+            g.id
+        } else {
+            conn.execute(
+                "INSERT INTO rule_source_groups (name, enable, items_json, remark, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    name,
+                    if g.enable { 1 } else { 0 },
+                    items_json,
+                    g.remark.trim(),
+                    now
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+        drop(conn);
+        self.get_rule_source_group(id)?
+            .ok_or_else(|| anyhow!("failed to reload rule source group"))
+    }
+
+    pub fn update_rule_source_items(&self, id: i64, items: &[RuleSourceItem]) -> Result<()> {
+        let items_json = serde_json::to_string(items)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE rule_source_groups SET items_json = ?1 WHERE id = ?2",
+            params![items_json, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_rule_source_group(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM rule_source_groups WHERE id = ?1", params![id])?;
         Ok(())
     }
 

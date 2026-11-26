@@ -86,9 +86,22 @@ impl Inbound {
             || self.stream_settings.network == "quic"
     }
 
-    pub fn has_vless_vision(&self) -> bool {
+    pub fn has_vless_native_encryption(&self) -> bool {
         self.protocol == "vless"
-            && self.stream_settings.network == "tcp"
+            && !matches!(
+                self.protocol_settings.vless_decryption.trim(),
+                "" | "none"
+            )
+    }
+
+    pub fn has_vless_vision(&self) -> bool {
+        if self.protocol != "vless" {
+            return false;
+        }
+        if self.has_vless_native_encryption() && self.protocol_settings.vless_native_vision {
+            return true;
+        }
+        self.stream_settings.network == "tcp"
             && ((self.stream_settings.security == "tls" && self.stream_settings.tls.vision)
                 || (self.stream_settings.security == "reality"
                     && self.stream_settings.reality.vision))
@@ -98,6 +111,9 @@ impl Inbound {
     /// QUIC / Hysteria2 / TUIC / AnyTLS / NaiveProxy / XHTTP already multiplex natively.
     pub fn supports_h2mux(&self) -> bool {
         let ss = &self.stream_settings;
+        if ss.security == "shadowtls" {
+            return false;
+        }
         match self.protocol.as_str() {
             "vless" => matches!(ss.network.as_str(), "tcp" | "ws") && !self.has_vless_vision(),
             "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
@@ -159,6 +175,18 @@ pub struct ProtocolSettings {
     #[serde(default)]
     pub rules_ref: String,
     #[serde(default)]
+    pub dns_group: String,
+    #[serde(default)]
+    pub vless_decryption: String,
+    #[serde(default)]
+    pub vless_encryption: String,
+    #[serde(default)]
+    pub vless_native_vision: bool,
+    #[serde(default)]
+    pub port_range: String,
+    #[serde(default)]
+    pub forward_targets: Vec<String>,
+    #[serde(default)]
     pub raw_override_yaml: String,
 }
 
@@ -173,6 +201,12 @@ impl Default for ProtocolSettings {
             padding_scheme: Vec::new(),
             sniff: false,
             rules_ref: String::new(),
+            dns_group: String::new(),
+            vless_decryption: String::new(),
+            vless_encryption: String::new(),
+            vless_native_vision: false,
+            port_range: String::new(),
+            forward_targets: Vec::new(),
             raw_override_yaml: String::new(),
         }
     }
@@ -223,6 +257,8 @@ pub struct StreamSettings {
     #[serde(default)]
     pub reality: RealitySettings,
     #[serde(default)]
+    pub shadowtls: ShadowTlsSettings,
+    #[serde(default)]
     pub ws: WsSettings,
     #[serde(default)]
     pub xhttp: XhttpSettings,
@@ -237,9 +273,43 @@ impl Default for StreamSettings {
             security: "none".to_string(),
             tls: TlsSettings::default(),
             reality: RealitySettings::default(),
+            shadowtls: ShadowTlsSettings::default(),
             ws: WsSettings::default(),
             xhttp: XhttpSettings::default(),
             h2mux: H2MuxSettings::default(),
+        }
+    }
+}
+
+fn default_shadowtls_mode() -> String {
+    "remote".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowTlsSettings {
+    #[serde(default = "default_reality_sni")]
+    pub sni: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_shadowtls_mode")]
+    pub handshake_mode: String, // "remote" | "local"
+    #[serde(default = "default_reality_dest")]
+    pub handshake_addr: String,
+    #[serde(default)]
+    pub cert_file: String,
+    #[serde(default)]
+    pub key_file: String,
+}
+
+impl Default for ShadowTlsSettings {
+    fn default() -> Self {
+        Self {
+            sni: default_reality_sni(),
+            password: String::new(),
+            handshake_mode: default_shadowtls_mode(),
+            handshake_addr: default_reality_dest(),
+            cert_file: String::new(),
+            key_file: String::new(),
         }
     }
 }
@@ -469,10 +539,10 @@ fn default_http01_listen() -> String {
     "0.0.0.0:80".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OutboundMember {
     pub name: String,
-    pub protocol: String, // "direct" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan" | "group"
+    pub protocol: String, // "direct" | "socks" | "http" | "shadowsocks" | "vless" | "vmess" | "trojan" | "wireguard" | "group"
     #[serde(default)]
     pub address: String,
     #[serde(default)]
@@ -486,11 +556,35 @@ pub struct OutboundMember {
     #[serde(default)]
     pub tls: bool,
     #[serde(default)]
+    pub shadowtls: bool,
+    #[serde(default)]
+    pub shadowtls_password: String,
+    #[serde(default)]
     pub sni: String,
     #[serde(default = "default_true")]
     pub verify: bool,
     #[serde(default)]
     pub h2mux: H2MuxSettings,
+    #[serde(default)]
+    pub bind_interface: String,
+    #[serde(default)]
+    pub wg_private_key: String,
+    #[serde(default)]
+    pub wg_public_key: String,
+    #[serde(default)]
+    pub wg_preshared_key: String,
+    #[serde(default)]
+    pub wg_addresses: Vec<String>,
+    #[serde(default)]
+    pub wg_allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub wg_mtu: u16,
+    #[serde(default)]
+    pub wg_keepalive: u16,
+    #[serde(default)]
+    pub wg_tcp_buffer_size: Option<u32>,
+    #[serde(default)]
+    pub wg_tcp_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,7 +634,7 @@ fn default_probe_tolerance() -> u64 {
     50
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingRuleRecord {
     #[serde(default)]
     pub id: i64,
@@ -550,13 +644,208 @@ pub struct RoutingRuleRecord {
     pub enable: bool,
     #[serde(default)]
     pub remark: String,
-    pub match_type: String, // "masks" | "domain" | "destination_port" | "udp_stun" | "any" | "raw_yaml"
+    pub match_type: String, // "masks" | "domain" | "domain_suffix" | "domain_keyword" | "ip_cidr" | "destination_port" | "network" | "udp_stun" | "rule_source_group" | "any" | "raw_yaml"
     #[serde(default)]
     pub match_value: String,
     #[serde(default = "default_rule_action")]
     pub action: String, // "allow" | "block"
     #[serde(default = "default_rule_outbound")]
     pub outbound: String, // "direct" | group_name
+    #[serde(default)]
+    pub no_resolve: bool,
+    #[serde(default)]
+    pub override_address: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DnsServerItem {
+    pub url: String,
+    #[serde(default)]
+    pub ip_strategy: String,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub bootstrap_url: String,
+    #[serde(default)]
+    pub client_chain: String,
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub attempts: Option<usize>,
+    #[serde(default)]
+    pub native_cache_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsGroupRecord {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub servers: Vec<DnsServerItem>,
+    #[serde(default)]
+    pub hosts: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub remark: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+fn default_rule_source_type() -> String {
+    "url".to_string()
+}
+
+fn default_rule_sync_mode() -> String {
+    "panel".to_string()
+}
+
+fn default_rule_update_interval() -> String {
+    "24h".to_string()
+}
+
+fn default_rule_download_chain() -> String {
+    "direct".to_string()
+}
+
+fn default_rule_bootstrap_url() -> String {
+    "system".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSourceItem {
+    #[serde(default = "default_rule_source_type")]
+    pub source_type: String, // "url" | "local"
+    #[serde(default = "default_rule_sync_mode")]
+    pub sync_mode: String, // "panel" | "shoes_native"
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub format: String, // "" | "srs" | "mrs" | "singbox_json" | "mihomo_yaml" | "mihomo_text" | "geosite_dat" | "geoip_dat"
+    #[serde(default)]
+    pub behavior: String, // "" | "domain" | "ipcidr" | "classical"
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub attributes: Vec<String>,
+    #[serde(default = "default_rule_update_interval")]
+    pub update_interval: String,
+    #[serde(default = "default_rule_download_chain")]
+    pub download_chain: String,
+    #[serde(default = "default_rule_bootstrap_url")]
+    pub bootstrap_url: String,
+    #[serde(default)]
+    pub last_updated_at: i64,
+    #[serde(default)]
+    pub file_size: u64,
+    #[serde(default)]
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSourceGroupRecord {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub items: Vec<RuleSourceItem>,
+    #[serde(default)]
+    pub remark: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+fn default_ntp_server() -> String {
+    "time.cloudflare.com:123".to_string()
+}
+
+fn default_ntp_interval_secs() -> u64 {
+    1800
+}
+
+fn default_ntp_timeout_secs() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreGlobalSettings {
+    #[serde(default)]
+    pub max_connections: Option<u64>,
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    #[serde(default)]
+    pub max_streams: Option<u64>,
+    #[serde(default)]
+    pub max_streams_per_connection: Option<u64>,
+    #[serde(default)]
+    pub max_udp_destinations: Option<u64>,
+    #[serde(default)]
+    pub quic_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub quic_receive_window: Option<u64>,
+    #[serde(default)]
+    pub quic_send_window: Option<u64>,
+    #[serde(default)]
+    pub quic_stream_window: Option<u64>,
+    #[serde(default)]
+    pub quic_dns_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub quic_socket_buffer: Option<u64>,
+    #[serde(default)]
+    pub reload_grace_secs: Option<u64>,
+    #[serde(default)]
+    pub ntp_enabled: bool,
+    #[serde(default = "default_ntp_server")]
+    pub ntp_server: String,
+    #[serde(default = "default_ntp_interval_secs")]
+    pub ntp_interval_secs: u64,
+    #[serde(default = "default_ntp_timeout_secs")]
+    pub ntp_timeout_secs: u64,
+    #[serde(default)]
+    pub default_dns_group: String,
+    #[serde(default)]
+    pub default_dns_ip_strategy: String,
+    #[serde(default)]
+    pub default_dns_servers: Vec<DnsServerItem>,
+    #[serde(default)]
+    pub default_dns_hosts: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub rule_cache_dir: String,
+}
+
+impl Default for CoreGlobalSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: None,
+            max_connections_per_ip: None,
+            max_streams: None,
+            max_streams_per_connection: None,
+            max_udp_destinations: None,
+            quic_memory_bytes: None,
+            quic_receive_window: None,
+            quic_send_window: None,
+            quic_stream_window: None,
+            quic_dns_memory_bytes: None,
+            quic_socket_buffer: None,
+            reload_grace_secs: None,
+            ntp_enabled: false,
+            ntp_server: default_ntp_server(),
+            ntp_interval_secs: default_ntp_interval_secs(),
+            ntp_timeout_secs: default_ntp_timeout_secs(),
+            default_dns_group: String::new(),
+            default_dns_ip_strategy: String::new(),
+            default_dns_servers: Vec::new(),
+            default_dns_hosts: BTreeMap::new(),
+            rule_cache_dir: String::new(),
+        }
+    }
 }
 
 fn default_rule_action() -> String {
@@ -616,6 +905,8 @@ pub struct PanelSettings {
     pub tg_chat_id: String,
     #[serde(default)]
     pub tg_backup_enabled: bool,
+    #[serde(default)]
+    pub core_global: CoreGlobalSettings,
 }
 
 impl PanelSettings {

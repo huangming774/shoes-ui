@@ -55,4 +55,5 @@ export const PROTOCOL_COLORS = {
   socks: 'blue',
   http: 'default',
   mixed: 'processing',
+  portforward: 'geekblue',
 };

@@ -32,6 +32,7 @@
               <a-select-option value="socks">SOCKS5</a-select-option>
               <a-select-option value="http">HTTP / HTTPS</a-select-option>
               <a-select-option value="mixed">Mixed (HTTP+SOCKS5)</a-select-option>
+              <a-select-option value="portforward">PortForward (TCP 转发)</a-select-option>
             </a-select>
           </a-form-item>
         </a-col>
@@ -76,7 +77,34 @@
         </a-col>
       </a-row>
 
+      <!-- Optional Port Range / Hysteria2 Port Hopping -->
+      <a-row v-if="form.protocol === 'hysteria2' || form.protocol === 'portforward' || form.protocol_settings.port_range" :gutter="12">
+        <a-col :span="24">
+          <a-form-item :label="t('inbounds.portRange')">
+            <a-input
+              v-model:value="form.protocol_settings.port_range"
+              placeholder="e.g. 20000-20100 or 20000,20010-20020 (Hysteria2 hopping auto-synced to subscriptions)"
+            />
+          </a-form-item>
+        </a-col>
+      </a-row>
+
+      <!-- PortForward Target Addresses -->
+      <div v-if="isPortForward" class="sub-box">
+        <div class="sub-box-title">PortForward</div>
+        <a-alert type="info" show-icon :message="t('inbounds.forwardTip')" style="margin-bottom: 10px; font-size: 12px" />
+        <a-form-item :label="t('inbounds.forwardTargets')" required>
+          <a-textarea
+            v-model:value="forwardTargetsStr"
+            :rows="3"
+            style="font-family: monospace; font-size: 12px"
+            placeholder="e.g. 198.51.100.10:443&#10;relay.example.com:8443"
+          />
+        </a-form-item>
+      </div>
+
       <!-- Primary Client Credentials -->
+      <template v-if="!isPortForward">
       <a-divider orientation="left" style="margin: 8px 0 12px">{{ t('inbounds.primaryClient') }}</a-divider>
       <a-row :gutter="12">
         <a-col :span="8">
@@ -141,8 +169,61 @@
           </a-form-item>
         </a-col>
       </a-row>
+      </template>
+
+      <!-- VLESS Native Encryption -->
+      <div v-if="form.protocol === 'vless'" class="sub-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px">
+          <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.vlessEncTitle') }}</span>
+          <a-space size="small" wrap>
+            <a-select v-model:value="vlessEncOpts.auth" size="small" style="width: 112px">
+              <a-select-option value="mlkem768">ML-KEM-768</a-select-option>
+              <a-select-option value="x25519">X25519</a-select-option>
+            </a-select>
+            <a-select v-model:value="vlessEncOpts.mode" size="small" style="width: 92px">
+              <a-select-option value="native">native</a-select-option>
+              <a-select-option value="xorpub">xorpub</a-select-option>
+              <a-select-option value="random">random</a-select-option>
+            </a-select>
+            <a-select v-model:value="vlessEncOpts.rtt" size="small" style="width: 72px">
+              <a-select-option value="0rtt">0rtt</a-select-option>
+              <a-select-option value="1rtt">1rtt</a-select-option>
+            </a-select>
+            <a-button size="small" type="primary" ghost :loading="vlessEncLoading" @click="genVlessEncKeys">
+              🔑 {{ t('inbounds.vlessEncGen') }}
+            </a-button>
+            <a-button v-if="hasVlessNativeEnc" size="small" danger type="text" @click="clearVlessEnc">
+              {{ t('inbounds.vlessEncClear') }}
+            </a-button>
+          </a-space>
+        </div>
+
+        <template v-if="hasVlessNativeEnc">
+          <a-alert type="info" show-icon :message="t('inbounds.vlessEncTip')" style="margin-bottom: 10px; font-size: 12px" />
+          <a-row :gutter="12">
+            <a-col :span="12">
+              <a-form-item :label="t('inbounds.vlessDecryption')">
+                <a-input v-model:value="form.protocol_settings.vless_decryption" size="small" style="font-family: monospace" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="12">
+              <a-form-item :label="t('inbounds.vlessEncryption')">
+                <a-input v-model:value="form.protocol_settings.vless_encryption" size="small" style="font-family: monospace" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+          <a-checkbox
+            v-model:checked="form.protocol_settings.vless_native_vision"
+            style="margin-bottom: 10px"
+            @change="(e) => onNativeVisionToggle(e.target.checked)"
+          >
+            {{ t('inbounds.vlessNativeVision') }}
+          </a-checkbox>
+        </template>
+      </div>
 
       <!-- Transport & Security -->
+      <template v-if="!isPortForward">
       <a-divider orientation="left" style="margin: 8px 0 12px">{{ t('inbounds.transport') }}</a-divider>
       <a-row :gutter="12">
         <a-col :span="12">
@@ -161,10 +242,11 @@
         </a-col>
         <a-col :span="12">
           <a-form-item :label="t('inbounds.security')">
-            <a-select v-model:value="form.stream_settings.security" :disabled="isQuicOuter">
+            <a-select v-model:value="form.stream_settings.security" :disabled="isQuicOuter" @change="onSecurityChange">
               <a-select-option v-if="!requiresTlsOrReality && !isQuicOuter" value="none">None</a-select-option>
               <a-select-option value="tls">TLS</a-select-option>
               <a-select-option v-if="supportsReality && !isQuicOuter" value="reality">REALITY</a-select-option>
+              <a-select-option v-if="supportsShadowTls && !isQuicOuter" value="shadowtls">ShadowTLS v3</a-select-option>
             </a-select>
           </a-form-item>
         </a-col>
@@ -290,7 +372,7 @@
               {{ t('inbounds.allowInsecure') }}
             </a-checkbox>
             <a-checkbox
-              v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp' && !isQuicOuter"
+              v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp' && !isQuicOuter && !hasVlessNativeEnc"
               v-model:checked="form.stream_settings.tls.vision"
               @change="(e) => onVisionToggle(e.target.checked)"
             >
@@ -302,11 +384,16 @@
 
       <!-- REALITY Settings -->
       <div v-if="!isQuicOuter && form.stream_settings.security === 'reality'" class="sub-box">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px">
           <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.realitySettings') }}</span>
-          <a-button size="small" type="primary" ghost @click="refreshRealityKeys">
-            🔑 {{ t('inbounds.genRealityKeys') }}
-          </a-button>
+          <a-space size="small">
+            <a-button size="small" type="primary" ghost @click="refreshRealityKeys">
+              🔑 {{ t('inbounds.genRealityKeys') }}
+            </a-button>
+            <a-button size="small" :loading="mldsaLoading" @click="genMldsaKeys">
+              🛡️ {{ t('inbounds.mldsa65Gen') }}
+            </a-button>
+          </a-space>
         </div>
 
         <a-row :gutter="12">
@@ -343,13 +430,77 @@
           </a-col>
           <a-col :span="10" style="display: flex; align-items: center; padding-top: 12px">
             <a-checkbox
-              v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp'"
+              v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp' && !hasVlessNativeEnc"
               v-model:checked="form.stream_settings.reality.vision"
               @change="(e) => onVisionToggle(e.target.checked)"
             >
               {{ t('inbounds.vision') }}
             </a-checkbox>
           </a-col>
+        </a-row>
+
+        <a-row :gutter="12">
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.mldsa65Seed')">
+              <a-input v-model:value="form.stream_settings.reality.mldsa65_seed" size="small" placeholder="optional 32-byte base64url seed" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.mldsa65Verify')">
+              <a-input v-model:value="form.stream_settings.reality.mldsa65_verify" size="small" placeholder="optional base64url verify key (pqv)" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+        <div v-if="form.stream_settings.reality.mldsa65_seed || form.stream_settings.reality.mldsa65_verify" style="font-size: 11px; opacity: 0.72; margin-bottom: 10px">
+          {{ t('inbounds.mldsa65Tip') }}
+        </div>
+      </div>
+
+      <!-- ShadowTLS v3 Settings -->
+      <div v-if="!isQuicOuter && form.stream_settings.security === 'shadowtls'" class="sub-box">
+        <div class="sub-box-title">{{ t('inbounds.shadowtlsSettings') }}</div>
+        <a-alert type="info" show-icon :message="t('inbounds.shadowtlsTip')" style="margin-bottom: 10px; font-size: 12px" />
+        <a-row :gutter="12">
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.sni')" required>
+              <a-input v-model:value="form.stream_settings.shadowtls.sni" placeholder="www.microsoft.com" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="12">
+            <a-form-item :label="t('inbounds.shadowtlsPassword')" required>
+              <a-input-group compact>
+                <a-input v-model:value="form.stream_settings.shadowtls.password" style="width: calc(100% - 92px)" />
+                <a-button style="width: 92px" @click="refreshShadowTlsPassword">{{ t('inbounds.genRandom') }}</a-button>
+              </a-input-group>
+            </a-form-item>
+          </a-col>
+        </a-row>
+        <a-row :gutter="12">
+          <a-col :span="10">
+            <a-form-item :label="t('inbounds.shadowtlsMode')">
+              <a-select v-model:value="form.stream_settings.shadowtls.handshake_mode">
+                <a-select-option value="remote">{{ t('inbounds.shadowtlsRemote') }}</a-select-option>
+                <a-select-option value="local">{{ t('inbounds.shadowtlsLocal') }}</a-select-option>
+              </a-select>
+            </a-form-item>
+          </a-col>
+          <a-col v-if="form.stream_settings.shadowtls.handshake_mode !== 'local'" :span="14">
+            <a-form-item :label="t('inbounds.shadowtlsHandshakeAddr')" required>
+              <a-input v-model:value="form.stream_settings.shadowtls.handshake_addr" placeholder="www.microsoft.com:443" />
+            </a-form-item>
+          </a-col>
+          <template v-else>
+            <a-col :span="7">
+              <a-form-item :label="t('inbounds.certFile')" required>
+                <a-input v-model:value="form.stream_settings.shadowtls.cert_file" placeholder="/path/to/fullchain.pem" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="7">
+              <a-form-item :label="t('inbounds.keyFile')" required>
+                <a-input v-model:value="form.stream_settings.shadowtls.key_file" placeholder="/path/to/privkey.pem" />
+              </a-form-item>
+            </a-col>
+          </template>
         </a-row>
       </div>
 
@@ -394,6 +545,7 @@
           </a-row>
         </template>
       </div>
+      </template>
 
       <!-- Advanced & Routing -->
       <a-collapse ghost style="margin-top: 8px">
@@ -416,7 +568,7 @@
             </a-col>
           </a-row>
           <a-row :gutter="12" style="margin-top: 12px">
-            <a-col :span="12">
+            <a-col :span="8">
               <a-form-item :label="t('inbounds.rulesRef')">
                 <a-select v-model:value="form.protocol_settings.rules_ref" allow-clear placeholder="Default (Global Routing)">
                   <a-select-option value="">Default (Follow Global Routing)</a-select-option>
@@ -428,7 +580,18 @@
                 </a-select>
               </a-form-item>
             </a-col>
-            <a-col :span="12">
+            <a-col :span="8">
+              <a-form-item :label="t('inbounds.dnsGroup')">
+                <a-select v-model:value="form.protocol_settings.dns_group" allow-clear placeholder="Default (Global DNS)">
+                  <a-select-option value="">Default (Global DNS)</a-select-option>
+                  <a-select-option value="__system__">System Resolver Only</a-select-option>
+                  <a-select-option v-for="dg in dnsGroups" :key="dg.name" :value="dg.name">
+                    DNS: {{ dg.name }}
+                  </a-select-option>
+                </a-select>
+              </a-form-item>
+            </a-col>
+            <a-col :span="8">
               <a-form-item :label="t('inbounds.fallback')">
                 <a-input v-model:value="form.protocol_settings.fallback" placeholder="127.0.0.1:80 or /var/www/html" />
               </a-form-item>
@@ -460,6 +623,7 @@ const props = defineProps({
   record: { type: Object, default: null },
   certs: { type: Array, default: () => [] },
   outboundGroups: { type: Array, default: () => [] },
+  dnsGroups: { type: Array, default: () => [] },
 });
 const emit = defineEmits(['update:open', 'saved', 'certsChanged']);
 const { t } = useI18n();
@@ -487,6 +651,12 @@ function blankInbound() {
       padding_scheme: [],
       sniff: false,
       rules_ref: '',
+      dns_group: '',
+      vless_decryption: '',
+      vless_encryption: '',
+      vless_native_vision: false,
+      port_range: '',
+      forward_targets: [],
       raw_override_yaml: '',
     },
     stream_settings: {
@@ -515,6 +685,14 @@ function blankInbound() {
         mldsa65_seed: '',
         mldsa65_verify: '',
       },
+      shadowtls: {
+        sni: 'www.microsoft.com',
+        password: '',
+        handshake_mode: 'remote',
+        handshake_addr: 'www.microsoft.com:443',
+        cert_file: '',
+        key_file: '',
+      },
       ws: { path: '/ws', host: '', headers: {}, max_early_data: 0, early_data_header_name: '' },
       xhttp: { path: '/xhttp', host: '', mode: 'auto', headers: {} },
       h2mux: { enabled: false, max_connections: 4, min_streams: 4, max_streams: 0, padding: false },
@@ -540,6 +718,10 @@ const quotaGb = ref(0);
 const expiryDayjs = ref(null);
 const alpnStr = ref('');
 const shortIdsStr = ref('0123456789abcdef');
+const forwardTargetsStr = ref('');
+const vlessEncLoading = ref(false);
+const mldsaLoading = ref(false);
+const vlessEncOpts = reactive({ auth: 'mlkem768', mode: 'native', rtt: '0rtt', lifetime: '600s' });
 
 const primaryClient = computed(() => {
   if (!form.clients || form.clients.length === 0) {
@@ -548,11 +730,20 @@ const primaryClient = computed(() => {
   return form.clients[0];
 });
 
+const isPortForward = computed(() => form.protocol === 'portforward');
+const hasVlessNativeEnc = computed(
+  () =>
+    form.protocol === 'vless' &&
+    Boolean(form.protocol_settings.vless_decryption && form.protocol_settings.vless_decryption.trim() !== 'none')
+);
 const isQuicProtocol = computed(() => ['hysteria2', 'tuic'].includes(form.protocol));
 const isQuicOuter = computed(() => isQuicProtocol.value || form.stream_settings.network === 'quic');
 const requiresTlsOrReality = computed(() => ['anytls', 'naiveproxy'].includes(form.protocol));
 const supportsReality = computed(() =>
   ['vless', 'trojan', 'anytls', 'naiveproxy', 'vmess', 'shadowsocks'].includes(form.protocol)
+);
+const supportsShadowTls = computed(() =>
+  ['shadowsocks', 'vless', 'vmess', 'trojan', 'socks', 'mixed'].includes(form.protocol)
 );
 const supportsWs = computed(() =>
   ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks'].includes(form.protocol)
@@ -562,6 +753,7 @@ const supportsH2Mux = computed(() => {
   const p = form.protocol;
   const net = form.stream_settings.network;
   const sec = form.stream_settings.security;
+  if (sec === 'shadowtls') return false;
   if (['vless', 'vmess', 'trojan'].includes(p)) {
     return ['tcp', 'ws'].includes(net);
   }
@@ -586,22 +778,26 @@ const compatInfo = computed(() => {
   const sec = isQuicOuter.value ? 'tls' : form.stream_settings.security;
   const cipher = (form.protocol_settings.cipher || '').trim().toLowerCase();
 
+  if (p === 'portforward') {
+    return { supported: ['Shoes'], omitted: [] };
+  }
+
   let mihomo = false;
   let singbox = false;
 
   if (p === 'vless') {
-    mihomo = ['tcp', 'ws', 'xhttp'].includes(net) && !(net === 'ws' && sec === 'reality');
-    singbox = ['tcp', 'ws', 'quic'].includes(net);
+    mihomo = sec !== 'shadowtls' && ['tcp', 'ws', 'xhttp'].includes(net) && !(net === 'ws' && sec === 'reality');
+    singbox = !hasVlessNativeEnc.value && ((sec === 'shadowtls' && net === 'tcp') || (sec !== 'shadowtls' && ['tcp', 'ws', 'quic'].includes(net)));
   } else if (p === 'vmess') {
     const okCipher = cipher !== 'none';
-    mihomo = okCipher && ['tcp', 'ws'].includes(net) && !(net === 'ws' && sec === 'reality');
-    singbox = okCipher && ['tcp', 'ws'].includes(net);
+    mihomo = okCipher && sec !== 'shadowtls' && ['tcp', 'ws'].includes(net) && !(net === 'ws' && sec === 'reality');
+    singbox = okCipher && ((sec === 'shadowtls' && net === 'tcp') || (sec !== 'shadowtls' && ['tcp', 'ws'].includes(net)));
   } else if (p === 'trojan') {
-    mihomo = ['tcp', 'ws'].includes(net) && sec !== 'none' && !(net === 'ws' && sec === 'reality');
-    singbox = ['tcp', 'ws'].includes(net);
+    mihomo = sec !== 'shadowtls' && ['tcp', 'ws'].includes(net) && sec !== 'none' && !(net === 'ws' && sec === 'reality');
+    singbox = (sec === 'shadowtls' && net === 'tcp') || (sec !== 'shadowtls' && ['tcp', 'ws'].includes(net));
   } else if (p === 'shadowsocks') {
-    mihomo = (net === 'tcp' && sec === 'none') || (net === 'ws' && ['none', 'tls'].includes(sec));
-    singbox = (net === 'tcp' && sec === 'none') || (net === 'ws' && sec === 'none')
+    mihomo = (net === 'tcp' && ['none', 'shadowtls'].includes(sec)) || (net === 'ws' && ['none', 'tls'].includes(sec));
+    singbox = (net === 'tcp' && ['none', 'shadowtls'].includes(sec)) || (net === 'ws' && sec === 'none')
       || (net === 'ws' && sec === 'tls' && !form.stream_settings.tls.allow_insecure);
   } else if (p === 'hysteria2' || p === 'tuic') {
     mihomo = true;
@@ -617,11 +813,11 @@ const compatInfo = computed(() => {
     mihomo = net === 'tcp' && sec === 'none' && ['aes-128-gcm', 'chacha20-ietf-poly1305'].includes(effCipher);
     singbox = false;
   } else if (p === 'socks') {
-    mihomo = net === 'tcp';
+    mihomo = net === 'tcp' && sec !== 'shadowtls';
     singbox = net === 'tcp' && sec === 'none';
   } else if (p === 'http' || p === 'mixed') {
-    mihomo = net === 'tcp';
-    singbox = net === 'tcp';
+    mihomo = net === 'tcp' && sec !== 'shadowtls';
+    singbox = net === 'tcp' && sec !== 'shadowtls';
   }
 
   const supported = ['Shoes'];
@@ -643,22 +839,34 @@ watch(
       const cloned = JSON.parse(JSON.stringify(props.record));
       const blank = blankInbound();
       Object.assign(form, blank, cloned);
+      form.protocol_settings = Object.assign(
+        {},
+        blank.protocol_settings,
+        cloned.protocol_settings || {}
+      );
       form.stream_settings.h2mux = Object.assign(
         {},
         blank.stream_settings.h2mux,
         cloned.stream_settings?.h2mux || {}
+      );
+      form.stream_settings.shadowtls = Object.assign(
+        {},
+        blank.stream_settings.shadowtls,
+        cloned.stream_settings?.shadowtls || {}
       );
       if (isQuicProtocol.value) selectAutoCertIfEmpty();
       quotaGb.value = form.total_quota_bytes > 0 ? +(form.total_quota_bytes / 1073741824).toFixed(2) : 0;
       expiryDayjs.value = form.expiry_time > 0 ? dayjs(form.expiry_time) : null;
       alpnStr.value = (form.stream_settings.tls.alpn || []).join(',');
       shortIdsStr.value = (form.stream_settings.reality.short_ids || []).join(',');
+      forwardTargetsStr.value = (form.protocol_settings.forward_targets || []).join('\n');
     } else {
       Object.assign(form, blankInbound());
       quotaGb.value = 0;
       expiryDayjs.value = null;
       alpnStr.value = '';
       shortIdsStr.value = '0123456789abcdef';
+      forwardTargetsStr.value = '';
       if (props.certs?.length > 0) {
         form.stream_settings.tls.certificate_source = props.certs[0].name;
         onCertSourceChange(props.certs[0].name);
@@ -720,6 +928,9 @@ async function onProtocolChange(proto) {
     primaryClient.value.username = '';
     primaryClient.value.password = '';
   }
+  if (!supportsH2Mux.value) {
+    form.stream_settings.h2mux.enabled = false;
+  }
 }
 
 function onNetworkChange(net) {
@@ -736,6 +947,7 @@ function onH2MuxToggle(enabled) {
     // VLESS Vision is mutually exclusive with H2Mux across Shoes, Mihomo, and sing-box.
     form.stream_settings.tls.vision = false;
     form.stream_settings.reality.vision = false;
+    form.protocol_settings.vless_native_vision = false;
   }
 }
 
@@ -743,6 +955,67 @@ function onVisionToggle(enabled) {
   if (enabled) {
     form.stream_settings.h2mux.enabled = false;
   }
+}
+
+function onNativeVisionToggle(enabled) {
+  if (enabled) {
+    form.stream_settings.h2mux.enabled = false;
+    form.stream_settings.tls.vision = false;
+    form.stream_settings.reality.vision = false;
+  }
+}
+
+async function onSecurityChange(sec) {
+  if (sec === 'shadowtls') {
+    form.stream_settings.h2mux.enabled = false;
+    if (!form.stream_settings.shadowtls.password) {
+      await refreshShadowTlsPassword();
+    }
+  }
+}
+
+async function genVlessEncKeys() {
+  vlessEncLoading.value = true;
+  try {
+    const res = await api.genVlessEncryption(vlessEncOpts);
+    form.protocol_settings.vless_decryption = res.decryption;
+    form.protocol_settings.vless_encryption = res.encryption;
+    form.protocol_settings.fallback = '';
+    form.stream_settings.tls.vision = false;
+    form.stream_settings.reality.vision = false;
+    message.success('Generated VLESS native encryption credentials');
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    vlessEncLoading.value = false;
+  }
+}
+
+function clearVlessEnc() {
+  form.protocol_settings.vless_decryption = '';
+  form.protocol_settings.vless_encryption = '';
+  form.protocol_settings.vless_native_vision = false;
+}
+
+async function genMldsaKeys() {
+  mldsaLoading.value = true;
+  try {
+    const res = await api.genMldsa65();
+    form.stream_settings.reality.mldsa65_seed = res.mldsa65_seed;
+    form.stream_settings.reality.mldsa65_verify = res.mldsa65_verify;
+    message.success('Generated ML-DSA-65 post-quantum keys');
+  } catch (e) {
+    message.error(e.message);
+  } finally {
+    mldsaLoading.value = false;
+  }
+}
+
+async function refreshShadowTlsPassword() {
+  try {
+    const { secret } = await api.genRandom(24);
+    form.stream_settings.shadowtls.password = secret;
+  } catch {}
 }
 
 function onCertSourceChange(certName) {
@@ -838,6 +1111,15 @@ async function handleSave() {
     payload.stream_settings.reality.short_ids = shortIdsStr.value
       .split(',')
       .map((s) => s.trim());
+    payload.protocol_settings.forward_targets = forwardTargetsStr.value
+      .split(/[\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (payload.protocol === 'portforward') {
+      payload.stream_settings.network = 'tcp';
+      payload.stream_settings.security = 'none';
+      payload.stream_settings.h2mux.enabled = false;
+    }
 
     if (isEdit.value) {
       await api.updateInbound(payload.id, payload);

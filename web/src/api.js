@@ -83,6 +83,14 @@ export const api = {
   genReality: () => apiFetch('/keygen/reality'),
   genSs2022: (cipher) => apiFetch(`/keygen/ss2022?cipher=${encodeURIComponent(cipher)}`),
   genRandom: (len = 20) => apiFetch(`/keygen/random?len=${len}`),
+  genWireguard: () => apiFetch('/keygen/wireguard'),
+  registerWarp: () => apiFetch('/keygen/warp', { method: 'POST' }),
+  parseWgConf: (conf) => apiFetch('/keygen/parse-wg-conf', { method: 'POST', body: { conf } }),
+  genVlessEncryption: ({ auth = 'mlkem768', mode = 'native', rtt = '0rtt', lifetime = '600s' } = {}) =>
+    apiFetch(
+      `/keygen/vless-encryption?auth=${encodeURIComponent(auth)}&mode=${encodeURIComponent(mode)}&rtt=${encodeURIComponent(rtt)}&lifetime=${encodeURIComponent(lifetime)}`
+    ),
+  genMldsa65: () => apiFetch('/keygen/mldsa65'),
 
   listCerts: () => apiFetch('/certificates'),
   acmeMeta: (directory_url = '') =>
@@ -100,6 +108,15 @@ export const api = {
   listOutboundGroups: () => apiFetch('/outbound-groups'),
   saveOutboundGroup: (payload) => apiFetch('/outbound-groups', { method: 'POST', body: payload }),
   deleteOutboundGroup: (id) => apiFetch(`/outbound-groups/${id}`, { method: 'DELETE' }),
+
+  listDnsGroups: () => apiFetch('/dns-groups'),
+  saveDnsGroup: (payload) => apiFetch('/dns-groups', { method: 'POST', body: payload }),
+  deleteDnsGroup: (id) => apiFetch(`/dns-groups/${id}`, { method: 'DELETE' }),
+
+  listRuleSources: () => apiFetch('/rule-sources'),
+  saveRuleSource: (payload) => apiFetch('/rule-sources', { method: 'POST', body: payload }),
+  syncRuleSource: (id) => apiFetch(`/rule-sources/${id}/sync`, { method: 'POST' }),
+  deleteRuleSource: (id) => apiFetch(`/rule-sources/${id}`, { method: 'DELETE' }),
 
   listRoutingRules: () => apiFetch('/routing-rules'),
   saveRoutingRule: (payload) => apiFetch('/routing-rules', { method: 'POST', body: payload }),

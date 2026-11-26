@@ -239,6 +239,7 @@ fn extract_pem_cert_raw(pem: &str) -> Option<String> {
 fn can_export_uri_transport(ib: &Inbound) -> bool {
     let ss = &ib.stream_settings;
     match ib.protocol.as_str() {
+        "portforward" => false,
         "tuic" | "hysteria2" => true,
         "snell" => {
             ss.network == "tcp"
@@ -249,14 +250,14 @@ fn can_export_uri_transport(ib: &Inbound) -> bool {
                 )
         }
         "shadowsocks" => {
-            (ss.network == "tcp" && ss.security == "none")
+            (ss.network == "tcp" && matches!(ss.security.as_str(), "none" | "shadowtls"))
                 || (ss.network == "ws"
                     && matches!(ss.security.as_str(), "none" | "tls")
                     && !has_non_host_ws_headers(ib))
         }
-        "vless" => matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp"),
-        "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
-        _ => ss.network == "tcp",
+        "vless" => ss.security != "shadowtls" && matches!(ss.network.as_str(), "tcp" | "ws" | "xhttp"),
+        "vmess" | "trojan" => ss.security != "shadowtls" && matches!(ss.network.as_str(), "tcp" | "ws"),
+        _ => ss.network == "tcp" && ss.security != "shadowtls",
     }
 }
 
@@ -278,15 +279,24 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
     match ib.protocol.as_str() {
         "vless" => {
             let mut params = Vec::new();
-            params.push("encryption=none".to_string());
+            let has_vless_enc = ib.has_vless_native_encryption();
+            if has_vless_enc && !ps.vless_encryption.trim().is_empty() {
+                params.push(format!("encryption={}", enc_query(ps.vless_encryption.trim())));
+            } else {
+                params.push("encryption=none".to_string());
+            }
             let net = match ss.network.as_str() {
                 "ws" => "ws",
                 "xhttp" => "xhttp",
                 _ => "tcp",
             };
 
+            if has_vless_enc && ps.vless_native_vision {
+                params.push("flow=xtls-rprx-vision".to_string());
+            }
+
             if ss.security == "reality" {
-                if ss.network == "tcp" && ss.reality.vision {
+                if !has_vless_enc && ss.network == "tcp" && ss.reality.vision {
                     params.push("flow=xtls-rprx-vision".to_string());
                 }
                 params.push("security=reality".to_string());
@@ -310,7 +320,7 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                     params.push(format!("pqv={}", enc_query(ss.reality.mldsa65_verify.trim())));
                 }
             } else if ss.security == "tls" {
-                if ss.network == "tcp" && ss.tls.vision {
+                if !has_vless_enc && ss.network == "tcp" && ss.tls.vision {
                     params.push("flow=xtls-rprx-vision".to_string());
                 }
                 params.push("security=tls".to_string());
@@ -479,12 +489,24 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
                 }
                 let plugin_param = enc_userinfo(&opts.join(";"));
                 format!("ss://{userinfo}@{addr}:{port}/?plugin={plugin_param}#{tag}")
+            } else if ss.security == "shadowtls" {
+                let st = &ss.shadowtls;
+                let opts = format!(
+                    "shadow-tls;host={};password={};version=3",
+                    st.sni.trim(),
+                    st.password.trim()
+                );
+                let plugin_param = enc_userinfo(&opts);
+                format!("ss://{userinfo}@{addr}:{port}/?plugin={plugin_param}#{tag}")
             } else {
                 format!("ss://{userinfo}@{addr}:{port}#{tag}")
             }
         }
         "hysteria2" => {
             let mut params = Vec::new();
+            if let Ok(Some(mport)) = crate::yaml_gen::normalize_port_range_spec(ib.port, &ps.port_range) {
+                params.push(format!("mport={}", enc_query(&mport)));
+            }
             let sni = effective_tls_sni(ib);
             if !sni.is_empty() {
                 params.push(format!("sni={}", enc_query(&sni)));
@@ -686,14 +708,24 @@ fn build_singbox_multiplex_json(mux: &H2MuxSettings) -> JsonValue {
 }
 
 fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> String {
+    if ib.protocol == "portforward" {
+        return String::new();
+    }
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let target_addr = format!("{}:{}", format_host(host), ib.port);
     let active_mux = inbound_effective_h2mux(ib);
+    let has_vless_enc = ib.has_vless_native_encryption();
 
     let inner = match ib.protocol.as_str() {
         "vless" => {
             let mut m = json!({"type": "vless", "user_id": c.uuid.trim()});
+            if has_vless_enc && !ps.vless_encryption.trim().is_empty() {
+                m["encryption"] = json!(ps.vless_encryption.trim());
+                if ps.vless_native_vision {
+                    m["vision"] = json!(true);
+                }
+            }
             if let Some(mux) = active_mux {
                 m["h2mux"] = build_shoes_h2mux_json(mux);
             }
@@ -728,7 +760,11 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             json!({"type": "shadowsocks", "cipher": cipher, "password": c.password.trim()})
         }
         "hysteria2" => {
-            json!({"type": "hysteria2", "password": c.password.trim(), "udp_enabled": true})
+            let mut m = json!({"type": "hysteria2", "password": c.password.trim(), "udp_enabled": true});
+            if let Ok(Some(ports)) = crate::yaml_gen::normalize_port_range_spec(ib.port, &ps.port_range) {
+                m["hopping"] = json!({"ports": ports, "interval_secs": 30});
+            }
+            m
         }
         "tuic" => {
             json!({"type": "tuic", "uuid": c.uuid.trim(), "password": c.password.trim(), "udp_enabled": true})
@@ -824,7 +860,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             .first()
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision;
+        let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.reality.vision && !has_vless_enc;
         let mut hop = json!({
             "name": name,
             "address": target_addr,
@@ -842,7 +878,7 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
         }
         hop
     } else if ss.security == "tls" {
-        let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision;
+        let vision = ib.protocol == "vless" && ss.network == "tcp" && ss.tls.vision && !has_vless_enc;
         let mut sni = effective_tls_sni(ib);
         if sni.is_empty() {
             sni = host.trim().to_string();
@@ -864,6 +900,17 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
             hop["protocol"]["alpn_protocols"] = json!(ss.tls.alpn);
         }
         hop
+    } else if ss.security == "shadowtls" {
+        json!({
+            "name": name,
+            "address": target_addr,
+            "protocol": {
+                "type": "shadowtls",
+                "password": ss.shadowtls.password.trim(),
+                "sni_hostname": ss.shadowtls.sni.trim(),
+                "protocol": transported
+            }
+        })
     } else {
         json!({
             "name": name,
@@ -889,10 +936,18 @@ fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: 
 }
 
 fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Option<JsonValue> {
+    if ib.protocol == "portforward" {
+        return None;
+    }
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let server = host.trim();
     let port = ib.port;
+    let has_vless_enc = ib.has_vless_native_encryption();
+
+    if ss.security == "shadowtls" && ib.protocol != "shadowsocks" {
+        return None;
+    }
 
     let mut obj = match ib.protocol.as_str() {
         "vless" => {
@@ -912,7 +967,13 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "udp": ps.udp_enabled,
                 "network": if ss.network == "ws" { "ws" } else { "tcp" },
             });
-            if ss.security == "reality" && ss.network == "tcp" && ss.reality.vision {
+            if has_vless_enc && !ps.vless_encryption.trim().is_empty() {
+                obj["encryption"] = json!(ps.vless_encryption.trim());
+                if ps.vless_native_vision {
+                    obj["flow"] = json!("xtls-rprx-vision");
+                }
+            }
+            if !has_vless_enc && ss.security == "reality" && ss.network == "tcp" && ss.reality.vision {
                 obj["flow"] = json!("xtls-rprx-vision");
             }
             if ss.security == "tls" {
@@ -925,7 +986,7 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 if !ss.tls.fingerprint.trim().is_empty() {
                     obj["client-fingerprint"] = json!(ss.tls.fingerprint.trim());
                 }
-                if ss.network == "tcp" && ss.tls.vision {
+                if !has_vless_enc && ss.network == "tcp" && ss.tls.vision {
                     obj["flow"] = json!("xtls-rprx-vision");
                 }
             }
@@ -1023,6 +1084,15 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             });
             if ss.network == "tcp" && ss.security == "none" {
                 Some(obj)
+            } else if ss.network == "tcp" && ss.security == "shadowtls" {
+                let st = &ss.shadowtls;
+                obj["plugin"] = json!("shadow-tls");
+                obj["plugin-opts"] = json!({
+                    "host": st.sni.trim(),
+                    "password": st.password.trim(),
+                    "version": 3,
+                });
+                Some(obj)
             } else if ss.network == "ws" && matches!(ss.security.as_str(), "none" | "tls") {
                 let ws_host = ss.ws.host_header();
                 let sni = effective_tls_sni(ib);
@@ -1074,6 +1144,10 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
                 "password": c.password.trim(),
                 "skip-cert-verify": ss.tls.allow_insecure,
             });
+            if let Ok(Some(ports)) = crate::yaml_gen::normalize_port_range_spec(ib.port, &ps.port_range) {
+                obj["ports"] = json!(ports);
+                obj["hop-interval"] = json!(30);
+            }
             let sni = effective_tls_sni(ib);
             if !sni.is_empty() {
                 obj["sni"] = json!(sni);
@@ -1221,11 +1295,43 @@ fn build_singbox_outbound(
     host: &str,
     name: &str,
     certs: &[CertificateRecord],
-) -> Option<JsonValue> {
+) -> Option<(JsonValue, Option<JsonValue>)> {
+    if ib.protocol == "portforward" {
+        return None;
+    }
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let server = host.trim();
     let port = ib.port;
+
+    if ib.has_vless_native_encryption() {
+        // sing-box does not support Xray/Shoes VLESS native encryption.
+        return None;
+    }
+
+    let shadowtls_detour = if ss.security == "shadowtls" {
+        if ss.network != "tcp" || !matches!(ib.protocol.as_str(), "shadowsocks" | "vless" | "vmess" | "trojan") {
+            return None;
+        }
+        let detour_tag = format!("{name}-stls");
+        Some((
+            detour_tag.clone(),
+            json!({
+                "tag": detour_tag,
+                "type": "shadowtls",
+                "server": server,
+                "server_port": port,
+                "version": 3,
+                "password": ss.shadowtls.password.trim(),
+                "tls": {
+                    "enabled": true,
+                    "server_name": ss.shadowtls.sni.trim(),
+                }
+            }),
+        ))
+    } else {
+        None
+    };
 
     let tls_block = if ib.is_quic() || ss.security == "tls" {
         let mut t = json!({
@@ -1353,7 +1459,7 @@ fn build_singbox_outbound(
                 "method": cipher,
                 "password": c.password.trim(),
             });
-            if ss.network == "tcp" && ss.security == "none" {
+            if ss.network == "tcp" && matches!(ss.security.as_str(), "none" | "shadowtls") {
                 Some(obj)
             } else if ss.network == "ws"
                 && matches!(ss.security.as_str(), "none" | "tls")
@@ -1417,6 +1523,20 @@ fn build_singbox_outbound(
                 "server_port": port,
                 "password": c.password.trim(),
             });
+            if let Ok(Some(ports)) = crate::yaml_gen::normalize_port_range_spec(ib.port, &ps.port_range) {
+                let sb_ports: Vec<String> = ports
+                    .split(',')
+                    .map(|seg| {
+                        if let Some((a, b)) = seg.split_once('-') {
+                            format!("{a}:{b}")
+                        } else {
+                            format!("{seg}:{seg}")
+                        }
+                    })
+                    .collect();
+                obj["server_ports"] = json!(sb_ports);
+                obj["hop_interval"] = json!("30s");
+            }
             if let Some(t) = tls_block {
                 obj["tls"] = t;
             }
@@ -1531,7 +1651,15 @@ fn build_singbox_outbound(
     if let Some(mux) = inbound_effective_h2mux(ib) {
         obj["multiplex"] = build_singbox_multiplex_json(mux);
     }
-    Some(obj)
+    if let Some((detour_tag, detour_obj)) = shadowtls_detour {
+        if let Some(map) = obj.as_object_mut() {
+            map.remove("server");
+            map.remove("server_port");
+            map.insert("detour".to_string(), json!(detour_tag));
+        }
+        return Some((obj, Some(detour_obj)));
+    }
+    Some((obj, None))
 }
 
 /// Ensures fields like `short-id`, `password`, `uuid`, `psk` in Clash YAML are never coerced
@@ -1588,7 +1716,7 @@ pub fn generate_subscription_with_certs(
     let mut has_unlimited_quota = false;
     let mut earliest_expiry_ms: i64 = 0;
 
-    for ib in inbounds.iter().filter(|i| i.enable) {
+    for ib in inbounds.iter().filter(|i| i.enable && i.protocol != "portforward") {
         let mut inbound_counted = false;
         for c in ib.clients.iter().filter(|c| c.enable) {
             if match_all || c.sub_id.trim() == sub_id_filter.trim() {
@@ -1718,9 +1846,12 @@ pub fn generate_subscription_with_certs(
             let mut outbounds = Vec::new();
             let mut tags = Vec::new();
             for (ib, c, name) in &matched_pairs {
-                if let Some(o) = build_singbox_outbound(ib, c, host, name, certs) {
+                if let Some((o, detour)) = build_singbox_outbound(ib, c, host, name, certs) {
                     tags.push(name.clone());
                     outbounds.push(o);
+                    if let Some(d) = detour {
+                        outbounds.push(d);
+                    }
                 }
             }
             let mut select_tags = vec!["auto".to_string()];

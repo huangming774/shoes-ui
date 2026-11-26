@@ -126,6 +126,124 @@
       </a-space>
     </a-card>
 
+    <!-- 1b. Shoes Core Global Limits, QUIC Memory Tuning & Built-In NTP -->
+    <a-card :title="t('settings.coreGlobalSection')" size="small">
+      <a-alert type="info" show-icon :message="t('settings.coreGlobalHint')" style="margin-bottom: 14px" />
+      <a-form layout="vertical" :disabled="!loaded || saving">
+        <a-row :gutter="12">
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.maxConnectionsPerIp')">
+              <a-input-number v-model:value="cgUi.max_connections_per_ip" :min="0" :precision="0" style="width: 100%" placeholder="Unlimited" />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.maxConnections')">
+              <a-input-number v-model:value="cgUi.max_connections" :min="0" :precision="0" style="width: 100%" placeholder="Unlimited" />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.quicMemoryMb')">
+              <a-input-number v-model:value="cgUi.quic_memory_mb" :min="0" :max="65536" :precision="0" style="width: 100%" placeholder="e.g. 256 / 512" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+
+        <a-row :gutter="12">
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.maxStreams')">
+              <a-input-number v-model:value="cgUi.max_streams" :min="0" :precision="0" style="width: 100%" placeholder="Unlimited" />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.maxStreamsPerConn')">
+              <a-input-number v-model:value="cgUi.max_streams_per_connection" :min="0" :max="65535" :precision="0" style="width: 100%" placeholder="Unlimited (1-65535)" />
+            </a-form-item>
+          </a-col>
+          <a-col :xs="12" :md="8">
+            <a-form-item :label="t('settings.maxUdpDests')">
+              <a-input-number v-model:value="cgUi.max_udp_destinations" :min="0" :precision="0" style="width: 100%" placeholder="Unlimited" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+
+        <a-divider orientation="left" style="margin: 8px 0 12px">NTP</a-divider>
+        <a-row :gutter="12" style="align-items: center">
+          <a-col :xs="24" :md="24" style="margin-bottom: 10px">
+            <a-space wrap>
+              <a-switch v-model:checked="cgUi.ntp_enabled" />
+              <span>{{ t('settings.ntpEnable') }}</span>
+            </a-space>
+          </a-col>
+          <template v-if="cgUi.ntp_enabled">
+            <a-col :xs="24" :md="12">
+              <a-form-item :label="t('settings.ntpServer')">
+                <a-input v-model:value="cgUi.ntp_server" placeholder="time.cloudflare.com:123" />
+                <a-space size="small" style="margin-top: 6px" wrap>
+                  <a-tag style="cursor: pointer" @click="cgUi.ntp_server = 'time.cloudflare.com:123'">Cloudflare</a-tag>
+                  <a-tag style="cursor: pointer" @click="cgUi.ntp_server = 'time.google.com:123'">Google</a-tag>
+                  <a-tag style="cursor: pointer" @click="cgUi.ntp_server = 'pool.ntp.org:123'">pool.ntp.org</a-tag>
+                  <a-tag style="cursor: pointer" @click="cgUi.ntp_server = 'time.apple.com:123'">Apple</a-tag>
+                </a-space>
+              </a-form-item>
+            </a-col>
+            <a-col :xs="12" :md="6">
+              <a-form-item :label="t('settings.ntpInterval')">
+                <a-input-number v-model:value="cgUi.ntp_interval_secs" :min="60" :max="86400" :precision="0" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :xs="12" :md="6">
+              <a-form-item :label="t('settings.ntpTimeout')">
+                <a-input-number v-model:value="cgUi.ntp_timeout_secs" :min="1" :max="30" :precision="0" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+          </template>
+        </a-row>
+
+        <a-collapse ghost style="margin-bottom: 10px">
+          <a-collapse-panel key="quic" :header="t('settings.quicTuningCollapse')">
+            <a-row :gutter="12">
+              <a-col :xs="12" :md="6">
+                <a-form-item :label="t('settings.quicRecvWinMb')">
+                  <a-input-number v-model:value="cgUi.quic_receive_window_mb" :min="0" :max="64" :step="0.5" style="width: 100%" placeholder="2" />
+                </a-form-item>
+              </a-col>
+              <a-col :xs="12" :md="6">
+                <a-form-item :label="t('settings.quicSendWinMb')">
+                  <a-input-number v-model:value="cgUi.quic_send_window_mb" :min="0" :max="64" :step="0.5" style="width: 100%" placeholder="2" />
+                </a-form-item>
+              </a-col>
+              <a-col :xs="12" :md="6">
+                <a-form-item :label="t('settings.quicStreamWinKb')">
+                  <a-input-number v-model:value="cgUi.quic_stream_window_kb" :min="0" :max="65536" :precision="0" style="width: 100%" placeholder="256" />
+                </a-form-item>
+              </a-col>
+              <a-col :xs="12" :md="6">
+                <a-form-item :label="t('settings.quicSockBufMb')">
+                  <a-input-number v-model:value="cgUi.quic_socket_buffer_mb" :min="0" :max="16" :step="0.5" style="width: 100%" placeholder="8" />
+                </a-form-item>
+              </a-col>
+            </a-row>
+            <a-row :gutter="12">
+              <a-col :xs="12" :md="8">
+                <a-form-item :label="t('settings.reloadGraceSecs')">
+                  <a-input-number v-model:value="cgUi.reload_grace_secs" :min="0" :max="86400" :precision="0" style="width: 100%" placeholder="300" />
+                </a-form-item>
+              </a-col>
+              <a-col :xs="24" :md="16">
+                <a-form-item :label="t('settings.ruleCacheDir')">
+                  <a-input v-model:value="cgUi.rule_cache_dir" placeholder="/etc/shoes-panel/rule-cache (optional)" />
+                </a-form-item>
+              </a-col>
+            </a-row>
+          </a-collapse-panel>
+        </a-collapse>
+      </a-form>
+
+      <a-button type="primary" :disabled="!loaded" :loading="saving" @click="saveAllSettings">
+        {{ t('app.save') }}
+      </a-button>
+    </a-card>
+
     <!-- 2. Online Version Check & One-Click Upgrade -->
     <a-card :title="t('settings.updateSection')" size="small">
       <template #extra>
@@ -394,7 +512,91 @@ const form = reactive({
   tg_bot_token: '',
   tg_chat_id: '',
   tg_backup_enabled: false,
+  core_global: {
+    max_connections: null,
+    max_connections_per_ip: null,
+    max_streams: null,
+    max_streams_per_connection: null,
+    max_udp_destinations: null,
+    quic_memory_bytes: null,
+    quic_receive_window: null,
+    quic_send_window: null,
+    quic_stream_window: null,
+    quic_dns_memory_bytes: null,
+    quic_socket_buffer: null,
+    reload_grace_secs: null,
+    ntp_enabled: false,
+    ntp_server: 'time.cloudflare.com:123',
+    ntp_interval_secs: 1800,
+    ntp_timeout_secs: 5,
+    default_dns_group: '',
+    default_dns_ip_strategy: '',
+    default_dns_servers: [],
+    default_dns_hosts: {},
+    rule_cache_dir: '',
+  },
 });
+
+const cgUi = reactive({
+  max_connections: null,
+  max_connections_per_ip: null,
+  max_streams: null,
+  max_streams_per_connection: null,
+  max_udp_destinations: null,
+  quic_memory_mb: null,
+  quic_receive_window_mb: null,
+  quic_send_window_mb: null,
+  quic_stream_window_kb: null,
+  quic_socket_buffer_mb: null,
+  reload_grace_secs: null,
+  ntp_enabled: false,
+  ntp_server: 'time.cloudflare.com:123',
+  ntp_interval_secs: 1800,
+  ntp_timeout_secs: 5,
+  rule_cache_dir: '',
+});
+
+function syncCoreGlobalToUi(cg = {}) {
+  cgUi.max_connections = cg.max_connections || null;
+  cgUi.max_connections_per_ip = cg.max_connections_per_ip || null;
+  cgUi.max_streams = cg.max_streams || null;
+  cgUi.max_streams_per_connection = cg.max_streams_per_connection || null;
+  cgUi.max_udp_destinations = cg.max_udp_destinations || null;
+  cgUi.quic_memory_mb = cg.quic_memory_bytes ? Math.round(cg.quic_memory_bytes / 1048576) : null;
+  cgUi.quic_receive_window_mb = cg.quic_receive_window ? Number((cg.quic_receive_window / 1048576).toFixed(2)) : null;
+  cgUi.quic_send_window_mb = cg.quic_send_window ? Number((cg.quic_send_window / 1048576).toFixed(2)) : null;
+  cgUi.quic_stream_window_kb = cg.quic_stream_window ? Math.round(cg.quic_stream_window / 1024) : null;
+  cgUi.quic_socket_buffer_mb = cg.quic_socket_buffer ? Number((cg.quic_socket_buffer / 1048576).toFixed(2)) : null;
+  cgUi.reload_grace_secs = cg.reload_grace_secs ?? null;
+  cgUi.ntp_enabled = Boolean(cg.ntp_enabled);
+  cgUi.ntp_server = cg.ntp_server || 'time.cloudflare.com:123';
+  cgUi.ntp_interval_secs = cg.ntp_interval_secs || 1800;
+  cgUi.ntp_timeout_secs = cg.ntp_timeout_secs || 5;
+  cgUi.rule_cache_dir = cg.rule_cache_dir || '';
+}
+
+function buildCoreGlobalFromUi() {
+  const pos = (v) => (v != null && Number(v) > 0 ? Math.round(Number(v)) : null);
+  return {
+    ...(form.core_global || {}),
+    max_connections: pos(cgUi.max_connections),
+    max_connections_per_ip: pos(cgUi.max_connections_per_ip),
+    max_streams: pos(cgUi.max_streams),
+    max_streams_per_connection: pos(cgUi.max_streams_per_connection),
+    max_udp_destinations: pos(cgUi.max_udp_destinations),
+    quic_memory_bytes: cgUi.quic_memory_mb > 0 ? Math.round(Number(cgUi.quic_memory_mb) * 1048576) : null,
+    quic_receive_window: cgUi.quic_receive_window_mb > 0 ? Math.round(Number(cgUi.quic_receive_window_mb) * 1048576) : null,
+    quic_send_window: cgUi.quic_send_window_mb > 0 ? Math.round(Number(cgUi.quic_send_window_mb) * 1048576) : null,
+    quic_stream_window: cgUi.quic_stream_window_kb > 0 ? Math.round(Number(cgUi.quic_stream_window_kb) * 1024) : null,
+    quic_socket_buffer: cgUi.quic_socket_buffer_mb > 0 ? Math.round(Number(cgUi.quic_socket_buffer_mb) * 1048576) : null,
+    reload_grace_secs: cgUi.reload_grace_secs != null && cgUi.reload_grace_secs !== '' ? Math.max(0, Math.round(Number(cgUi.reload_grace_secs))) : null,
+    ntp_enabled: Boolean(cgUi.ntp_enabled),
+    ntp_server: (cgUi.ntp_server || 'time.cloudflare.com:123').trim(),
+    ntp_interval_secs: Math.max(60, Math.min(86400, Number(cgUi.ntp_interval_secs) || 1800)),
+    ntp_timeout_secs: Math.max(1, Math.min(30, Number(cgUi.ntp_timeout_secs) || 5)),
+    rule_cache_dir: (cgUi.rule_cache_dir || '').trim(),
+  };
+}
 
 const pwdForm = reactive({
   current_password: '',
@@ -428,6 +630,7 @@ async function loadSettings() {
   try {
     const res = await api.getSettings();
     Object.assign(form, res.settings);
+    syncCoreGlobalToUi(res.settings?.core_global);
     pwdForm.new_username = res.admin_username || 'admin';
     listenerScheme.value = res.listener_scheme || 'http';
     loaded.value = true;
@@ -469,8 +672,10 @@ async function saveAllSettings() {
   saving.value = true;
   try {
     const prevBase = window.__SHOES_BASE__ || '/';
-    const saved = await api.saveSettings({ ...form });
+    const payload = { ...form, core_global: buildCoreGlobalFromUi() };
+    const saved = await api.saveSettings(payload);
     Object.assign(form, saved);
+    syncCoreGlobalToUi(saved.core_global);
     message.success(t('app.saveSuccess'));
     if (saved.panel_base_path !== prevBase) {
       const target = saved.panel_base_path === '/' ? '/' : `${saved.panel_base_path}/`;

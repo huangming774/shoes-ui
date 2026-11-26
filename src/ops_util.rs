@@ -965,3 +965,458 @@ pub async fn upgrade_shoes_binary(state: Arc<AppState>) -> Result<UpgradeResult>
         restarting: false,
     })
 }
+
+// ==================== Cloudflare WARP Registration & WireGuard Conf Parser ====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpAccountProfile {
+    pub address: String,
+    pub wg_private_key: String,
+    pub wg_public_key: String,
+    pub wg_preshared_key: String,
+    pub wg_addresses: Vec<String>,
+    pub wg_allowed_ips: Vec<String>,
+    pub wg_mtu: u16,
+    pub wg_keepalive: u16,
+    pub account_id: String,
+}
+
+fn ensure_cidr(ip: &str, default_v4_prefix: u8, default_v6_prefix: u8) -> String {
+    let trimmed = ip.trim();
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    if trimmed.contains(':') {
+        format!("{trimmed}/{default_v6_prefix}")
+    } else {
+        format!("{trimmed}/{default_v4_prefix}")
+    }
+}
+
+/// Registers a free Cloudflare WARP WireGuard profile using a locally generated Curve25519 keypair.
+pub async fn register_cloudflare_warp() -> Result<WarpAccountProfile> {
+    let (private_key, local_public_key, _) = crate::crypto_util::generate_wireguard_keypair();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("okhttp/3.12.1")
+        .build()?;
+
+    let payload = serde_json::json!({
+        "key": local_public_key,
+        "install_id": "",
+        "fcm_token": "",
+        "tos": Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string(),
+        "model": "PC",
+        "serial_number": "",
+        "locale": "en_US"
+    });
+
+    let resp = client
+        .post("https://api.cloudflareclient.com/v0a2158/reg")
+        .header("CF-Client-Version", "a-6.11-2223")
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .context("Failed to connect to Cloudflare WARP registration API")?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse Cloudflare WARP registration response")?;
+
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Cloudflare WARP API returned HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    let account_id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let cfg = body
+        .get("config")
+        .ok_or_else(|| anyhow!("Cloudflare WARP response missing 'config' object"))?;
+
+    let mut addresses = Vec::new();
+    if let Some(v4) = cfg.pointer("/interface/addresses/v4").and_then(|v| v.as_str()) {
+        if !v4.trim().is_empty() {
+            addresses.push(ensure_cidr(v4, 32, 128));
+        }
+    }
+    if let Some(v6) = cfg.pointer("/interface/addresses/v6").and_then(|v| v.as_str()) {
+        if !v6.trim().is_empty() {
+            addresses.push(ensure_cidr(v6, 32, 128));
+        }
+    }
+    if addresses.is_empty() {
+        return Err(anyhow!(
+            "Cloudflare WARP response did not include interface tunnel addresses"
+        ));
+    }
+
+    let peer = cfg
+        .pointer("/peers/0")
+        .ok_or_else(|| anyhow!("Cloudflare WARP response missing peer entry"))?;
+    let peer_public_key = peer
+        .get("public_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
+        .to_string();
+
+    let raw_endpoint = peer
+        .pointer("/endpoint/host")
+        .and_then(|v| v.as_str())
+        .or_else(|| peer.pointer("/endpoint/v4").and_then(|v| v.as_str()))
+        .unwrap_or("engage.cloudflareclient.com:2408")
+        .trim();
+    let endpoint = if let Some(host) = raw_endpoint.strip_suffix(":0") {
+        format!("{host}:2408")
+    } else if raw_endpoint.is_empty() {
+        "engage.cloudflareclient.com:2408".to_string()
+    } else {
+        raw_endpoint.to_string()
+    };
+
+    Ok(WarpAccountProfile {
+        address: endpoint,
+        wg_private_key: private_key,
+        wg_public_key: peer_public_key,
+        wg_preshared_key: String::new(),
+        wg_addresses: addresses,
+        wg_allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        wg_mtu: 1280,
+        wg_keepalive: 25,
+        account_id,
+    })
+}
+
+/// Parses a standard WireGuard / `wgcf-profile.conf` INI text into outbound WireGuard fields.
+pub fn parse_wireguard_conf(conf_text: &str) -> Result<WarpAccountProfile> {
+    let mut section = String::new();
+    let mut private_key = String::new();
+    let mut public_key = String::new();
+    let mut preshared_key = String::new();
+    let mut endpoint = String::new();
+    let mut addresses = Vec::new();
+    let mut allowed_ips = Vec::new();
+    let mut mtu: u16 = 1280;
+    let mut keepalive: u16 = 25;
+
+    for raw_line in conf_text.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim();
+        match (section.as_str(), key.as_str()) {
+            ("interface", "privatekey") => private_key = val.to_string(),
+            ("interface", "address") => {
+                for part in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    addresses.push(ensure_cidr(part, 32, 128));
+                }
+            }
+            ("interface", "mtu") => {
+                if let Ok(parsed) = val.parse::<u16>() {
+                    mtu = parsed.clamp(1280, 1420);
+                }
+            }
+            ("peer", "publickey") => public_key = val.to_string(),
+            ("peer", "presharedkey") => preshared_key = val.to_string(),
+            ("peer", "endpoint") => endpoint = val.to_string(),
+            ("peer", "allowedips") => {
+                for part in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    allowed_ips.push(part.to_string());
+                }
+            }
+            ("peer", "persistentkeepalive") => {
+                if let Ok(parsed) = val.parse::<u16>() {
+                    keepalive = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if private_key.is_empty() || public_key.is_empty() || addresses.is_empty() || endpoint.is_empty() {
+        return Err(anyhow!(
+            "WireGuard config must contain PrivateKey, Address, PublicKey, and Endpoint"
+        ));
+    }
+    if allowed_ips.is_empty() {
+        allowed_ips = vec!["0.0.0.0/0".to_string(), "::/0".to_string()];
+    }
+
+    Ok(WarpAccountProfile {
+        address: endpoint,
+        wg_private_key: private_key,
+        wg_public_key: public_key,
+        wg_preshared_key: preshared_key,
+        wg_addresses: addresses,
+        wg_allowed_ips: allowed_ips,
+        wg_mtu: mtu,
+        wg_keepalive: keepalive,
+        account_id: String::new(),
+    })
+}
+
+// ==================== Rule Source Synchronization (SRS / MRS / GeoData / YAML) ====================
+
+const MAX_RULE_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+
+pub fn parse_rule_interval_secs(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+    let (num_str, unit) = trimmed.split_at(trimmed.len() - 1);
+    let factor: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    let n = num_str.parse::<u64>().ok()?;
+    let secs = n.checked_mul(factor)?;
+    (1..=365 * 86_400).contains(&secs).then_some(secs)
+}
+
+pub fn managed_rule_file_path(
+    data_dir: &Path,
+    group_name: &str,
+    index: usize,
+    item: &crate::models::RuleSourceItem,
+) -> PathBuf {
+    let safe: String = group_name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "ruleset".to_string()
+    } else {
+        safe
+    };
+
+    let ext = match item.format.trim() {
+        "srs" => "srs",
+        "mrs" => "mrs",
+        "singbox_json" => "json",
+        "mihomo_yaml" => "yaml",
+        "mihomo_text" => "txt",
+        "geosite_dat" | "geoip_dat" => "dat",
+        _ => {
+            let url_path = item
+                .url
+                .trim()
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("");
+            match Path::new(url_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("srs") => "srs",
+                Some("mrs") => "mrs",
+                Some("json") => "json",
+                Some("yaml") | Some("yml") => "yaml",
+                Some("txt") => "txt",
+                Some("dat") => "dat",
+                _ => "srs",
+            }
+        }
+    };
+    data_dir.join("rules").join(format!("{safe}_{index}.{ext}"))
+}
+
+/// Downloads and atomically caches all `panel`-synced remote items in a rule source group.
+/// Returns `Ok(changed)` indicating whether any cached rule file on disk changed.
+pub async fn sync_rule_source_group(
+    data_dir: &Path,
+    group: &mut crate::models::RuleSourceGroupRecord,
+) -> Result<bool> {
+    let rules_dir = data_dir.join("rules");
+    std::fs::create_dir_all(&rules_dir)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("shoes-panel/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let mut changed = false;
+    let now = Utc::now().timestamp_millis();
+
+    for (idx, item) in group.items.iter_mut().enumerate() {
+        if item.source_type == "local" {
+            let p = PathBuf::from(item.path.trim());
+            if let Ok(meta) = std::fs::metadata(&p) {
+                item.file_size = meta.len();
+                item.last_updated_at = now;
+                item.last_error.clear();
+            } else {
+                item.last_error = format!("Local file not found: {}", p.display());
+                return Err(anyhow!(item.last_error.clone()));
+            }
+            continue;
+        }
+
+        if item.sync_mode == "shoes_native" {
+            item.last_error.clear();
+            continue;
+        }
+
+        let url_str = item.url.trim();
+        let parsed = url::Url::parse(url_str)
+            .with_context(|| format!("Invalid rule source URL '{url_str}'"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(anyhow!(
+                "Rule source URL must use http:// or https:// (got '{}')",
+                parsed.scheme()
+            ));
+        }
+
+        let resp = client
+            .get(url_str)
+            .send()
+            .await
+            .with_context(|| format!("Failed to download rule source '{url_str}'"))?;
+        if !resp.status().is_success() {
+            let err = format!(
+                "Failed to download '{}': HTTP {}",
+                url_str,
+                resp.status().as_u16()
+            );
+            item.last_error = err.clone();
+            return Err(anyhow!(err));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("Failed to read response body from '{url_str}'"))?;
+        if bytes.is_empty() {
+            let err = format!("Rule source '{url_str}' returned empty content");
+            item.last_error = err.clone();
+            return Err(anyhow!(err));
+        }
+        if bytes.len() > MAX_RULE_SOURCE_BYTES {
+            let err = format!("Rule source '{url_str}' exceeds 64 MiB limit");
+            item.last_error = err.clone();
+            return Err(anyhow!(err));
+        }
+
+        let target = managed_rule_file_path(data_dir, &group.name, idx, item);
+        let unchanged = std::fs::read(&target)
+            .map(|existing| existing.as_slice() == bytes.as_ref())
+            .unwrap_or(false);
+        if !unchanged {
+            let tmp = rules_dir.join(format!(
+                ".rule-tmp-{}-{idx}-{}.part",
+                now,
+                crate::crypto_util::generate_random_alnum(6)
+            ));
+            std::fs::write(&tmp, &bytes)?;
+            if target.exists() {
+                let _ = std::fs::remove_file(&target);
+            }
+            std::fs::rename(&tmp, &target).with_context(|| {
+                format!("Failed to save downloaded rule file to {}", target.display())
+            })?;
+            changed = true;
+        }
+
+        let abs_target = std::fs::canonicalize(&target).unwrap_or(target);
+        let path_str = abs_target.to_string_lossy().to_string();
+        item.path = path_str
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&path_str)
+            .replace('\\', "/");
+        item.file_size = bytes.len() as u64;
+        item.last_updated_at = now;
+        item.last_error.clear();
+    }
+
+    Ok(changed)
+}
+
+/// Refreshes all due `panel`-synced remote rule sources in the background.
+pub async fn sync_due_rule_sources(state: &Arc<AppState>) {
+    let groups = match state.db.list_rule_source_groups() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let now = Utc::now().timestamp_millis();
+    let mut any_changed = false;
+
+    for mut group in groups.into_iter().filter(|g| g.enable) {
+        let is_due = group.items.iter().any(|item| {
+            if item.source_type != "url" || item.sync_mode == "shoes_native" {
+                return false;
+            }
+            let interval_ms = parse_rule_interval_secs(&item.update_interval)
+                .unwrap_or(86_400)
+                .saturating_mul(1000) as i64;
+            item.last_updated_at <= 0 || (now - item.last_updated_at) >= interval_ms
+        });
+        if !is_due {
+            continue;
+        }
+        match sync_rule_source_group(&state.db.data_dir, &mut group).await {
+            Ok(changed) => {
+                let _ = state.db.update_rule_source_items(group.id, &group.items);
+                if changed {
+                    any_changed = true;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Rule source '{}' auto-refresh failed: {e}", group.name);
+                let _ = state.db.update_rule_source_items(group.id, &group.items);
+            }
+        }
+    }
+
+    if any_changed {
+        if let Err(e) = state.proc_mgr.reload_config().await {
+            tracing::warn!("Failed to reload shoes after rule-set refresh: {e}");
+        } else {
+            state
+                .proc_mgr
+                .push_panel_log("Refreshed remote rule sources and hot-reloaded shoes");
+        }
+    }
+}
+
+pub fn spawn_rule_source_loop(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
+        // Skip immediate tick so startup stays fast and non-blocking
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            sync_due_rule_sources(&state).await;
+        }
+    });
+}

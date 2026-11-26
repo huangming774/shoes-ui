@@ -21,23 +21,25 @@ use crate::acme_util::{
 use crate::auth::{extract_token_from_headers, SESSION_COOKIE_NAME};
 use crate::crypto_util::{
     generate_random_alnum, generate_reality_keypair, generate_self_signed_cert,
-    generate_short_id, generate_ss2022_password, generate_uuid,
+    generate_short_id, generate_ss2022_password, generate_uuid, generate_wireguard_keypair,
 };
 use crate::db::default_client_for_inbound;
 use crate::models::{
-    CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, PanelSettings,
-    RoutingRuleRecord, SubscriptionRecord, DEFAULT_LETSENCRYPT_DIR, DEFAULT_LETSENCRYPT_TOS,
+    CertificateRecord, ClientRecord, DnsGroupRecord, Inbound, OutboundGroupRecord, PanelSettings,
+    RoutingRuleRecord, RuleSourceGroupRecord, SubscriptionRecord, DEFAULT_LETSENCRYPT_DIR,
+    DEFAULT_LETSENCRYPT_TOS,
 };
 use crate::ops_util::{
     backups_dir, build_backup_caption, check_github_updates, create_local_backup,
-    list_local_backups, sanitize_backup_filename, schedule_panel_restart, send_backup_to_telegram,
-    upgrade_panel_binary, upgrade_shoes_binary,
+    list_local_backups, parse_wireguard_conf, register_cloudflare_warp, sanitize_backup_filename,
+    schedule_panel_restart, send_backup_to_telegram, sync_rule_source_group, upgrade_panel_binary,
+    upgrade_shoes_binary,
 };
 use crate::state::{is_loopback_or_unspecified_host, AppState};
 use crate::sub_gen::{
     build_client_share_info, generate_subscription_with_certs, SubFormat,
 };
-use crate::yaml_gen::{build_shoes_yaml, normalize_acme_domains};
+use crate::yaml_gen::{build_shoes_yaml_full, normalize_acme_domains};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
@@ -124,6 +126,11 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/keygen/reality", get(api_keygen_reality))
         .route("/keygen/ss2022", get(api_keygen_ss2022))
         .route("/keygen/random", get(api_keygen_random))
+        .route("/keygen/wireguard", get(api_keygen_wireguard))
+        .route("/keygen/warp", post(api_keygen_warp))
+        .route("/keygen/parse-wg-conf", post(api_parse_wg_conf))
+        .route("/keygen/vless-encryption", get(api_keygen_vless_encryption))
+        .route("/keygen/mldsa65", get(api_keygen_mldsa65))
         // Certificates
         .route(
             "/certificates",
@@ -139,12 +146,23 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             post(api_apply_panel_https),
         )
         .route("/certificates/{id}", delete(api_delete_cert))
-        // Outbound Groups & Routing Rules
+        // Outbound Groups, DNS Groups, Rule Sources & Routing Rules
         .route(
             "/outbound-groups",
             get(api_list_outbound_groups).post(api_save_outbound_group),
         )
         .route("/outbound-groups/{id}", delete(api_delete_outbound_group))
+        .route(
+            "/dns-groups",
+            get(api_list_dns_groups).post(api_save_dns_group),
+        )
+        .route("/dns-groups/{id}", delete(api_delete_dns_group))
+        .route(
+            "/rule-sources",
+            get(api_list_rule_sources).post(api_save_rule_source),
+        )
+        .route("/rule-sources/{id}/sync", post(api_sync_rule_source))
+        .route("/rule-sources/{id}", delete(api_delete_rule_source))
         .route(
             "/routing-rules",
             get(api_list_routing_rules).post(api_save_routing_rule),
@@ -411,13 +429,17 @@ async fn api_shoes_logs_clear(State(state): State<Arc<AppState>>) -> ApiResult {
 async fn api_shoes_config_preview(State(state): State<Arc<AppState>>) -> ApiResult {
     let settings = state.db.get_settings().map_err(internal_err)?;
     let certs = state.db.list_certificates().map_err(internal_err)?;
+    let dns_groups = state.db.list_dns_groups().map_err(internal_err)?;
+    let rule_sources = state.db.list_rule_source_groups().map_err(internal_err)?;
     let groups = state.db.list_outbound_groups().map_err(internal_err)?;
     let rules = state.db.list_routing_rules().map_err(internal_err)?;
     let inbounds = state.db.list_inbounds().map_err(internal_err)?;
-    let yaml = build_shoes_yaml(
+    let yaml = build_shoes_yaml_full(
         &state.db.data_dir,
         &settings,
         &certs,
+        &dns_groups,
+        &rule_sources,
         &groups,
         &rules,
         &inbounds,
@@ -789,6 +811,162 @@ fn default_rand_len() -> usize {
 
 async fn api_keygen_random(Query(q): Query<RandomQuery>) -> ApiResult {
     ok_json(json!({ "secret": generate_random_alnum(q.len.clamp(6, 64)) }))
+}
+
+async fn api_keygen_wireguard() -> ApiResult {
+    let (priv_k, pub_k, psk) = generate_wireguard_keypair();
+    ok_json(json!({
+        "private_key": priv_k,
+        "public_key": pub_k,
+        "preshared_key": psk,
+    }))
+}
+
+async fn api_keygen_warp() -> ApiResult {
+    let profile = register_cloudflare_warp().await.map_err(bad_req)?;
+    ok_json(profile)
+}
+
+#[derive(Deserialize)]
+struct ParseWgConfRequest {
+    conf: String,
+}
+
+async fn api_parse_wg_conf(Json(req): Json<ParseWgConfRequest>) -> ApiResult {
+    let profile = parse_wireguard_conf(&req.conf).map_err(bad_req)?;
+    ok_json(profile)
+}
+
+#[derive(Deserialize)]
+struct VlessEncQuery {
+    #[serde(default)]
+    auth: String, // "mlkem768" | "x25519"
+    #[serde(default)]
+    mode: String, // "native" | "xorpub" | "random"
+    #[serde(default)]
+    rtt: String, // "0rtt" | "1rtt"
+    #[serde(default)]
+    lifetime: String, // "600s" | "0s"
+}
+
+async fn api_keygen_vless_encryption(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<VlessEncQuery>,
+) -> ApiResult {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let bin = std::path::PathBuf::from(settings.shoes_bin_path.trim());
+    if !bin.exists() {
+        return Err(bad_req(format!(
+            "shoes binary not found at '{}'; install/configure shoes first to generate VLESS encryption keys",
+            bin.display()
+        )));
+    }
+    let auth = match q.auth.trim() {
+        "x25519" => "x25519",
+        _ => "mlkem768",
+    };
+    let mode = match q.mode.trim() {
+        "xorpub" => "xorpub",
+        "random" => "random",
+        _ => "native",
+    };
+    let rtt = match q.rtt.trim() {
+        "1rtt" => "1rtt",
+        _ => "0rtt",
+    };
+    let lifetime = if q.lifetime.trim().is_empty() {
+        "600s"
+    } else {
+        q.lifetime.trim()
+    };
+
+    let output = tokio::process::Command::new(&bin)
+        .args([
+            "generate-vless-encryption",
+            "--auth",
+            auth,
+            "--mode",
+            mode,
+            "--rtt",
+            rtt,
+            "--lifetime",
+            lifetime,
+        ])
+        .output()
+        .await
+        .map_err(|e| bad_req(format!("failed to execute shoes generate-vless-encryption: {e}")))?;
+
+    if !output.status.success() {
+        return Err(bad_req(format!(
+            "shoes generate-vless-encryption failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut encryption = String::new();
+    let mut decryption = String::new();
+    for line in stdout.lines() {
+        if let Some(v) = line.trim().strip_prefix("encryption:") {
+            encryption = v.trim().to_string();
+        } else if let Some(v) = line.trim().strip_prefix("decryption:") {
+            decryption = v.trim().to_string();
+        }
+    }
+    if encryption.is_empty() || decryption.is_empty() {
+        return Err(bad_req(format!(
+            "Unexpected output from shoes generate-vless-encryption: {stdout}"
+        )));
+    }
+    ok_json(json!({
+        "encryption": encryption,
+        "decryption": decryption,
+        "auth": auth,
+        "mode": mode,
+        "rtt": rtt,
+        "lifetime": lifetime,
+    }))
+}
+
+async fn api_keygen_mldsa65(State(state): State<Arc<AppState>>) -> ApiResult {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let bin = std::path::PathBuf::from(settings.shoes_bin_path.trim());
+    if !bin.exists() {
+        return Err(bad_req(format!(
+            "shoes binary not found at '{}'; install/configure shoes first to generate ML-DSA-65 keys",
+            bin.display()
+        )));
+    }
+    let output = tokio::process::Command::new(&bin)
+        .arg("generate-reality-mldsa65-keypair")
+        .output()
+        .await
+        .map_err(|e| bad_req(format!("failed to execute shoes generate-reality-mldsa65-keypair: {e}")))?;
+    if !output.status.success() {
+        return Err(bad_req(format!(
+            "shoes generate-reality-mldsa65-keypair failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut seed = String::new();
+    let mut verify = String::new();
+    for line in stdout.lines() {
+        if let Some(v) = line.trim().strip_prefix("mldsa65_seed:") {
+            seed = v.trim().to_string();
+        } else if let Some(v) = line.trim().strip_prefix("mldsa65_verify:") {
+            verify = v.trim().to_string();
+        }
+    }
+    if seed.is_empty() || verify.is_empty() {
+        return Err(bad_req(format!(
+            "Unexpected output from shoes generate-reality-mldsa65-keypair: {stdout}"
+        )));
+    }
+    ok_json(json!({
+        "mldsa65_seed": seed,
+        "mldsa65_verify": verify,
+    }))
 }
 
 // ==================== Certificates ====================
@@ -1292,8 +1470,24 @@ async fn api_save_outbound_group(
     State(state): State<Arc<AppState>>,
     Json(g): Json<OutboundGroupRecord>,
 ) -> ApiResult {
+    let previous = if g.id > 0 {
+        state
+            .db
+            .list_outbound_groups()
+            .ok()
+            .and_then(|all| all.into_iter().find(|item| item.id == g.id))
+    } else {
+        None
+    };
     let saved = state.db.save_outbound_group(g).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = previous {
+            let _ = state.db.save_outbound_group(prev);
+        } else {
+            let _ = state.db.delete_outbound_group(saved.id);
+        }
+        return Err(bad_req(e));
+    }
     ok_json(saved)
 }
 
@@ -1301,8 +1495,165 @@ async fn api_delete_outbound_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let existing = state
+        .db
+        .list_outbound_groups()
+        .map_err(internal_err)?
+        .into_iter()
+        .find(|g| g.id == id);
     state.db.delete_outbound_group(id).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = existing {
+            let _ = state.db.save_outbound_group(prev);
+        }
+        return Err(bad_req(e));
+    }
+    ok_json(true)
+}
+
+// ==================== DNS Groups ====================
+
+async fn api_list_dns_groups(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok_json(state.db.list_dns_groups().map_err(internal_err)?)
+}
+
+async fn api_save_dns_group(
+    State(state): State<Arc<AppState>>,
+    Json(g): Json<DnsGroupRecord>,
+) -> ApiResult {
+    let previous = if g.id > 0 {
+        state
+            .db
+            .list_dns_groups()
+            .ok()
+            .and_then(|all| all.into_iter().find(|item| item.id == g.id))
+    } else {
+        None
+    };
+    let saved = state.db.save_dns_group(g).map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = previous {
+            let _ = state.db.save_dns_group(prev);
+        } else {
+            let _ = state.db.delete_dns_group(saved.id);
+        }
+        return Err(bad_req(e));
+    }
+    ok_json(saved)
+}
+
+async fn api_delete_dns_group(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let existing = state
+        .db
+        .list_dns_groups()
+        .map_err(internal_err)?
+        .into_iter()
+        .find(|g| g.id == id)
+        .ok_or_else(|| bad_req("DNS group not found"))?;
+    if let Ok(settings) = state.db.get_settings() {
+        if settings.core_global.default_dns_group.trim() == existing.name.trim() {
+            return Err(bad_req(format!(
+                "DNS group '{}' is currently set as global default DNS. Clear default DNS first.",
+                existing.name
+            )));
+        }
+    }
+    state.db.delete_dns_group(id).map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        let _ = state.db.save_dns_group(existing);
+        return Err(bad_req(e));
+    }
+    ok_json(true)
+}
+
+// ==================== Rule Source Groups ====================
+
+async fn api_list_rule_sources(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok_json(state.db.list_rule_source_groups().map_err(internal_err)?)
+}
+
+async fn api_save_rule_source(
+    State(state): State<Arc<AppState>>,
+    Json(mut g): Json<RuleSourceGroupRecord>,
+) -> ApiResult {
+    if g.name.trim().is_empty() {
+        return Err(bad_req("Rule source group name must not be empty"));
+    }
+    if g.items.is_empty() {
+        return Err(bad_req(
+            "Rule source group must contain at least one URL or local file source",
+        ));
+    }
+    let previous = if g.id > 0 {
+        state.db.get_rule_source_group(g.id).ok().flatten()
+    } else {
+        None
+    };
+
+    // For panel-managed remote URLs, download and cache before running `shoes check`
+    if g.enable {
+        let needs_panel_sync = g
+            .items
+            .iter()
+            .any(|item| item.source_type == "url" && item.sync_mode != "shoes_native");
+        if needs_panel_sync {
+            sync_rule_source_group(&state.db.data_dir, &mut g)
+                .await
+                .map_err(bad_req)?;
+        }
+    }
+
+    let saved = state.db.save_rule_source_group(g).map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = previous {
+            let _ = state.db.save_rule_source_group(prev);
+        } else {
+            let _ = state.db.delete_rule_source_group(saved.id);
+        }
+        return Err(bad_req(e));
+    }
+    ok_json(saved)
+}
+
+async fn api_sync_rule_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let mut group = state
+        .db
+        .get_rule_source_group(id)
+        .map_err(internal_err)?
+        .ok_or_else(|| bad_req("Rule source group not found"))?;
+    let changed = sync_rule_source_group(&state.db.data_dir, &mut group)
+        .await
+        .map_err(bad_req)?;
+    state
+        .db
+        .update_rule_source_items(group.id, &group.items)
+        .map_err(internal_err)?;
+    if group.enable {
+        state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    }
+    ok_json(json!({ "group": group, "changed": changed }))
+}
+
+async fn api_delete_rule_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let existing = state
+        .db
+        .get_rule_source_group(id)
+        .map_err(internal_err)?
+        .ok_or_else(|| bad_req("Rule source group not found"))?;
+    state.db.delete_rule_source_group(id).map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        let _ = state.db.save_rule_source_group(existing);
+        return Err(bad_req(e));
+    }
     ok_json(true)
 }
 
@@ -1314,8 +1665,24 @@ async fn api_save_routing_rule(
     State(state): State<Arc<AppState>>,
     Json(r): Json<RoutingRuleRecord>,
 ) -> ApiResult {
+    let previous = if r.id > 0 {
+        state
+            .db
+            .list_routing_rules()
+            .ok()
+            .and_then(|all| all.into_iter().find(|item| item.id == r.id))
+    } else {
+        None
+    };
     let saved = state.db.save_routing_rule(r).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = previous {
+            let _ = state.db.save_routing_rule(prev);
+        } else {
+            let _ = state.db.delete_routing_rule(saved.id);
+        }
+        return Err(bad_req(e));
+    }
     ok_json(saved)
 }
 
@@ -1323,8 +1690,19 @@ async fn api_delete_routing_rule(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let existing = state
+        .db
+        .list_routing_rules()
+        .map_err(internal_err)?
+        .into_iter()
+        .find(|r| r.id == id);
     state.db.delete_routing_rule(id).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = existing {
+            let _ = state.db.save_routing_rule(prev);
+        }
+        return Err(bad_req(e));
+    }
     ok_json(true)
 }
 
