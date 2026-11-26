@@ -1965,7 +1965,7 @@ pub async fn validated_config(db: &Database, settings: &PanelSettings) -> Result
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let bin_path = Path::new(settings.shoes_bin_path.trim());
-    if bin_path.exists() {
+    if bin_path.is_file() {
         use std::io::Write;
         let mut tmp = tempfile::Builder::new()
             .prefix(".shoes-check-")

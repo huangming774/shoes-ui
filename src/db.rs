@@ -275,7 +275,7 @@ impl Database {
             PathBuf::from("/usr/bin/shoes"),
         ];
         for c in &candidates {
-            if c.exists() {
+            if c.is_file() {
                 if let Ok(abs) = std::fs::canonicalize(c) {
                     let s = abs.to_string_lossy().to_string();
                     return s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
