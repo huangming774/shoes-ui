@@ -42,6 +42,8 @@ export const api = {
   me: () => apiFetch('/auth/me'),
 
   status: () => apiFetch('/status'),
+  dailyTraffic: () => apiFetch('/traffic/daily'),
+  coreHistory: () => apiFetch('/status/history'),
   shoesStart: () => apiFetch('/shoes/start', { method: 'POST' }),
   shoesStop: () => apiFetch('/shoes/stop', { method: 'POST' }),
   shoesRestart: () => apiFetch('/shoes/restart', { method: 'POST' }),
@@ -83,9 +85,16 @@ export const api = {
   genRandom: (len = 20) => apiFetch(`/keygen/random?len=${len}`),
 
   listCerts: () => apiFetch('/certificates'),
+  acmeMeta: (directory_url = '') =>
+    apiFetch(
+      `/certificates/acme-meta${directory_url ? `?directory_url=${encodeURIComponent(directory_url)}` : ''}`
+    ),
   saveCert: (payload) => apiFetch('/certificates', { method: 'POST', body: payload }),
   uploadCert: (payload) => apiFetch('/certificates/upload', { method: 'POST', body: payload }),
   selfSignedCert: (payload) => apiFetch('/certificates/self-signed', { method: 'POST', body: payload }),
+  issueIpCert: (payload) => apiFetch('/certificates/issue-ip', { method: 'POST', body: payload }),
+  renewCert: (id) => apiFetch(`/certificates/${id}/renew`, { method: 'POST' }),
+  applyPanelHttps: (id) => apiFetch(`/certificates/${id}/apply-panel-https`, { method: 'POST' }),
   deleteCert: (id) => apiFetch(`/certificates/${id}`, { method: 'DELETE' }),
 
   listOutboundGroups: () => apiFetch('/outbound-groups'),
@@ -106,4 +115,25 @@ export const api = {
   setPublicHost: (public_host) => apiFetch('/settings/public-host', { method: 'POST', body: { public_host } }),
   changePassword: (payload) => apiFetch('/settings/password', { method: 'POST', body: payload }),
   backupDbUrl: () => `${getApiBase()}/settings/backup-db`,
+  restoreDb: (file) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    return apiFetch('/settings/restore-db', { method: 'POST', body: fd });
+  },
+  listBackups: () => apiFetch('/settings/backups'),
+  backupNow: (send_telegram = false) =>
+    apiFetch('/settings/backup-now', { method: 'POST', body: { send_telegram } }),
+  backupTgTest: (payload = {}) =>
+    apiFetch('/settings/backup-tg-test', { method: 'POST', body: payload }),
+  downloadLocalBackupUrl: (filename) =>
+    `${getApiBase()}/settings/backups/${encodeURIComponent(filename)}`,
+  restoreLocalBackup: (filename) =>
+    apiFetch(`/settings/backups/${encodeURIComponent(filename)}/restore`, { method: 'POST' }),
+  deleteLocalBackup: (filename) =>
+    apiFetch(`/settings/backups/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
+
+  restartPanel: () => apiFetch('/panel/restart', { method: 'POST' }),
+  checkUpdates: (force = false) => apiFetch(`/system/updates${force ? '?force=1' : ''}`),
+  upgradePanel: () => apiFetch('/system/upgrade-panel', { method: 'POST' }),
+  upgradeShoes: () => apiFetch('/system/upgrade-shoes', { method: 'POST' }),
 };

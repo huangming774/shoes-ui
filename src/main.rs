@@ -1,9 +1,11 @@
+mod acme_util;
 mod api;
 mod auth;
 mod crypto_util;
 mod db;
 mod models;
 mod monitor;
+mod ops_util;
 mod process;
 mod state;
 mod sub_gen;
@@ -47,12 +49,268 @@ fn print_help() {
 
 USAGE:
   shoes-panel [serve] [--data-dir <DIR>] [--port <PORT>]
-  shoes-panel reset [--username <USER>] [--password <PASS>] [--data-dir <DIR>]
-  shoes-panel setting [--port <PORT>] [--base-path <PATH>] [--shoes-bin <PATH>] [--data-dir <DIR>]
+  shoes-panel reset [--username <USER>] [--password <PASS>] [--random] [--data-dir <DIR>]
+  shoes-panel setting [--port <PORT>] [--base-path <PATH>] [--shoes-bin <PATH>] [--public-host <HOST>] [--data-dir <DIR>]
+  shoes-panel cert ip [--ip <IP>] [--email <EMAIL>] [--listen <ADDR>] [--staging] [--panel-https] [--data-dir <DIR>]
+  shoes-panel cert self-signed [--ip <IP>] [--panel-https] [--data-dir <DIR>]
+  shoes-panel cert clear [--data-dir <DIR>]
+  shoes-panel backup [--data-dir <DIR>]
+  shoes-panel restore <BACKUP_DB_FILE> [--data-dir <DIR>]
   shoes-panel info [--data-dir <DIR>]
   shoes-panel version",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+async fn detect_public_ip_cli() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .no_proxy()
+        .build()
+        .ok()?;
+    for url in [
+        "https://4.ipw.cn",
+        "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com",
+        "https://6.ipw.cn",
+    ] {
+        if let Ok(resp) = client.get(url).send().await {
+            if resp.status().is_success() {
+                if let Ok(txt) = resp.text().await {
+                    let cand = txt.trim();
+                    if let Ok(ip) = cand.parse::<std::net::IpAddr>() {
+                        if acme_util::is_globally_routable_ip(ip) {
+                            return Some(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn run_cert_cli(db: &Database, args: &[String]) -> Result<()> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or("help");
+    if matches!(action, "help" | "--help" | "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    let mut ips: Vec<String> = Vec::new();
+    let mut email = String::new();
+    let mut listen = "0.0.0.0:80".to_string();
+    let mut directory_url = crate::models::DEFAULT_LETSENCRYPT_DIR.to_string();
+    let mut name_arg: Option<String> = None;
+    let mut panel_https = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ip" if i + 1 < args.len() => {
+                for part in args[i + 1].split([',', ' ']) {
+                    let t = part.trim();
+                    if !t.is_empty() {
+                        ips.push(t.to_string());
+                    }
+                }
+                i += 2;
+            }
+            "--email" if i + 1 < args.len() => {
+                email = args[i + 1].trim().to_string();
+                i += 2;
+            }
+            "--listen" if i + 1 < args.len() => {
+                listen = args[i + 1].trim().to_string();
+                i += 2;
+            }
+            "--directory" if i + 1 < args.len() => {
+                directory_url = args[i + 1].trim().to_string();
+                i += 2;
+            }
+            "--staging" => {
+                directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+                i += 1;
+            }
+            "--name" if i + 1 < args.len() => {
+                name_arg = Some(args[i + 1].trim().to_string());
+                i += 2;
+            }
+            "--panel-https" => {
+                panel_https = true;
+                i += 1;
+            }
+            "--data-dir" | "-d" if i + 1 < args.len() => {
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    match action {
+        "ip" => {
+            if ips.is_empty() {
+                if let Ok(s) = db.get_settings() {
+                    let ph = s.public_host.trim().trim_matches(['[', ']']);
+                    if ph.parse::<std::net::IpAddr>().is_ok() {
+                        ips.push(ph.to_string());
+                    }
+                }
+            }
+            if ips.is_empty() {
+                if let Some(detected) = detect_public_ip_cli().await {
+                    ips.push(detected);
+                }
+            }
+            if ips.is_empty() {
+                anyhow::bail!("Could not determine server public IP; pass --ip <PUBLIC_IP>");
+            }
+
+            let safe_name = acme_util::sanitize_cert_filename(
+                name_arg.as_deref().unwrap_or("panel-ip-ssl"),
+            );
+            let issued = acme_util::issue_shortlived_ip_cert(
+                &db.data_dir,
+                &safe_name,
+                &ips,
+                &email,
+                &directory_url,
+                &listen,
+            )
+            .await?;
+
+            let cert_dir = db.data_dir.join("certs");
+            let cert_path = cert_dir.join(format!("{safe_name}.crt"));
+            let key_path = cert_dir.join(format!("{safe_name}.key"));
+            acme_util::write_cert_and_key_atomic(
+                &cert_path,
+                &key_path,
+                &issued.cert_pem,
+                &issued.key_pem,
+            )?;
+
+            let cert_str = cert_path.to_string_lossy().replace('\\', "/");
+            let key_str = key_path.to_string_lossy().replace('\\', "/");
+            let existing_id = db
+                .list_certificates()?
+                .into_iter()
+                .find(|c| c.name == safe_name)
+                .map(|c| c.id)
+                .unwrap_or(0);
+
+            db.save_certificate(crate::models::CertificateRecord {
+                id: existing_id,
+                name: safe_name.clone(),
+                cert_type: "acme_ip".to_string(),
+                cert_file: cert_str.clone(),
+                key_file: key_str.clone(),
+                domains: if issued.info.sans.is_empty() {
+                    ips.clone()
+                } else {
+                    issued.info.sans.clone()
+                },
+                email,
+                directory_url,
+                terms_of_service: issued.terms_of_service,
+                challenge_type: "http01".to_string(),
+                http01_listen: listen,
+                remark: "Let's Encrypt IP SSL (shortlived 6d auto-renew)".to_string(),
+                created_at: 0,
+            })?;
+
+            if panel_https {
+                db.set_setting_kv("panel_cert_file", &cert_str)?;
+                db.set_setting_kv("panel_key_file", &key_str)?;
+            }
+
+            println!("==========================================");
+            println!("Free Let's Encrypt IP SSL issued successfully!");
+            println!("  Source Name : {safe_name}");
+            println!("  IP SANs     : {}", issued.info.sans.join(", "));
+            println!("  Cert File   : {cert_str}");
+            println!("  Key File    : {key_str}");
+            println!("  Panel HTTPS : {}", if panel_https { "ENABLED" } else { "unchanged" });
+            println!("==========================================");
+            Ok(())
+        }
+        "self-signed" => {
+            if ips.is_empty() {
+                if let Ok(s) = db.get_settings() {
+                    let ph = s.public_host.trim();
+                    if !ph.is_empty() && !crate::state::is_loopback_or_unspecified_host(ph) {
+                        ips.push(ph.to_string());
+                    }
+                }
+            }
+            if !ips.iter().any(|s| s == "localhost") {
+                ips.push("localhost".to_string());
+            }
+            if !ips.iter().any(|s| s == "127.0.0.1") {
+                ips.push("127.0.0.1".to_string());
+            }
+
+            let safe_name = acme_util::sanitize_cert_filename(
+                name_arg.as_deref().unwrap_or("panel-self-ssl"),
+            );
+            let (cert_pem, key_pem) = crate::crypto_util::generate_self_signed_cert(&ips)?;
+            let cert_dir = db.data_dir.join("certs");
+            let cert_path = cert_dir.join(format!("{safe_name}.crt"));
+            let key_path = cert_dir.join(format!("{safe_name}.key"));
+            acme_util::write_cert_and_key_atomic(&cert_path, &key_path, &cert_pem, &key_pem)?;
+
+            let cert_str = cert_path.to_string_lossy().replace('\\', "/");
+            let key_str = key_path.to_string_lossy().replace('\\', "/");
+            let existing_id = db
+                .list_certificates()?
+                .into_iter()
+                .find(|c| c.name == safe_name)
+                .map(|c| c.id)
+                .unwrap_or(0);
+
+            db.save_certificate(crate::models::CertificateRecord {
+                id: existing_id,
+                name: safe_name.clone(),
+                cert_type: "files".to_string(),
+                cert_file: cert_str.clone(),
+                key_file: key_str.clone(),
+                domains: ips.clone(),
+                email: String::new(),
+                directory_url: String::new(),
+                terms_of_service: String::new(),
+                challenge_type: "http01".to_string(),
+                http01_listen: String::new(),
+                remark: "Self-Signed IP SSL (180d)".to_string(),
+                created_at: 0,
+            })?;
+
+            if panel_https {
+                db.set_setting_kv("panel_cert_file", &cert_str)?;
+                db.set_setting_kv("panel_key_file", &key_str)?;
+            }
+
+            println!("==========================================");
+            println!("Self-signed IP SSL certificate generated!");
+            println!("  Source Name : {safe_name}");
+            println!("  SANs        : {}", ips.join(", "));
+            println!("  Cert File   : {cert_str}");
+            println!("  Key File    : {key_str}");
+            println!("  Panel HTTPS : {}", if panel_https { "ENABLED" } else { "unchanged" });
+            println!("==========================================");
+            Ok(())
+        }
+        "clear" => {
+            db.set_setting_kv("panel_cert_file", "")?;
+            db.set_setting_kv("panel_key_file", "")?;
+            println!("Cleared Panel HTTPS certificate settings (panel will serve HTTP after restart).");
+            Ok(())
+        }
+        other => anyhow::bail!("Unknown cert subcommand '{other}' (expected: ip, self-signed, clear)"),
+    }
 }
 
 #[tokio::main]
@@ -86,6 +344,7 @@ async fn main() -> Result<()> {
     let mut data_dir_arg: Option<String> = None;
     let mut username_arg: Option<String> = None;
     let mut password_arg: Option<String> = None;
+    let mut random_creds = false;
     let mut port_arg: Option<u16> = None;
     let mut base_path_arg: Option<String> = None;
     let mut shoes_bin_arg: Option<String> = None;
@@ -105,6 +364,10 @@ async fn main() -> Result<()> {
             "--password" | "-p" if i + 1 < args.len() => {
                 password_arg = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--random" => {
+                random_creds = true;
+                i += 1;
             }
             "--port" if i + 1 < args.len() => {
                 port_arg = args[i + 1].parse().ok();
@@ -137,9 +400,43 @@ async fn main() -> Result<()> {
     let db = Arc::new(Database::open(&db_path, &data_dir)?);
 
     match subcmd.as_str() {
+        "cert" => {
+            run_cert_cli(&db, &args).await?;
+            return Ok(());
+        }
+        "backup" => {
+            let (entry, _) = ops_util::create_local_backup(&db, "cli", None)?;
+            let full_path = ops_util::backups_dir(&db.data_dir).join(&entry.filename);
+            println!("Backup saved: {} ({} bytes)", full_path.display(), entry.size_bytes);
+            return Ok(());
+        }
+        "restore" => {
+            let file_arg = args
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .ok_or_else(|| anyhow::anyhow!("Usage: shoes-panel restore <BACKUP_DB_FILE> [--data-dir <DIR>]"))?;
+            let bytes = std::fs::read(file_arg)
+                .with_context(|| format!("Cannot read backup file '{file_arg}'"))?;
+            let pre_backup = db.restore_from_bytes(&bytes)?;
+            println!("Database restored successfully from {file_arg}!");
+            println!("Safety pre-restore snapshot saved as backups/{pre_backup}");
+            return Ok(());
+        }
         "reset" => {
-            let user = username_arg.unwrap_or_else(|| "admin".to_string());
-            let pass = password_arg.unwrap_or_else(|| "admin".to_string());
+            let user = username_arg.unwrap_or_else(|| {
+                if random_creds {
+                    crypto_util::generate_random_alnum(8).to_lowercase()
+                } else {
+                    "admin".to_string()
+                }
+            });
+            let pass = password_arg.unwrap_or_else(|| {
+                if random_creds {
+                    crypto_util::generate_random_alnum(12)
+                } else {
+                    "admin".to_string()
+                }
+            });
             db.update_credentials(None, &user, &pass)?;
             println!("==========================================");
             println!("Credentials reset successfully!");
@@ -180,22 +477,32 @@ async fn main() -> Result<()> {
             } else {
                 s.public_host.trim()
             };
+            let url_host_raw = if s.public_host.trim().is_empty() {
+                "127.0.0.1"
+            } else {
+                s.public_host.trim()
+            };
+            let url_host = if url_host_raw.contains(':') && !url_host_raw.starts_with('[') {
+                format!("[{url_host_raw}]")
+            } else {
+                url_host_raw.to_string()
+            };
             println!("==========================================");
             println!("shoes-panel current configuration:");
             println!("  Admin user   : {u}");
+            println!("  Scheme       : {scheme}");
             println!("  Listen       : {}:{}", s.panel_listen, s.panel_port);
             println!("  Base path    : {}", s.panel_base_path);
             println!("  Public host  : {disp_host}");
             println!(
-                "  URL          : {scheme}://{}:{}{}",
-                if s.public_host.trim().is_empty() {
-                    "127.0.0.1"
+                "  SSL Cert     : {}",
+                if s.panel_cert_file.trim().is_empty() {
+                    "(disabled / HTTP)"
                 } else {
-                    s.public_host.trim()
-                },
-                s.panel_port,
-                s.panel_base_path
+                    s.panel_cert_file.trim()
+                }
             );
+            println!("  URL          : {scheme}://{url_host}:{}{}", s.panel_port, s.panel_base_path);
             println!("  shoes binary : {}", s.shoes_bin_path);
             println!("  shoes config : {}", s.shoes_config_path);
             println!("==========================================");
@@ -225,6 +532,8 @@ async fn main() -> Result<()> {
     let proc_mgr = ShoesProcessManager::new(db.clone());
     let monitor = RuntimeMonitor::new(db.clone(), proc_mgr.clone());
     let state = AppState::new(db.clone(), proc_mgr.clone(), monitor, &settings);
+    acme_util::spawn_cert_maintenance_loop(state.clone());
+    ops_util::spawn_auto_backup_loop(state.clone());
 
     // Ensure initial shoes.config.yaml is generated and optionally auto-start shoes
     if let Err(e) = proc_mgr.reload_config().await {
@@ -298,6 +607,7 @@ async fn main() -> Result<()> {
         )
         .await
         .context("failed to load panel TLS cert/key")?;
+        state.set_panel_tls_config(tls_cfg.clone());
 
         axum_server::bind_rustls(addr, tls_cfg)
             .serve(make_svc.into_make_service())
@@ -741,6 +1051,7 @@ mod tests {
                 timeout_ms: 5000,
                 tolerance_ms: 50,
                 members: vec![OutboundMember {
+                    h2mux: Default::default(),
                     name: "edge-1".to_string(),
                     protocol: "socks".to_string(),
                     address: "198.51.100.10:1080".to_string(),
@@ -902,6 +1213,1621 @@ mod tests {
         assert!(s_nv_node["tls"]["certificate"][0].as_str().unwrap().contains("BEGIN CERTIFICATE"));
         assert!(s_nv_node["tls"].get("insecure").is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn x509_der_inspector_and_validation_rules() -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem) = crypto_util::generate_self_signed_cert(&[
+            "node.example.test".to_string(),
+            "1.1.1.1".to_string(),
+            "2606:4700:4700::1111".to_string(),
+        ])?;
+        let info = acme_util::validate_cert_key_pair(&cert_pem, &key_pem).await?;
+        assert!(info.is_self_signed);
+        assert!(info.sans.iter().any(|s| s == "node.example.test"));
+        assert!(info.sans.iter().any(|s| s == "1.1.1.1"));
+        assert!(info.sans.iter().any(|s| s == "2606:4700:4700::1111"));
+        let days = (info.not_after - info.not_before) / 86400;
+        assert!((178..=182).contains(&days), "expected ~180d validity, got {days}d");
+
+        // Mismatched key must be rejected
+        let (_, other_key) = crypto_util::generate_self_signed_cert(&["other.test".to_string()])?;
+        assert!(acme_util::validate_cert_key_pair(&cert_pem, &other_key).await.is_err());
+
+        // Public IP validation rejects private/loopback/documentation IPs, accepts public IPv4/IPv6
+        assert!(acme_util::parse_and_validate_ip_targets(&["127.0.0.1".into()], false).is_err());
+        assert!(acme_util::parse_and_validate_ip_targets(&["192.168.1.10".into()], false).is_err());
+        assert!(acme_util::parse_and_validate_ip_targets(&["10.0.0.1".into()], false).is_err());
+        assert!(acme_util::parse_and_validate_ip_targets(&["100.64.0.1".into()], false).is_err());
+        assert!(acme_util::parse_and_validate_ip_targets(&["203.0.113.10".into()], false).is_err());
+        assert!(acme_util::parse_and_validate_ip_targets(&["fd00::1".into()], false).is_err());
+        let ok_ips = acme_util::parse_and_validate_ip_targets(
+            &["1.1.1.1".into(), "[2606:4700:4700::1111]".into()],
+            false,
+        )?;
+        assert_eq!(ok_ips.len(), 2);
+
+        // Domain ACME normalization lowercases, deduplicates, and rejects IPs/wildcards
+        let norm = yaml_gen::normalize_acme_domains(&[
+            "Proxy.Example.COM.".into(),
+            "proxy.example.com".into(),
+        ])?;
+        assert_eq!(norm, vec!["proxy.example.com"]);
+        assert!(yaml_gen::normalize_acme_domains(&["1.1.1.1".into()]).is_err());
+        assert!(yaml_gen::normalize_acme_domains(&["*.example.com".into()]).is_err());
+
+        // Distinct directory or domain produces distinct state_dir hash
+        let tmp = tempfile::tempdir()?;
+        let s1 = yaml_gen::acme_state_dir(tmp.path(), "main", "https://acme-staging-v02.api.letsencrypt.org/directory", &["a.example.com".into()]);
+        let s2 = yaml_gen::acme_state_dir(tmp.path(), "main", "https://acme-v02.api.letsencrypt.org/directory", &["a.example.com".into()]);
+        let s3 = yaml_gen::acme_state_dir(tmp.path(), "main", "https://acme-v02.api.letsencrypt.org/directory", &["b.example.com".into()]);
+        assert_ne!(s1, s2);
+        assert_ne!(s2, s3);
+        Ok(())
+    }
+
+    struct MockAcmeState {
+        base_url: String,
+        http01_port: u16,
+        ca_cert: rcgen::Certificate,
+        ca_key: rcgen::KeyPair,
+        jwk_thumbprint: parking_lot::Mutex<Option<String>>,
+        order_identifiers: parking_lot::Mutex<Vec<serde_json::Value>>,
+        order_profile: parking_lot::Mutex<Option<String>>,
+        authz_valid: std::sync::atomic::AtomicBool,
+        http01_verified: std::sync::atomic::AtomicBool,
+        issued_chain_pem: parking_lot::Mutex<Option<String>>,
+        nonce_seq: std::sync::atomic::AtomicU64,
+        cert_days: i64,
+    }
+
+    impl MockAcmeState {
+        fn next_nonce(&self) -> String {
+            let n = self.nonce_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            format!("mock-nonce-{n}")
+        }
+    }
+
+    async fn spawn_mock_acme_ca(
+        http01_port: u16,
+        cert_days: i64,
+    ) -> anyhow::Result<(String, Arc<MockAcmeState>, tokio::task::JoinHandle<()>)> {
+        use axum::{
+            extract::State as AState,
+            http::{header, StatusCode},
+            response::IntoResponse,
+            routing::{get, head, post},
+            Router,
+        };
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use chrono::Datelike;
+
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut ca_dn = rcgen::DistinguishedName::new();
+        ca_dn.push(rcgen::DnType::CommonName, "Shoes Panel Test ACME Root CA");
+        ca_params.distinguished_name = ca_dn;
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let state = Arc::new(MockAcmeState {
+            base_url: base_url.clone(),
+            http01_port,
+            ca_cert,
+            ca_key,
+            jwk_thumbprint: parking_lot::Mutex::new(None),
+            order_identifiers: parking_lot::Mutex::new(Vec::new()),
+            order_profile: parking_lot::Mutex::new(None),
+            authz_valid: std::sync::atomic::AtomicBool::new(false),
+            http01_verified: std::sync::atomic::AtomicBool::new(false),
+            issued_chain_pem: parking_lot::Mutex::new(None),
+            nonce_seq: std::sync::atomic::AtomicU64::new(0),
+            cert_days,
+        });
+
+        let decode_jws = |body: &str| -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
+            let v: serde_json::Value = serde_json::from_str(body)?;
+            let prot_b64 = v["protected"].as_str().unwrap_or("");
+            let pay_b64 = v["payload"].as_str().unwrap_or("");
+            let prot: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(prot_b64)?)?;
+            let pay: serde_json::Value = if pay_b64.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(pay_b64)?)?
+            };
+            Ok((prot, pay))
+        };
+
+        let app = Router::new()
+            .route(
+                "/directory",
+                get(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let body = serde_json::json!({
+                        "newNonce": format!("{}/new-nonce", st.base_url),
+                        "newAccount": format!("{}/new-acct", st.base_url),
+                        "newOrder": format!("{}/new-order", st.base_url),
+                        "meta": {
+                            "termsOfService": format!("{}/tos", st.base_url),
+                            "profiles": {
+                                "classic": format!("{}/profiles#classic", st.base_url),
+                                "shortlived": format!("{}/profiles#shortlived", st.base_url)
+                            }
+                        }
+                    });
+                    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], body.to_string())
+                }),
+            )
+            .route(
+                "/new-nonce",
+                head(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    (StatusCode::OK, [("replay-nonce", st.next_nonce())], "")
+                })
+                .get(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    (StatusCode::OK, [("replay-nonce", st.next_nonce())], "")
+                }),
+            )
+            .route(
+                "/new-acct",
+                post(move |AState(st): AState<Arc<MockAcmeState>>, body: String| async move {
+                    let (prot, _) = decode_jws(&body).unwrap();
+                    if let Some(jwk) = prot.get("jwk") {
+                        let x = jwk["x"].as_str().unwrap_or("");
+                        let y = jwk["y"].as_str().unwrap_or("");
+                        let canon = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+                        let tp = URL_SAFE_NO_PAD.encode(
+                            ring::digest::digest(&ring::digest::SHA256, canon.as_bytes()).as_ref(),
+                        );
+                        *st.jwk_thumbprint.lock() = Some(tp);
+                    }
+                    let resp = serde_json::json!({ "status": "valid" });
+                    (
+                        StatusCode::CREATED,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (header::LOCATION, format!("{}/acct/1", st.base_url)),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/acct/1",
+                post(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let resp = serde_json::json!({ "status": "valid" });
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (header::LOCATION, format!("{}/acct/1", st.base_url)),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/new-order",
+                post(move |AState(st): AState<Arc<MockAcmeState>>, body: String| async move {
+                    let (_, pay) = decode_jws(&body).unwrap();
+                    let ids = pay["identifiers"].as_array().cloned().unwrap_or_default();
+                    *st.order_identifiers.lock() = ids.clone();
+                    *st.order_profile.lock() =
+                        pay.get("profile").and_then(|v| v.as_str()).map(str::to_string);
+                    let resp = serde_json::json!({
+                        "status": "pending",
+                        "identifiers": ids,
+                        "authorizations": [format!("{}/authz/1", st.base_url)],
+                        "finalize": format!("{}/order/1/finalize", st.base_url)
+                    });
+                    (
+                        StatusCode::CREATED,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (header::LOCATION, format!("{}/order/1", st.base_url)),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/authz/1",
+                post(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let valid = st.authz_valid.load(std::sync::atomic::Ordering::SeqCst);
+                    let status = if valid { "valid" } else { "pending" };
+                    let id0 = st
+                        .order_identifiers
+                        .lock()
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type":"dns","value":"example.test"}));
+                    let resp = serde_json::json!({
+                        "identifier": id0,
+                        "status": status,
+                        "challenges": [{
+                            "type": "http-01",
+                            "url": format!("{}/chall/1", st.base_url),
+                            "status": status,
+                            "token": "mock-http01-token-abcdef"
+                        }]
+                    });
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/chall/1",
+                post(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let token = "mock-http01-token-abcdef";
+                    let host_hdr = st
+                        .order_identifiers
+                        .lock()
+                        .first()
+                        .and_then(|v| v["value"].as_str())
+                        .unwrap_or("127.0.0.1")
+                        .to_string();
+                    let url = format!(
+                        "http://127.0.0.1:{}/.well-known/acme-challenge/{token}",
+                        st.http01_port
+                    );
+                    let cli = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .no_proxy()
+                        .build()
+                        .unwrap();
+                    let resp_text = cli
+                        .get(&url)
+                        .header(header::HOST, host_hdr)
+                        .send()
+                        .await
+                        .ok()
+                        .and_then(|r| if r.status().is_success() { Some(r) } else { None });
+                    let fetched = match resp_text {
+                        Some(r) => r.text().await.unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    let expected_tp = st.jwk_thumbprint.lock().clone().unwrap_or_default();
+                    let expected = format!("{token}.{expected_tp}");
+                    let ok = !expected_tp.is_empty() && fetched.trim() == expected;
+                    if ok {
+                        st.http01_verified.store(true, std::sync::atomic::Ordering::SeqCst);
+                        st.authz_valid.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let status = if ok { "valid" } else { "invalid" };
+                    let resp = serde_json::json!({
+                        "type": "http-01",
+                        "url": format!("{}/chall/1", st.base_url),
+                        "status": status,
+                        "token": token
+                    });
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/order/1/finalize",
+                post(move |AState(st): AState<Arc<MockAcmeState>>, body: String| async move {
+                    let (_, pay) = decode_jws(&body).unwrap();
+                    let csr_b64 = pay["csr"].as_str().unwrap_or("");
+                    let csr_der = URL_SAFE_NO_PAD.decode(csr_b64).unwrap();
+
+                    // Parse PKCS#10 CSR DER to extract SubjectPublicKeyInfo raw key bytes + check subject DN
+                    fn read_tlv<'a>(buf: &mut &'a [u8]) -> (u8, &'a [u8]) {
+                        let tag = buf[0];
+                        let lb = buf[1];
+                        let (len, hdr) = if lb & 0x80 == 0 {
+                            (lb as usize, 2)
+                        } else {
+                            let c = (lb & 0x7f) as usize;
+                            let mut l = 0usize;
+                            for &b in &buf[2..2 + c] {
+                                l = (l << 8) | (b as usize);
+                            }
+                            (l, 2 + c)
+                        };
+                        let body = &buf[hdr..hdr + len];
+                        *buf = &buf[hdr + len..];
+                        (tag, body)
+                    }
+                    let mut root = csr_der.as_slice();
+                    let (_, csr_seq) = read_tlv(&mut root);
+                    let mut c1 = csr_seq;
+                    let (_, cri_seq) = read_tlv(&mut c1);
+                    let mut cri = cri_seq;
+                    let _ver = read_tlv(&mut cri);
+                    let (_, subj_seq) = read_tlv(&mut cri);
+                    let (_, spki_seq) = read_tlv(&mut cri);
+                    let mut spki = spki_seq;
+                    let _alg = read_tlv(&mut spki);
+                    let (_, bit_str) = read_tlv(&mut spki);
+                    let pub_key_bytes = bit_str[1..].to_vec(); // skip unused-bits byte
+
+                    struct RawP256Pub(Vec<u8>);
+                    impl rcgen::PublicKeyData for RawP256Pub {
+                        fn der_bytes(&self) -> &[u8] {
+                            &self.0
+                        }
+                        fn algorithm(&self) -> &rcgen::SignatureAlgorithm {
+                            &rcgen::PKCS_ECDSA_P256_SHA256
+                        }
+                    }
+
+                    let ids = st.order_identifiers.lock().clone();
+                    let is_ip_order = ids.iter().any(|v| v["type"] == "ip");
+                    if is_ip_order {
+                        assert!(
+                            subj_seq.is_empty(),
+                            "Let's Encrypt IP CSR must have an empty Subject/CN!"
+                        );
+                    }
+
+                    let mut leaf_params = rcgen::CertificateParams::default();
+                    leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+                    let mut sans = Vec::new();
+                    for id in &ids {
+                        let val = id["value"].as_str().unwrap_or("");
+                        if id["type"] == "ip" {
+                            sans.push(rcgen::SanType::IpAddress(val.parse().unwrap()));
+                        } else {
+                            sans.push(rcgen::SanType::DnsName(val.try_into().unwrap()));
+                        }
+                    }
+                    leaf_params.subject_alt_names = sans;
+                    let now = chrono::Utc::now();
+                    let start = now - chrono::Duration::days(1);
+                    let end = now + chrono::Duration::days(st.cert_days);
+                    leaf_params.not_before = rcgen::date_time_ymd(
+                        start.year(),
+                        start.month() as u8,
+                        start.day() as u8,
+                    );
+                    leaf_params.not_after = rcgen::date_time_ymd(
+                        end.year(),
+                        end.month() as u8,
+                        end.day() as u8,
+                    );
+                    let leaf = leaf_params
+                        .signed_by(&RawP256Pub(pub_key_bytes), &st.ca_cert, &st.ca_key)
+                        .unwrap();
+                    let fullchain = format!("{}{}", leaf.pem(), st.ca_cert.pem());
+                    *st.issued_chain_pem.lock() = Some(fullchain);
+                    let resp = serde_json::json!({
+                        "status": "valid",
+                        "identifiers": ids,
+                        "authorizations": [format!("{}/authz/1", st.base_url)],
+                        "finalize": format!("{}/order/1/finalize", st.base_url),
+                        "certificate": format!("{}/cert/1", st.base_url)
+                    });
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/order/1",
+                post(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let has_cert = st.issued_chain_pem.lock().is_some();
+                    let valid = st.authz_valid.load(std::sync::atomic::Ordering::SeqCst);
+                    let status = if has_cert {
+                        "valid"
+                    } else if valid {
+                        "ready"
+                    } else {
+                        "pending"
+                    };
+                    let ids = st.order_identifiers.lock().clone();
+                    let mut resp = serde_json::json!({
+                        "status": status,
+                        "identifiers": ids,
+                        "authorizations": [format!("{}/authz/1", st.base_url)],
+                        "finalize": format!("{}/order/1/finalize", st.base_url)
+                    });
+                    if has_cert {
+                        resp["certificate"] =
+                            serde_json::json!(format!("{}/cert/1", st.base_url));
+                    }
+                    (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "application/json".to_string()),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        resp.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/cert/1",
+                post(|AState(st): AState<Arc<MockAcmeState>>| async move {
+                    let pem = st.issued_chain_pem.lock().clone().unwrap_or_default();
+                    (
+                        StatusCode::OK,
+                        [
+                            (
+                                header::CONTENT_TYPE,
+                                "application/pem-certificate-chain".to_string(),
+                            ),
+                            (
+                                header::HeaderName::from_static("replay-nonce"),
+                                st.next_nonce(),
+                            ),
+                        ],
+                        pem,
+                    )
+                        .into_response()
+                }),
+            )
+            .with_state(state.clone());
+
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok((format!("{base_url}/directory"), state, handle))
+    }
+
+    #[tokio::test]
+    async fn acme_shortlived_ip_ssl_end_to_end_and_shoes_check() -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Reserve a free ephemeral port for temporary HTTP-01 listener
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let http01_port = probe.local_addr()?.port();
+        drop(probe);
+
+        let (dir_url, ca_state, ca_handle) = spawn_mock_acme_ca(http01_port, 6).await?;
+        let tmp = tempfile::tempdir()?;
+
+        // 1. Live directory metadata fetch
+        let meta = acme_util::fetch_acme_directory_meta(&dir_url).await?;
+        assert!(meta.supports_shortlived);
+        assert!(meta.terms_of_service.as_deref().unwrap_or("").ends_with("/tos"));
+
+        // 2. Issue real shortlived IP cert via RFC 8555 + RFC 8738 HTTP-01
+        let issued = acme_util::issue_shortlived_ip_cert(
+            tmp.path(),
+            "my-ip-ssl",
+            &["127.0.0.1".to_string()],
+            "ops@example.test",
+            &dir_url,
+            &format!("127.0.0.1:{http01_port}"),
+        )
+        .await?;
+
+        assert!(ca_state.http01_verified.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(ca_state.order_profile.lock().as_deref(), Some("shortlived"));
+        assert_eq!(ca_state.order_identifiers.lock()[0]["type"], "ip");
+        assert_eq!(ca_state.order_identifiers.lock()[0]["value"], "127.0.0.1");
+        assert!(!issued.info.is_self_signed, "certificate must be CA-signed");
+        assert!(issued.info.subject.is_empty(), "IP CSR must NOT set CommonName");
+        assert_eq!(issued.info.sans, vec!["127.0.0.1"]);
+
+        // 3. Persist as acme_ip cert source + verify shoes.exe check + subscription export
+        let cert_path = tmp.path().join("certs/my-ip-ssl.crt");
+        let key_path = tmp.path().join("certs/my-ip-ssl.key");
+        acme_util::write_cert_and_key_atomic(&cert_path, &key_path, &issued.cert_pem, &issued.key_pem)?;
+
+        let db = Database::open(&tmp.path().join("panel.db"), tmp.path())?;
+        let cert_rec = db.save_certificate(CertificateRecord {
+            id: 0,
+            name: "my-ip-ssl".into(),
+            cert_type: "acme_ip".into(),
+            cert_file: cert_path.to_string_lossy().replace('\\', "/"),
+            key_file: key_path.to_string_lossy().replace('\\', "/"),
+            domains: vec!["127.0.0.1".into()],
+            email: "ops@example.test".into(),
+            directory_url: dir_url.clone(),
+            terms_of_service: issued.terms_of_service.clone(),
+            challenge_type: "http01".into(),
+            http01_listen: format!("127.0.0.1:{http01_port}"),
+            remark: "IP SSL".into(),
+            created_at: 0,
+        })?;
+
+        let ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "remark": "ip-tls-vless",
+            "port": 23443,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {
+                    "cert_mode": "source",
+                    "certificate_source": "my-ip-ssl",
+                    "sni": "127.0.0.1",
+                    "allow_insecure": false
+                }
+            },
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?)?;
+
+        let settings = db.get_settings()?;
+        let yaml = yaml_gen::build_shoes_yaml(
+            tmp.path(),
+            &settings,
+            &db.list_certificates()?,
+            &[],
+            &[],
+            &db.list_inbounds()?,
+        )?;
+        // IP SNI must map to default_tls_target (RFC 6066)
+        assert!(yaml.contains("default_tls_target:"));
+        assert!(!yaml.contains("tls_targets:"));
+
+        // Subscription export for IP SSL must omit SNI and keep insecure=false
+        let share = sub_gen::build_client_share_info(&ib, &ib.clients[0], "127.0.0.1");
+        assert!(!share.uri.contains("sni="));
+        assert!(!share.uri.contains("allowInsecure=1"));
+
+        // Runtime status inspection reports issued + CA name
+        let rt = acme_util::inspect_certificate_runtime(tmp.path(), &cert_rec, vec!["ip-tls-vless".into()], "");
+        assert_eq!(rt.status, "issued");
+        assert!(!rt.is_self_signed);
+
+        // Validate against REAL shoes binary if present
+        let shoes_bin = std::path::PathBuf::from("shoes/target/debug/shoes.exe");
+        if shoes_bin.exists() {
+            let yp = tmp.path().join("ip_ssl.yaml");
+            std::fs::write(&yp, &yaml)?;
+            let out = std::process::Command::new(&shoes_bin).arg("check").arg(&yp).output()?;
+            assert!(
+                out.status.success(),
+                "shoes check failed on IP SSL config: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        ca_handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn domain_acme_real_shoes_e2e_and_alpn_standby() -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let shoes_bin = std::path::PathBuf::from("shoes/target/debug/shoes.exe");
+        if !shoes_bin.exists() {
+            return Ok(());
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let db = Database::open(&tmp.path().join("panel.db"), tmp.path())?;
+        let settings = db.get_settings()?;
+
+        // 1. TLS-ALPN-01 saved BEFORE any inbound must pass `shoes check` (deferred until attached)
+        let alpn_cert = db.save_certificate(CertificateRecord {
+            id: 0,
+            name: "alpn-domain".into(),
+            cert_type: "acme".into(),
+            cert_file: String::new(),
+            key_file: String::new(),
+            domains: vec!["ALPN.Example.TEST".into()],
+            email: "admin@example.test".into(),
+            directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            terms_of_service: DEFAULT_LETSENCRYPT_TOS.into(),
+            challenge_type: "tls_alpn01".into(),
+            http01_listen: String::new(),
+            remark: String::new(),
+            created_at: 0,
+        })?;
+        let yaml_standby = yaml_gen::build_shoes_yaml(
+            tmp.path(),
+            &settings,
+            &db.list_certificates()?,
+            &[],
+            &[],
+            &[],
+        )?;
+        assert!(!yaml_standby.contains("alpn-domain"));
+        let standby_path = tmp.path().join("alpn_standby.yaml");
+        std::fs::write(&standby_path, &yaml_standby)?;
+        let out = std::process::Command::new(&shoes_bin).arg("check").arg(&standby_path).output()?;
+        assert!(out.status.success(), "standby ALPN check failed: {}", String::from_utf8_lossy(&out.stderr));
+
+        let rt_standby = acme_util::inspect_certificate_runtime(tmp.path(), &alpn_cert, vec![], "");
+        assert_eq!(rt_standby.status, "unreferenced_alpn");
+
+        // 2. Attach TLS-ALPN-01 to TCP TLS inbound with uppercase SNI -> normalized & passes `shoes check`
+        let _ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "remark": "alpn-443",
+            "port": 24443,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {
+                    "cert_mode": "source",
+                    "certificate_source": "alpn-domain",
+                    "sni": "ALPN.Example.TEST",
+                    "allow_insecure": false
+                }
+            },
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?)?;
+        let yaml_bound = yaml_gen::build_shoes_yaml(
+            tmp.path(),
+            &settings,
+            &db.list_certificates()?,
+            &[],
+            &[],
+            &db.list_inbounds()?,
+        )?;
+        assert!(yaml_bound.contains("alpn-domain"));
+        assert!(yaml_bound.contains("alpn.example.test"));
+        let bound_path = tmp.path().join("alpn_bound.yaml");
+        std::fs::write(&bound_path, &yaml_bound)?;
+        let out2 = std::process::Command::new(&shoes_bin).arg("check").arg(&bound_path).output()?;
+        assert!(out2.status.success(), "bound ALPN check failed: {}", String::from_utf8_lossy(&out2.stderr));
+
+        // 3. LIVE REAL `shoes.exe` HTTP-01 domain ACME issuance against local loopback ACME CA!
+        let probe_http = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let http01_port = probe_http.local_addr()?.port();
+        drop(probe_http);
+        let probe_proxy = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let proxy_port = probe_proxy.local_addr()?.port();
+        drop(probe_proxy);
+
+        let (dir_url, ca_state, ca_handle) = spawn_mock_acme_ca(http01_port, 90).await?;
+        let meta = acme_util::fetch_acme_directory_meta(&dir_url).await?;
+
+        let tmp2 = tempfile::tempdir()?;
+        let db2 = Database::open(&tmp2.path().join("panel.db"), tmp2.path())?;
+        // Disable clash api to avoid port collision with running services
+        db2.set_setting_kv("clash_api_addr", "")?;
+        let settings2 = db2.get_settings()?;
+
+        let dom_cert = db2.save_certificate(CertificateRecord {
+            id: 0,
+            name: "live-domain".into(),
+            cert_type: "acme".into(),
+            cert_file: String::new(),
+            key_file: String::new(),
+            domains: vec!["proxy.example.test".into()],
+            email: "admin@example.test".into(),
+            directory_url: dir_url.clone(),
+            terms_of_service: meta.terms_of_service.unwrap_or_default(),
+            challenge_type: "http01".into(),
+            http01_listen: format!("127.0.0.1:{http01_port}"),
+            remark: String::new(),
+            created_at: 0,
+        })?;
+        let _ib2 = db2.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "trojan",
+            "remark": "dom-tls",
+            "listen": "127.0.0.1",
+            "port": proxy_port,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {
+                    "cert_mode": "source",
+                    "certificate_source": "live-domain",
+                    "sni": "proxy.example.test",
+                    "allow_insecure": false
+                }
+            },
+            "clients": [{"name": "u", "password": "secret-password-123"}]
+        }))?)?;
+
+        let yaml_live = yaml_gen::build_shoes_yaml(
+            tmp2.path(),
+            &settings2,
+            &db2.list_certificates()?,
+            &[],
+            &[],
+            &db2.list_inbounds()?,
+        )?;
+        let live_cfg = tmp2.path().join("live_acme.yaml");
+        std::fs::write(&live_cfg, &yaml_live)?;
+
+        let mut child = tokio::process::Command::new(&shoes_bin)
+            .arg(&live_cfg)
+            .env("RUST_LOG", "debug")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        let mut issued_ok = false;
+        while tokio::time::Instant::now() < deadline {
+            let rt = acme_util::inspect_certificate_runtime(tmp2.path(), &dom_cert, vec!["dom-tls".into()], "");
+            if rt.status == "issued" {
+                assert!(rt.sans.iter().any(|s| s == "proxy.example.test"));
+                assert!(!rt.is_self_signed);
+                issued_ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        let _ = child.kill().await;
+        let output = child.wait_with_output().await?;
+        ca_handle.abort();
+
+        let logs = format!(
+            "YAML:\n{yaml_live}\nSTDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            ca_state.http01_verified.load(std::sync::atomic::Ordering::SeqCst),
+            "shoes did not complete HTTP-01 challenge.\n{logs}"
+        );
+        assert!(
+            issued_ok,
+            "real shoes.exe did not persist issued ACME certificate into state.json.\n{logs}"
+        );
+
+        // 4. Verify Panel HTTPS export from Shoes ACME state.json produces valid RustlsConfig!
+        let (exp_cert, exp_key) = acme_util::export_acme_state_for_panel(tmp2.path(), &dom_cert)?;
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(&exp_cert, &exp_key).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn certificate_http_api_validation_rollback_and_panel_https() -> anyhow::Result<()> {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&tmp.path().join("panel.db"), tmp.path())?);
+        let settings = db.get_settings()?;
+        let proc_mgr = ShoesProcessManager::new(db.clone());
+        let monitor = RuntimeMonitor::new(db.clone(), proc_mgr.clone());
+        let state = AppState::new(db.clone(), proc_mgr, monitor, &settings);
+        let token = state.sessions.create_session("admin", 1);
+        let app = build_inner_router(state.clone());
+
+        let authed = |method: &str, uri: &str, body: Option<serde_json::Value>| -> Request<Body> {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(v) = body {
+                b = b.header(header::CONTENT_TYPE, "application/json");
+                b.body(Body::from(v.to_string())).unwrap()
+            } else {
+                b.body(Body::empty()).unwrap()
+            }
+        };
+
+        // 1. Mismatched cert/key upload must fail 400 without polluting DB
+        let (c1, _) = crypto_util::generate_self_signed_cert(&["a.test".into()])?;
+        let (_, k2) = crypto_util::generate_self_signed_cert(&["b.test".into()])?;
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/api/certificates/upload",
+                Some(serde_json::json!({
+                    "name": "bad-pair",
+                    "cert_pem": c1,
+                    "key_pem": k2
+                })),
+            ))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(db.list_certificates()?.is_empty());
+
+        // 2. Self-signed IP cert creation succeeds & GET /api/certificates includes runtime status
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/api/certificates/self-signed",
+                Some(serde_json::json!({
+                    "name": "ip-self",
+                    "domains": ["1.1.1.1", "localhost"],
+                    "remark": "No-Domain IP Self-Signed"
+                })),
+            ))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await?;
+        let created: serde_json::Value = serde_json::from_slice(&body_bytes)?;
+        let cert_id = created["data"]["id"].as_i64().unwrap();
+
+        // Bind it to an inbound
+        let ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "trojan",
+            "remark": "bound-node",
+            "port": 25443,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {
+                    "cert_mode": "source",
+                    "certificate_source": "ip-self",
+                    "allow_insecure": true
+                }
+            },
+            "clients": [{"name": "u", "password": "pw"}]
+        }))?)?;
+
+        // 3. GET /api/certificates returns runtime metadata + bound inbound list
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/api/certificates", None))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await?;
+        let list_json: serde_json::Value = serde_json::from_slice(&list_bytes)?;
+        let item = &list_json["data"][0];
+        assert_eq!(item["runtime"]["status"], "issued");
+        assert!(item["runtime"]["sans"].as_array().unwrap().iter().any(|s| s == "1.1.1.1"));
+        assert!(item["runtime"]["used_by"].as_array().unwrap()[0].as_str().unwrap().contains("bound-node"));
+
+        // 4. Deleting in-use cert must be blocked (400) and keep cert intact
+        let resp = app
+            .clone()
+            .oneshot(authed("DELETE", &format!("/api/certificates/{cert_id}"), None))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(db.list_certificates()?.len(), 1);
+
+        // 5. Apply to Panel HTTPS sets panel_cert_file & panel_key_file
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/api/certificates/{cert_id}/apply-panel-https"),
+                None,
+            ))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let updated_settings = db.get_settings()?;
+        assert!(updated_settings.panel_cert_file.ends_with("ip-self.crt"));
+        assert!(updated_settings.panel_key_file.ends_with("ip-self.key"));
+
+        // 6. Deleting cert while used by Panel HTTPS is also blocked
+        db.delete_inbound(ib.id)?;
+        let resp = app
+            .clone()
+            .oneshot(authed("DELETE", &format!("/api/certificates/{cert_id}"), None))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Clear panel HTTPS -> delete now succeeds!
+        db.set_setting_kv("panel_cert_file", "")?;
+        db.set_setting_kv("panel_key_file", "")?;
+        let resp = app
+            .clone()
+            .oneshot(authed("DELETE", &format!("/api/certificates/{cert_id}"), None))
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(db.list_certificates()?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn credentials_change_bruteforce_guard_and_cert_cli() -> anyhow::Result<()> {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&tmp.path().join("panel.db"), tmp.path())?);
+        assert!(db.is_default_credentials());
+
+        // 1. Rename username ONLY (blank new_password keeps old password hash!)
+        db.update_credentials(Some("admin"), "opsadmin", "")?;
+        assert!(!db.is_default_credentials());
+        assert!(db.verify_user("opsadmin", "admin")?);
+        assert!(!db.verify_user("admin", "admin")?);
+
+        // 2. Wrong current password must fail
+        assert!(db.update_credentials(Some("wrong"), "opsadmin", "newpass123").is_err());
+
+        // 3. Change password + verify HTTP /api/settings/password revokes session & clears cookie
+        let settings = db.get_settings()?;
+        let proc_mgr = ShoesProcessManager::new(db.clone());
+        let monitor = RuntimeMonitor::new(db.clone(), proc_mgr.clone());
+        let state = AppState::new(db.clone(), proc_mgr, monitor, &settings);
+        let tok = state.sessions.create_session("opsadmin", 1);
+        let app = build_inner_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings/password")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "current_password": "admin",
+                            "new_username": "rootpanel",
+                            "new_password": "StrongPassword!2026"
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cookie_hdr = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(cookie_hdr.contains("Max-Age=0"));
+        assert!(state.sessions.validate(&tok).is_none());
+        assert!(db.verify_user("rootpanel", "StrongPassword!2026")?);
+
+        // 4. Brute-force protection: 8 failed logins trigger 429 Too Many Requests
+        for attempt in 0..8 {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "username": "rootpanel",
+                                "password": "wrong-password"
+                            })
+                            .to_string(),
+                        ))?,
+                )
+                .await?;
+            if attempt < 7 {
+                assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+        // Locked out even with right password until lockout expires
+        let locked_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "rootpanel",
+                            "password": "StrongPassword!2026"
+                        })
+                        .to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(locked_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 5. CLI `cert self-signed --panel-https`, `cert clear`, and `cert ip --panel-https`
+        run_cert_cli(
+            &db,
+            &[
+                "self-signed".into(),
+                "--ip".into(),
+                "1.1.1.1".into(),
+                "--panel-https".into(),
+            ],
+        )
+        .await?;
+        let s_https = db.get_settings()?;
+        assert_eq!(s_https.scheme(), "https");
+        assert!(s_https.panel_cert_file.ends_with("panel-self-ssl.crt"));
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &s_https.panel_cert_file,
+            &s_https.panel_key_file,
+        )
+        .await?;
+
+        run_cert_cli(&db, &["clear".into()]).await?;
+        assert_eq!(db.get_settings()?.scheme(), "http");
+
+        // CLI `cert ip --panel-https` against local RFC 8555 + RFC 8738 mock CA
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let http01_port = probe.local_addr()?.port();
+        drop(probe);
+        let (dir_url, _, ca_handle) = spawn_mock_acme_ca(http01_port, 6).await?;
+        run_cert_cli(
+            &db,
+            &[
+                "ip".into(),
+                "--ip".into(),
+                "127.0.0.1".into(),
+                "--directory".into(),
+                dir_url,
+                "--listen".into(),
+                format!("127.0.0.1:{http01_port}"),
+                "--panel-https".into(),
+            ],
+        )
+        .await?;
+        ca_handle.abort();
+
+        let s_le = db.get_settings()?;
+        assert_eq!(s_le.scheme(), "https");
+        assert!(s_le.panel_cert_file.ends_with("panel-ip-ssl.crt"));
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &s_le.panel_cert_file,
+            &s_le.panel_key_file,
+        )
+        .await?;
+        assert!(db
+            .list_certificates()?
+            .iter()
+            .any(|c| c.name == "panel-ip-ssl" && c.cert_type == "acme_ip"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_restore_multipart_telegram_and_upgrade_checks() -> anyhow::Result<()> {
+        use axum::{
+            body::Body,
+            extract::Multipart as TestMultipart,
+            http::{header, Request, StatusCode},
+            routing::post,
+            Router,
+        };
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&tmp.path().join("panel.db"), tmp.path())?);
+        let settings = db.get_settings()?;
+        let proc_mgr = ShoesProcessManager::new(db.clone());
+        let monitor = RuntimeMonitor::new(db.clone(), proc_mgr.clone());
+        let state = AppState::new(db.clone(), proc_mgr, monitor, &settings);
+        let tok = state.sessions.create_session("admin", 1);
+        let app = build_inner_router(state.clone());
+
+        // 1. Seed distinctive inbound & create snapshot backup
+        let _ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "socks",
+            "remark": "restore-marker-node",
+            "port": 26123
+        }))?)?;
+        let (b1, bytes1) = ops_util::create_local_backup(&db, "manual", Some(2))?;
+        assert!(b1.size_bytes > 4096);
+        assert!(ops_util::list_local_backups(tmp.path())?.iter().any(|x| x.filename == b1.filename));
+
+        // 2. Reject invalid (non-SQLite) upload via HTTP /api/settings/restore-db
+        let bad_boundary = "----TestBadBoundary123";
+        let bad_body = format!(
+            "--{bad_boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"corrupt.db\"\r\nContent-Type: application/octet-stream\r\n\r\nnot-a-sqlite-db\r\n--{bad_boundary}--\r\n"
+        );
+        let bad_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings/restore-db")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={bad_boundary}"),
+                    )
+                    .body(Body::from(bad_body))?,
+            )
+            .await?;
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Delete inbound, then restore via HTTP multipart upload and confirm inbound returns + pre-restore safety snapshot saved!
+        for ib in db.list_inbounds()? {
+            db.delete_inbound(ib.id)?;
+        }
+        assert!(db.list_inbounds()?.is_empty());
+
+        let ok_boundary = "----TestOkBoundary456";
+        let mut ok_body = Vec::new();
+        ok_body.extend_from_slice(
+            format!(
+                "--{ok_boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"backup.db\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        ok_body.extend_from_slice(&bytes1);
+        ok_body.extend_from_slice(format!("\r\n--{ok_boundary}--\r\n").as_bytes());
+
+        let ok_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings/restore-db")
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={ok_boundary}"),
+                    )
+                    .body(Body::from(ok_body))?,
+            )
+            .await?;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(ok_resp.into_body(), 1024 * 1024).await?)?;
+        let pre_name = resp_json["data"]["pre_restore_backup"].as_str().unwrap();
+        assert!(pre_name.starts_with("pre-restore-"));
+        assert!(ops_util::backups_dir(tmp.path()).join(pre_name).is_file());
+        assert_eq!(db.list_inbounds()?.len(), 1);
+        assert_eq!(db.list_inbounds()?[0].remark, "restore-marker-node");
+        // Sessions must be revoked after DB restore
+        assert!(state.sessions.validate(&tok).is_none());
+
+        // 4. Retention pruning keeps only N auto/manual backups
+        for i in 0..4 {
+            let p = ops_util::backups_dir(tmp.path()).join(format!("auto-2026010{i}-000000.db"));
+            std::fs::write(&p, &bytes1)?;
+        }
+        let _ = ops_util::prune_old_backups(tmp.path(), 2)?;
+        let remaining_auto_manual: Vec<_> = ops_util::list_local_backups(tmp.path())?
+            .into_iter()
+            .filter(|b| b.filename.starts_with("auto-") || b.filename.starts_with("manual-"))
+            .collect();
+        assert_eq!(remaining_auto_manual.len(), 2);
+
+        // Path traversal guard
+        assert!(ops_util::sanitize_backup_filename("../panel.db").is_err());
+        assert!(ops_util::sanitize_backup_filename("sub/a.db").is_err());
+        assert!(ops_util::sanitize_backup_filename("ok-backup_1.db").is_ok());
+
+        // 5. Real HTTP multipart Telegram sendDocument verification against local mock Telegram server
+        let received = Arc::new(parking_lot::Mutex::new(Vec::<(String, String, usize)>::new()));
+        let rec_clone = received.clone();
+        let tg_app = Router::new().route(
+            "/botTESTTOKEN/sendDocument",
+            post(move |mut mp: TestMultipart| {
+                let rec = rec_clone.clone();
+                async move {
+                    let mut chat = String::new();
+                    let mut fname = String::new();
+                    let mut doc_len = 0usize;
+                    while let Ok(Some(f)) = mp.next_field().await {
+                        let name = f.name().unwrap_or("").to_string();
+                        if name == "chat_id" {
+                            chat = f.text().await.unwrap_or_default();
+                        } else if name == "document" {
+                            fname = f.file_name().unwrap_or("").to_string();
+                            doc_len = f.bytes().await.map(|b| b.len()).unwrap_or(0);
+                        }
+                    }
+                    rec.lock().push((chat, fname, doc_len));
+                    (StatusCode::OK, r#"{"ok":true,"result":{"message_id":1}}"#)
+                }
+            }),
+        );
+        let tg_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tg_addr = tg_listener.local_addr()?;
+        let tg_handle = tokio::spawn(async move {
+            let _ = axum::serve(tg_listener, tg_app).await;
+        });
+
+        let sent = ops_util::send_backup_to_telegram(
+            Some(&format!("http://{tg_addr}")),
+            "TESTTOKEN",
+            "10001, 10002",
+            "auto-test.db",
+            &bytes1,
+            "Test Caption",
+        )
+        .await?;
+        tg_handle.abort();
+        assert_eq!(sent, 2);
+        let got = received.lock().clone();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], ("10001".to_string(), "auto-test.db".to_string(), bytes1.len()));
+        assert_eq!(got[1], ("10002".to_string(), "auto-test.db".to_string(), bytes1.len()));
+
+        // 6. Semver comparison & SHA-256 verification
+        assert!(ops_util::is_newer_version("0.1.2", "v0.1.3"));
+        assert!(!ops_util::is_newer_version("0.1.3", "v0.1.2"));
+        assert!(ops_util::is_newer_version("shoes 0.1.34 (abc)", "v0.1.35"));
+        let sample = b"release-archive-bytes";
+        let good_sum = hex::encode(ring::digest::digest(&ring::digest::SHA256, sample).as_ref());
+        let sums = format!("{good_sum}  shoes-panel-x86_64-unknown-linux-musl.tar.gz\n");
+        ops_util::verify_sha256_against_sums(&sums, "shoes-panel-x86_64-unknown-linux-musl.tar.gz", sample)?;
+        assert!(ops_util::verify_sha256_against_sums(
+            &sums,
+            "shoes-panel-x86_64-unknown-linux-musl.tar.gz",
+            b"tampered"
+        )
+        .is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn h2mux_subscriptions_outbound_and_live_shoes_proxy_forwarding() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir()?;
+        let db = Database::open(&tmp.path().join("panel.db"), tmp.path())?;
+        db.set_setting_kv("clash_api_addr", "")?;
+        let settings = db.get_settings()?;
+
+        let (cert_pem, key_pem) = crypto_util::generate_self_signed_cert(&["localhost".into(), "127.0.0.1".into()])?;
+        let cert_path = tmp.path().join("certs/mux.crt");
+        let key_path = tmp.path().join("certs/mux.key");
+        acme_util::write_cert_and_key_atomic(&cert_path, &key_path, &cert_pem, &key_pem)?;
+        db.save_certificate(CertificateRecord {
+            id: 0,
+            name: "mux-cert".into(),
+            cert_type: "files".into(),
+            cert_file: cert_path.to_string_lossy().replace('\\', "/"),
+            key_file: key_path.to_string_lossy().replace('\\', "/"),
+            domains: vec!["localhost".into(), "127.0.0.1".into()],
+            email: String::new(),
+            directory_url: String::new(),
+            terms_of_service: String::new(),
+            challenge_type: "http01".into(),
+            http01_listen: String::new(),
+            remark: "Self-Signed".into(),
+            created_at: 0,
+        })?;
+
+        // 1. VLESS Vision + H2Mux must be rejected by yaml_gen
+        let bad_vless: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "remark": "conflict-vless",
+            "port": 27001,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {"cert_mode": "source", "certificate_source": "mux-cert", "sni": "localhost", "vision": true, "allow_insecure": true},
+                "h2mux": {"enabled": true, "max_connections": 4, "min_streams": 4, "padding": true}
+            },
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?;
+        let err = yaml_gen::build_shoes_yaml(
+            tmp.path(),
+            &settings,
+            &db.list_certificates()?,
+            &[],
+            &[],
+            &[bad_vless],
+        )
+        .unwrap_err();
+        let err_chain = format!("{err:#}");
+        assert!(
+            err_chain.contains("VLESS Vision cannot be enabled together with H2Mux"),
+            "unexpected error: {err_chain}"
+        );
+
+        // 2. Verify 3-client subscription export for VLESS + H2Mux (max_connections/min_streams) & Trojan + H2Mux (max_streams) & SS TCP + H2Mux
+        let vless_mux: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "remark": "vl-mux",
+            "port": 27002,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {"cert_mode": "source", "certificate_source": "mux-cert", "sni": "localhost", "vision": false, "allow_insecure": true},
+                "h2mux": {"enabled": true, "max_connections": 4, "min_streams": 4, "max_streams": 0, "padding": true}
+            },
+            "clients": [{"name": "u", "uuid": "7a5b94ba-e5ac-40d2-9f86-43002674ff4d"}]
+        }))?;
+        let share_vl = sub_gen::build_client_share_info(&vless_mux, &vless_mux.clients[0], "127.0.0.1");
+        let shoes_vl: serde_yaml::Value = serde_yaml::from_str(&share_vl.shoes_client_yaml)?;
+        let inner_vl = &shoes_vl[0]["rules"][0]["client_chain"]["protocol"]["protocol"];
+        assert_eq!(inner_vl["type"], "vless");
+        assert_eq!(inner_vl["h2mux"]["max_connections"], 4);
+        assert_eq!(inner_vl["h2mux"]["min_streams"], 4);
+        assert_eq!(inner_vl["h2mux"]["padding"], true);
+
+        let clash_vl: serde_yaml::Value = serde_yaml::from_str(
+            &sub_gen::generate_subscription_with_certs(&[vless_mux.clone()], &db.list_certificates()?, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml).body,
+        )?;
+        assert_eq!(clash_vl["proxies"][0]["smux"]["enabled"], true);
+        assert_eq!(clash_vl["proxies"][0]["smux"]["protocol"], "h2mux");
+        assert_eq!(clash_vl["proxies"][0]["smux"]["max-connections"], 4);
+        assert_eq!(clash_vl["proxies"][0]["smux"]["min-streams"], 4);
+        assert_eq!(clash_vl["proxies"][0]["smux"]["padding"], true);
+        assert!(clash_vl["proxies"][0]["smux"].get("max-streams").is_none());
+
+        let sb_vl: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_certs(&[vless_mux], &db.list_certificates()?, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson).body,
+        )?;
+        let sb_vl_node = sb_vl["outbounds"].as_array().unwrap().iter().find(|o| o["type"] == "vless").unwrap();
+        assert_eq!(sb_vl_node["multiplex"]["enabled"], true);
+        assert_eq!(sb_vl_node["multiplex"]["protocol"], "h2mux");
+        assert_eq!(sb_vl_node["multiplex"]["max_connections"], 4);
+        assert_eq!(sb_vl_node["multiplex"]["min_streams"], 4);
+        assert_eq!(sb_vl_node["multiplex"]["padding"], true);
+        assert!(sb_vl_node["multiplex"].get("max_streams").is_none());
+
+        // When max_streams > 0, Mihomo & sing-box emit max_streams and omit max_connections/min_streams (sing-mux rule)
+        let trojan_max: Inbound = serde_json::from_value(serde_json::json!({
+            "protocol": "trojan",
+            "remark": "tj-mux",
+            "port": 27003,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {"cert_mode": "source", "certificate_source": "mux-cert", "sni": "localhost", "allow_insecure": true},
+                "h2mux": {"enabled": true, "max_connections": 4, "min_streams": 4, "max_streams": 16, "padding": false}
+            },
+            "clients": [{"name": "u", "password": "mux-secret-password"}]
+        }))?;
+        let clash_tj: serde_yaml::Value = serde_yaml::from_str(
+            &sub_gen::generate_subscription_with_certs(&[trojan_max.clone()], &db.list_certificates()?, "*", "127.0.0.1", sub_gen::SubFormat::ClashYaml).body,
+        )?;
+        assert_eq!(clash_tj["proxies"][0]["smux"]["max-streams"], 16);
+        assert!(clash_tj["proxies"][0]["smux"].get("max-connections").is_none());
+        let sb_tj: serde_json::Value = serde_json::from_str(
+            &sub_gen::generate_subscription_with_certs(&[trojan_max], &db.list_certificates()?, "*", "127.0.0.1", sub_gen::SubFormat::SingBoxJson).body,
+        )?;
+        let sb_tj_node = sb_tj["outbounds"].as_array().unwrap().iter().find(|o| o["type"] == "trojan").unwrap();
+        assert_eq!(sb_tj_node["multiplex"]["max_streams"], 16);
+        assert!(sb_tj_node["multiplex"].get("max_connections").is_none());
+
+        // 3. Outbound group member H2Mux YAML generation + real `shoes.exe check`
+        let mux_group = OutboundGroupRecord {
+            id: 1,
+            name: "mux-pool".into(),
+            enable: true,
+            group_type: "selector".into(),
+            default_member: String::new(),
+            test_url: String::new(),
+            interval_secs: 300,
+            timeout_ms: 5000,
+            tolerance_ms: 50,
+            members: vec![
+                OutboundMember {
+                    name: "up-vless".into(),
+                    protocol: "vless".into(),
+                    address: "198.51.100.10:443".into(),
+                    uuid: "7a5b94ba-e5ac-40d2-9f86-43002674ff4d".into(),
+                    username: String::new(),
+                    password: String::new(),
+                    cipher: String::new(),
+                    tls: true,
+                    sni: "edge.example.test".into(),
+                    verify: false,
+                    h2mux: H2MuxSettings {
+                        enabled: true,
+                        max_connections: 2,
+                        min_streams: 4,
+                        max_streams: 0,
+                        padding: true,
+                    },
+                },
+                OutboundMember {
+                    name: "up-trojan".into(),
+                    protocol: "trojan".into(),
+                    address: "198.51.100.11:443".into(),
+                    uuid: String::new(),
+                    username: String::new(),
+                    password: "secret".into(),
+                    cipher: String::new(),
+                    tls: true,
+                    sni: "tj.example.test".into(),
+                    verify: false,
+                    h2mux: H2MuxSettings {
+                        enabled: true,
+                        max_connections: 4,
+                        min_streams: 2,
+                        max_streams: 0,
+                        padding: false,
+                    },
+                },
+            ],
+            raw_chains_yaml: String::new(),
+            remark: String::new(),
+        };
+
+        let shoes_bin = std::path::PathBuf::from("shoes/target/debug/shoes.exe");
+        if !shoes_bin.exists() {
+            return Ok(());
+        }
+
+        // Reserve free loopback ports for live shoes server, shoes client SOCKS5, and echo target
+        let free_port = || -> anyhow::Result<u16> {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            Ok(l.local_addr()?.port())
+        };
+        let srv_port = free_port()?;
+        let socks_port = free_port()?;
+
+        // Local TCP echo server
+        let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let echo_port = echo_listener.local_addr()?.port();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        if n > 0 {
+                            let _ = sock.write_all(&buf[..n]).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let live_ib = db.create_inbound(serde_json::from_value(serde_json::json!({
+            "protocol": "trojan",
+            "remark": "live-h2mux-server",
+            "listen": "127.0.0.1",
+            "port": srv_port,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "tls",
+                "tls": {
+                    "cert_mode": "source",
+                    "certificate_source": "mux-cert",
+                    "sni": "localhost",
+                    "allow_insecure": true
+                },
+                "h2mux": {
+                    "enabled": true,
+                    "max_connections": 2,
+                    "min_streams": 2,
+                    "max_streams": 0,
+                    "padding": true
+                }
+            },
+            "clients": [{"name": "u", "password": "live-h2mux-password"}]
+        }))?)?;
+
+        let server_yaml = yaml_gen::build_shoes_yaml(
+            tmp.path(),
+            &settings,
+            &db.list_certificates()?,
+            &[mux_group],
+            &[],
+            &db.list_inbounds()?,
+        )?;
+        let server_cfg = tmp.path().join("h2mux_server.yaml");
+        std::fs::write(&server_cfg, &server_yaml)?;
+        let chk = std::process::Command::new(&shoes_bin).arg("check").arg(&server_cfg).output()?;
+        assert!(
+            chk.status.success(),
+            "shoes check failed on H2Mux outbound+server config:\n{}\nYAML:\n{}",
+            String::from_utf8_lossy(&chk.stderr),
+            server_yaml
+        );
+
+        // Generate real shoes client YAML directly from sub_gen and bind to our test socks_port
+        let share = sub_gen::build_client_share_info(&live_ib, &live_ib.clients[0], "127.0.0.1");
+        let client_yaml = share.shoes_client_yaml.replace("127.0.0.1:1080", &format!("127.0.0.1:{socks_port}"));
+        assert!(client_yaml.contains("h2mux:"));
+        let client_cfg = tmp.path().join("h2mux_client.yaml");
+        std::fs::write(&client_cfg, &client_yaml)?;
+        let chk2 = std::process::Command::new(&shoes_bin).arg("check").arg(&client_cfg).output()?;
+        assert!(
+            chk2.status.success(),
+            "shoes check failed on generated H2Mux client YAML:\n{}\nYAML:\n{}",
+            String::from_utf8_lossy(&chk2.stderr),
+            client_yaml
+        );
+
+        // Spawn REAL shoes.exe server + REAL shoes.exe H2Mux client and push 5 concurrent streams!
+        let mut srv_child = tokio::process::Command::new(&shoes_bin)
+            .arg(&server_cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut cli_child = tokio::process::Command::new(&shoes_bin)
+            .arg(&client_cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        // Wait until both listeners accept TCP connections
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while tokio::time::Instant::now() < ready_deadline {
+            let s_ok = tokio::net::TcpStream::connect(("127.0.0.1", srv_port)).await.is_ok();
+            let c_ok = tokio::net::TcpStream::connect(("127.0.0.1", socks_port)).await.is_ok();
+            if s_ok && c_ok {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+
+        let mut tasks = Vec::new();
+        for idx in 0..5usize {
+            tasks.push(tokio::spawn(async move {
+                let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", socks_port)).await?;
+                // SOCKS5 greeting: ver=5, nmethods=1, no-auth=0
+                stream.write_all(&[0x05, 0x01, 0x00]).await?;
+                let mut resp = [0u8; 2];
+                stream.read_exact(&mut resp).await?;
+                anyhow::ensure!(resp == [0x05, 0x00], "bad socks5 greeting: {resp:?}");
+
+                // SOCKS5 CONNECT 127.0.0.1:echo_port
+                let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+                req.extend_from_slice(&echo_port.to_be_bytes());
+                stream.write_all(&req).await?;
+                let mut rep = [0u8; 10];
+                stream.read_exact(&mut rep).await?;
+                anyhow::ensure!(rep[1] == 0x00, "socks5 connect failed: {rep:?}");
+
+                let msg = format!("shoes-h2mux-stream-{idx}");
+                stream.write_all(msg.as_bytes()).await?;
+                let mut echoed = vec![0u8; msg.len()];
+                stream.read_exact(&mut echoed).await?;
+                anyhow::ensure!(echoed == msg.as_bytes(), "echo mismatch");
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+
+        for t in tasks {
+            t.await??;
+        }
+
+        let _ = cli_child.kill().await;
+        let _ = srv_child.kill().await;
+        echo_task.abort();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live internet access to Let's Encrypt ACME directories"]
+    async fn live_letsencrypt_directories_match_tos_and_support_shortlived() -> anyhow::Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for url in [
+            DEFAULT_LETSENCRYPT_DIR,
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+        ] {
+            let meta = acme_util::fetch_acme_directory_meta(url).await?;
+            assert!(
+                meta.terms_of_service.as_deref().is_some_and(|t| t.starts_with("https://letsencrypt.org/documents/")),
+                "unexpected ToS from {url}: {:?}",
+                meta.terms_of_service
+            );
+            assert!(
+                meta.supports_shortlived,
+                "expected Let's Encrypt directory {url} to advertise shortlived profile, got {:?}",
+                meta.profiles
+            );
+        }
         Ok(())
     }
 }

@@ -22,6 +22,48 @@
       </a-card>
     </div>
 
+    <div class="dashboard-details trend-grid">
+      <a-card v-for="plot in livePlots" :key="plot.title" size="small" class="dashboard-section">
+        <template #title><h2>{{ plot.title }}</h2></template>
+        <template #extra>{{ t('dashboard.twoMinutes') }}</template>
+        <TrendChart v-if="samples.length" :title="plot.title" :rows="samples" :series="plot.series"
+          :format-value="plot.format" :format-time="clockLabel" :ceiling="plot.ceiling" :window-ms="120000" />
+        <a-empty v-else :description="t('dashboard.awaitingSamples')" />
+      </a-card>
+    </div>
+
+    <a-card size="small" class="dashboard-section">
+      <template #title><h2>{{ t('dashboard.health') }}</h2></template>
+      <dl class="detail-list host-details">
+        <div v-for="item in healthItems" :key="item.label">
+          <dt>{{ item.label }}</dt><dd>{{ item.value }}</dd>
+        </div>
+      </dl>
+      <small>{{ t('dashboard.healthNote') }}</small>
+    </a-card>
+
+    <a-card size="small" class="dashboard-section">
+      <template #title><h2>{{ t('dashboard.history') }}</h2></template>
+      <a-select v-model:value="metric" :aria-label="t('dashboard.history')" :options="metricOptions" />
+      <a-alert v-if="historyError" type="warning" :message="historyError" />
+      <TrendChart v-if="historyRows.length" :title="t('dashboard.history')" :rows="historyRows"
+        :series="historySeries" :format-value="historyFormat" :format-time="historyTime" :events="events"
+        :event-label="event => t('dashboard.event_' + event.kind)" />
+      <a-empty v-else :description="t('dashboard.awaitingSamples')" />
+      <details v-if="events.length"><summary>{{ t('dashboard.events') }} ({{ events.length }})</summary>
+        <p v-for="(event,i) in events" :key="i">{{ historyTime(event.time) }} · {{ t('dashboard.event_' + event.kind) }}</p>
+      </details>
+    </a-card>
+
+    <a-card size="small" class="dashboard-section">
+      <template #title><h2>{{ t('dashboard.dailyTraffic') }}</h2></template>
+      <template #extra>{{ t('dashboard.thirtyDays') }}</template>
+      <a-alert v-if="dailyError" type="warning" show-icon :message="dailyError" />
+      <TrendChart v-if="days.some(row => row.up != null)" :title="t('dashboard.dailyTraffic')" :rows="days"
+        :series="directions" :format-value="formatBytes" :format-time="dayLabel" />
+      <a-empty v-else-if="!dailyError" :description="t('dashboard.awaitingSamples')" />
+    </a-card>
+
     <div class="dashboard-details">
       <a-card size="small" class="dashboard-section service-card">
         <template #title><h2>{{ t('dashboard.shoesService') }}</h2></template>
@@ -158,7 +200,8 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue';
+import TrendChart from '../components/TrendChart.vue';
 import {
   ArrowDownOutlined,
   ArrowUpOutlined,
@@ -182,6 +225,81 @@ const { t, locale } = useI18n();
 const sys = computed(() => props.statusData?.system || {});
 const shoes = computed(() => props.statusData?.shoes || {});
 const totals = computed(() => props.statusData?.totals || {});
+
+const samples = ref([]);
+const days = ref([]);
+const dailyError = ref('');
+const directions = computed(() => [
+  { key: 'up', label: t('dashboard.upload') },
+  { key: 'down', label: t('dashboard.download') },
+]);
+const livePlots = computed(() => [
+  { title: t('dashboard.utilization'), ceiling: 100, format: percent => Math.round(percent) + '%',
+    series: [{ key: 'cpu', label: t('dashboard.cpu') }, { key: 'mem', label: t('dashboard.memory') }] },
+  { title: t('dashboard.hostNet'), format: formatSpeed, series: directions.value },
+]);
+const clockLabel = ms => new Date(ms).toLocaleTimeString(locale.value, { hour12: false, minute: '2-digit', second: '2-digit' });
+const dayLabel = ms => new Date(ms).toISOString().slice(5, 10);
+watch(sys, s => {
+  const time = s.sampled_at;
+  if (!time || time <= (samples.value.at(-1)?.time || 0)) return;
+  const rows = samples.value.filter(row => time - row.time <= 120000);
+  if (rows.length && time - rows.at(-1).time > 5000) rows.push({ time: time - 1 });
+  rows.push({ time, cpu: s.cpu_usage, mem: pct(s.mem_used, s.mem_total), up: s.net_tx_speed, down: s.net_rx_speed });
+  samples.value = rows;
+}, { immediate: true });
+
+const healthItems = computed(() => {
+  const h = sys.value.network_health || {};
+  const num = n => n == null ? '—' : Number(n).toLocaleString(locale.value);
+  return [
+    {label: t('dashboard.fd'), value: num(h.used) + ' / ' + (h.limit == null || h.limit === 'unlimited' ? h.limit ?? '—' : num(h.limit))},
+    {label: t('dashboard.cc'), value: h.algorithm || '—'},
+    ...['overflow','retrans','recv','send'].map(key => ({label:t('dashboard.'+key), value:num(h[key])})),
+  ];
+});
+const metric = ref('cpu');
+const historyRows = ref([]);
+const events = ref([]);
+const historyError = ref('');
+const metricOptions = computed(() => ['cpu','rss','connections','rate'].map(value => ({value,label:t('dashboard.core_'+value)})));
+const historySeries = computed(() => metric.value === 'rate' ? directions.value : [{key:metric.value,label:t('dashboard.core_'+metric.value)}]);
+const historyFormat = computed(() => ({rss:formatBytes,rate:formatSpeed,cpu:n=>n.toFixed(1)+'%',connections:n=>Number(n.toFixed(1)).toLocaleString(locale.value)})[metric.value]);
+const historyTime = ms => new Date(ms).toLocaleTimeString(locale.value,{hour:'2-digit',minute:'2-digit',hour12:false});
+let historyTimer;
+async function refreshHistory() {
+  clearTimeout(historyTimer);
+  try {
+    const result = await api.coreHistory();
+    if (disposed) return;
+    const byTime = new Map(result.minutes.map(point => [point.time,point]));
+    historyRows.value = result.minutes.length || result.events.length ? Array.from({length:1441}, (_, i) => {
+      const time = result.start + i * 60000;
+      return byTime.get(time) || {time};
+    }) : [];
+    events.value = result.events;
+    historyError.value = '';
+  } catch (err) { if (!disposed) historyError.value = err.message; }
+  finally { if (!disposed) historyTimer = setTimeout(refreshHistory, 60000); }
+}
+onMounted(refreshHistory);
+onBeforeUnmount(() => clearTimeout(historyTimer));
+let dailyTimer;
+let disposed = false;
+async function refreshDays() {
+  try {
+    const result = await api.dailyTraffic();
+    if (disposed) return;
+    days.value = result.map(row => ({ ...row, time: Date.parse(row.day + 'T00:00:00Z') }));
+    dailyError.value = '';
+  } catch (err) {
+    if (!disposed) dailyError.value = err.message;
+  } finally {
+    if (!disposed) dailyTimer = setTimeout(refreshDays, 60000);
+  }
+}
+onMounted(refreshDays);
+onBeforeUnmount(() => { disposed = true; clearTimeout(dailyTimer); });
 
 const resources = computed(() => [
   {
@@ -250,6 +368,7 @@ async function doOp(action) {
     else if (action === 'reload') await api.shoesReload();
     message.success('OK');
     emit('refresh');
+    if (action !== 'stop') refreshHistory();
   } catch (e) {
     message.error(e.message);
   } finally {
@@ -277,6 +396,7 @@ async function copyYaml() {
 <style scoped>
 .dashboard {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--panel-gap);
   font-variant-numeric: tabular-nums;
 }
@@ -294,6 +414,9 @@ async function copyYaml() {
 .dashboard-details {
   grid-template-columns: minmax(0, 1.12fr) minmax(0, 1fr);
 }
+
+.dashboard-section { min-inline-size: 0; }
+.trend-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 .dashboard-section :deep(.ant-card-body),
 .resource-card :deep(.ant-card-body) {

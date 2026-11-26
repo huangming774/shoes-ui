@@ -85,6 +85,26 @@ impl Inbound {
         matches!(self.protocol.as_str(), "hysteria2" | "tuic")
             || self.stream_settings.network == "quic"
     }
+
+    pub fn has_vless_vision(&self) -> bool {
+        self.protocol == "vless"
+            && self.stream_settings.network == "tcp"
+            && ((self.stream_settings.security == "tls" && self.stream_settings.tls.vision)
+                || (self.stream_settings.security == "reality"
+                    && self.stream_settings.reality.vision))
+    }
+
+    /// Protocols/transports where H2Mux (`sing-mux` / `h2mux`) applies cleanly.
+    /// QUIC / Hysteria2 / TUIC / AnyTLS / NaiveProxy / XHTTP already multiplex natively.
+    pub fn supports_h2mux(&self) -> bool {
+        let ss = &self.stream_settings;
+        match self.protocol.as_str() {
+            "vless" => matches!(ss.network.as_str(), "tcp" | "ws") && !self.has_vless_vision(),
+            "vmess" | "trojan" => matches!(ss.network.as_str(), "tcp" | "ws"),
+            "shadowsocks" => ss.network == "tcp" && ss.security == "none",
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +178,40 @@ impl Default for ProtocolSettings {
     }
 }
 
+fn default_h2mux_max_connections() -> u32 {
+    4
+}
+
+fn default_h2mux_min_streams() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct H2MuxSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_h2mux_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_h2mux_min_streams")]
+    pub min_streams: u32,
+    #[serde(default)]
+    pub max_streams: u32,
+    #[serde(default)]
+    pub padding: bool,
+}
+
+impl Default for H2MuxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: 4,
+            min_streams: 4,
+            max_streams: 0,
+            padding: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamSettings {
     #[serde(default = "default_network")]
@@ -172,6 +226,8 @@ pub struct StreamSettings {
     pub ws: WsSettings,
     #[serde(default)]
     pub xhttp: XhttpSettings,
+    #[serde(default)]
+    pub h2mux: H2MuxSettings,
 }
 
 impl Default for StreamSettings {
@@ -183,6 +239,7 @@ impl Default for StreamSettings {
             reality: RealitySettings::default(),
             ws: WsSettings::default(),
             xhttp: XhttpSettings::default(),
+            h2mux: H2MuxSettings::default(),
         }
     }
 }
@@ -369,7 +426,7 @@ pub struct CertificateRecord {
     #[serde(default)]
     pub id: i64,
     pub name: String,
-    pub cert_type: String, // "files" | "acme"
+    pub cert_type: String, // "files" | "acme" | "acme_ip"
     #[serde(default)]
     pub cert_file: String,
     #[serde(default)]
@@ -392,12 +449,16 @@ pub struct CertificateRecord {
     pub created_at: i64,
 }
 
+pub const DEFAULT_LETSENCRYPT_DIR: &str = "https://acme-v02.api.letsencrypt.org/directory";
+pub const DEFAULT_LETSENCRYPT_TOS: &str =
+    "https://letsencrypt.org/documents/LE-SA-v1.8-July-06-2026.pdf";
+
 fn default_acme_dir() -> String {
-    "https://acme-v02.api.letsencrypt.org/directory".to_string()
+    DEFAULT_LETSENCRYPT_DIR.to_string()
 }
 
 fn default_acme_tos() -> String {
-    "https://letsencrypt.org/documents/LE-SA-v1.4-April-3-2024.pdf".to_string()
+    DEFAULT_LETSENCRYPT_TOS.to_string()
 }
 
 fn default_acme_challenge() -> String {
@@ -428,6 +489,8 @@ pub struct OutboundMember {
     pub sni: String,
     #[serde(default = "default_true")]
     pub verify: bool,
+    #[serde(default)]
+    pub h2mux: H2MuxSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +580,14 @@ pub struct SubscriptionRecord {
     pub created_at: i64,
 }
 
+fn default_backup_interval_hours() -> u64 {
+    24
+}
+
+fn default_backup_retain_count() -> u64 {
+    7
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelSettings {
     pub panel_listen: String,
@@ -533,6 +604,18 @@ pub struct PanelSettings {
     pub shoes_auto_start: bool,
     pub shoes_extra_yaml: String,
     pub session_ttl_hours: u64,
+    #[serde(default)]
+    pub auto_backup_enabled: bool,
+    #[serde(default = "default_backup_interval_hours")]
+    pub auto_backup_interval_hours: u64,
+    #[serde(default = "default_backup_retain_count")]
+    pub auto_backup_retain_count: u64,
+    #[serde(default)]
+    pub tg_bot_token: String,
+    #[serde(default)]
+    pub tg_chat_id: String,
+    #[serde(default)]
+    pub tg_backup_enabled: bool,
 }
 
 impl PanelSettings {

@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, Request, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -13,6 +13,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::acme_util::{
+    export_acme_state_for_panel, fetch_acme_directory_meta, inspect_certificate_runtime,
+    issue_shortlived_ip_cert, reload_panel_https_if_matching, renew_ip_certificate_record,
+    sanitize_cert_filename, validate_cert_key_pair, write_cert_and_key_atomic, CertRuntimeStatus,
+};
 use crate::auth::{extract_token_from_headers, SESSION_COOKIE_NAME};
 use crate::crypto_util::{
     generate_random_alnum, generate_reality_keypair, generate_self_signed_cert,
@@ -21,13 +26,18 @@ use crate::crypto_util::{
 use crate::db::default_client_for_inbound;
 use crate::models::{
     CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, PanelSettings,
-    RoutingRuleRecord, SubscriptionRecord,
+    RoutingRuleRecord, SubscriptionRecord, DEFAULT_LETSENCRYPT_DIR, DEFAULT_LETSENCRYPT_TOS,
+};
+use crate::ops_util::{
+    backups_dir, build_backup_caption, check_github_updates, create_local_backup,
+    list_local_backups, sanitize_backup_filename, schedule_panel_restart, send_backup_to_telegram,
+    upgrade_panel_binary, upgrade_shoes_binary,
 };
 use crate::state::{is_loopback_or_unspecified_host, AppState};
 use crate::sub_gen::{
     build_client_share_info, generate_subscription_with_certs, SubFormat,
 };
-use crate::yaml_gen::build_shoes_yaml;
+use crate::yaml_gen::{build_shoes_yaml, normalize_acme_domains};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
@@ -68,6 +78,8 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
     let protected_api = Router::new()
         // Dashboard & Shoes service control
         .route("/status", get(api_status))
+        .route("/traffic/daily", get(api_daily_traffic))
+        .route("/status/history", get(api_core_history))
         .route("/shoes/start", post(api_shoes_start))
         .route("/shoes/stop", post(api_shoes_stop))
         .route("/shoes/restart", post(api_shoes_restart))
@@ -117,8 +129,15 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
             "/certificates",
             get(api_list_certs).post(api_save_cert),
         )
+        .route("/certificates/acme-meta", get(api_acme_meta))
         .route("/certificates/upload", post(api_upload_cert))
         .route("/certificates/self-signed", post(api_self_signed_cert))
+        .route("/certificates/issue-ip", post(api_issue_ip_cert))
+        .route("/certificates/{id}/renew", post(api_renew_cert))
+        .route(
+            "/certificates/{id}/apply-panel-https",
+            post(api_apply_panel_https),
+        )
         .route("/certificates/{id}", delete(api_delete_cert))
         // Outbound Groups & Routing Rules
         .route(
@@ -143,6 +162,23 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         .route("/settings/public-host", post(api_set_public_host))
         .route("/settings/password", post(api_change_password))
         .route("/settings/backup-db", get(api_backup_db))
+        .route("/settings/restore-db", post(api_restore_db))
+        .route("/settings/backups", get(api_list_backups))
+        .route("/settings/backup-now", post(api_backup_now))
+        .route("/settings/backup-tg-test", post(api_backup_tg_test))
+        .route(
+            "/settings/backups/{filename}",
+            get(api_download_local_backup).delete(api_delete_local_backup),
+        )
+        .route(
+            "/settings/backups/{filename}/restore",
+            post(api_restore_local_backup),
+        )
+        // Panel Restart & GitHub Online Updates
+        .route("/panel/restart", post(api_panel_restart))
+        .route("/system/updates", get(api_check_updates))
+        .route("/system/upgrade-panel", post(api_upgrade_panel))
+        .route("/system/upgrade-shoes", post(api_upgrade_shoes))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let public_api = Router::new()
@@ -229,16 +265,29 @@ async fn api_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoginReq>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    if let Some(wait_secs) = state.login_guard.check_locked() {
+        return Err(err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Too many failed login attempts. Try again in {wait_secs}s."),
+        ));
+    }
     let valid = state
         .db
         .verify_user(req.username.trim(), &req.password)
         .map_err(internal_err)?;
     if !valid {
+        if let Some(lock_secs) = state.login_guard.record_failure() {
+            return Err(err_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Too many failed login attempts. Locked for {lock_secs}s."),
+            ));
+        }
         return Err(err_json(
             StatusCode::UNAUTHORIZED,
             "Invalid username or password",
         ));
     }
+    state.login_guard.record_success();
     let ttl = state
         .db
         .get_settings()
@@ -246,12 +295,22 @@ async fn api_login(
         .unwrap_or(168);
     let token = state.sessions.create_session(req.username.trim(), ttl);
     let max_age = ttl.saturating_mul(3600);
+    let secure_attr = if state.listener_scheme == "https" {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax{secure_attr}; Max-Age={max_age}"
     );
     let mut resp = Json(json!({
         "ok": true,
-        "data": { "token": token, "username": req.username.trim() }
+        "data": {
+            "token": token,
+            "username": req.username.trim(),
+            "default_credentials": state.db.is_default_credentials(),
+            "https_enabled": state.listener_scheme == "https"
+        }
     }))
     .into_response();
     resp.headers_mut()
@@ -263,7 +322,7 @@ async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     if let Some(tok) = extract_token_from_headers(&headers) {
         state.sessions.revoke(&tok);
     }
-    let clear = format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Max-Age=0");
+    let clear = format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
     let mut resp = Json(json!({ "ok": true })).into_response();
     resp.headers_mut()
         .insert(header::SET_COOKIE, clear.parse().unwrap());
@@ -273,13 +332,26 @@ async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
     if let Some(tok) = extract_token_from_headers(&headers) {
         if let Some(username) = state.sessions.validate(&tok) {
-            return ok_json(json!({ "authenticated": true, "username": username }));
+            return ok_json(json!({
+                "authenticated": true,
+                "username": username,
+                "default_credentials": state.db.is_default_credentials(),
+                "https_enabled": state.listener_scheme == "https"
+            }));
         }
     }
     ok_json(json!({ "authenticated": false }))
 }
 
 // ==================== Status & Shoes Process ====================
+
+async fn api_core_history(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok_json(state.db.core_history().map_err(internal_err)?)
+}
+
+async fn api_daily_traffic(State(state): State<Arc<AppState>>) -> ApiResult {
+    ok_json(state.db.daily_traffic().map_err(internal_err)?)
+}
 
 async fn api_status(State(state): State<Arc<AppState>>) -> ApiResult {
     let sys = state.monitor.snapshot();
@@ -721,18 +793,156 @@ async fn api_keygen_random(Query(q): Query<RandomQuery>) -> ApiResult {
 
 // ==================== Certificates ====================
 
+#[derive(serde::Serialize)]
+struct CertificateListItem {
+    #[serde(flatten)]
+    cert: CertificateRecord,
+    runtime: CertRuntimeStatus,
+}
+
+fn inbounds_referencing_cert(inbounds: &[Inbound], cert_name: &str) -> Vec<String> {
+    let target = cert_name.trim();
+    inbounds
+        .iter()
+        .filter(|ib| {
+            let tls = &ib.stream_settings.tls;
+            (ib.is_quic() || ib.stream_settings.security == "tls")
+                && tls.certificate_source.trim() == target
+                && (tls.cert_mode == "source"
+                    || (tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty()))
+        })
+        .map(|ib| {
+            if ib.remark.trim().is_empty() {
+                format!("{} (:{})", ib.tag, ib.port)
+            } else {
+                format!("{} (:{})", ib.remark.trim(), ib.port)
+            }
+        })
+        .collect()
+}
+
 async fn api_list_certs(State(state): State<Arc<AppState>>) -> ApiResult {
-    ok_json(state.db.list_certificates().map_err(internal_err)?)
+    let certs = state.db.list_certificates().map_err(internal_err)?;
+    let inbounds = state.db.list_inbounds().unwrap_or_default();
+    let settings = state.db.get_settings().ok();
+    let panel_cert = settings
+        .as_ref()
+        .map(|s| s.panel_cert_file.as_str())
+        .unwrap_or("");
+
+    let enriched: Vec<CertificateListItem> = certs
+        .into_iter()
+        .map(|cert| {
+            let used_by = inbounds_referencing_cert(&inbounds, &cert.name);
+            let runtime = inspect_certificate_runtime(
+                &state.db.data_dir,
+                &cert,
+                used_by,
+                panel_cert,
+            );
+            CertificateListItem { cert, runtime }
+        })
+        .collect();
+    ok_json(enriched)
+}
+
+#[derive(Deserialize)]
+struct AcmeMetaQuery {
+    #[serde(default)]
+    directory_url: String,
+}
+
+async fn api_acme_meta(Query(q): Query<AcmeMetaQuery>) -> ApiResult {
+    let dir_url = if q.directory_url.trim().is_empty() {
+        DEFAULT_LETSENCRYPT_DIR
+    } else {
+        q.directory_url.trim()
+    };
+    let meta = fetch_acme_directory_meta(dir_url).await.map_err(bad_req)?;
+    ok_json(meta)
+}
+
+async fn save_cert_with_rollback(
+    state: &AppState,
+    cert: CertificateRecord,
+) -> Result<CertificateRecord, (StatusCode, Json<Value>)> {
+    let previous = if cert.id > 0 {
+        state.db.get_certificate(cert.id).ok().flatten()
+    } else {
+        None
+    };
+    let saved = state.db.save_certificate(cert).map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        if let Some(prev) = previous {
+            let _ = state.db.restore_certificate(&prev);
+        } else {
+            let _ = state.db.delete_certificate(saved.id);
+        }
+        return Err(bad_req(e));
+    }
+    Ok(saved)
 }
 
 async fn api_save_cert(
     State(state): State<Arc<AppState>>,
-    Json(cert): Json<CertificateRecord>,
+    Json(mut cert): Json<CertificateRecord>,
 ) -> ApiResult {
-    let saved = state.db.save_certificate(cert).map_err(bad_req)?;
-    if let Err(e) = state.proc_mgr.reload_config().await {
-        return Err(bad_req(e));
+    cert.name = cert.name.trim().to_string();
+    cert.cert_type = cert.cert_type.trim().to_string();
+
+    if cert.cert_type == "acme" {
+        cert.domains = normalize_acme_domains(&cert.domains).map_err(bad_req)?;
+        if cert.directory_url.trim().is_empty() {
+            cert.directory_url = DEFAULT_LETSENCRYPT_DIR.to_string();
+        } else {
+            cert.directory_url = cert.directory_url.trim().to_string();
+        }
+        if cert.challenge_type != "tls_alpn01" {
+            cert.challenge_type = "http01".to_string();
+            if cert.http01_listen.trim().is_empty() {
+                cert.http01_listen = "0.0.0.0:80".to_string();
+            }
+        }
+        // Always fetch the live ACME directory Terms of Service URL so Shoes never fails on stale LE-SA URLs.
+        match fetch_acme_directory_meta(&cert.directory_url).await {
+            Ok(meta) => {
+                cert.terms_of_service = meta.terms_of_service.unwrap_or_default();
+            }
+            Err(e) => {
+                // If user passed an unreachable custom URL or transient error, keep fallback for LE or surface error clearly.
+                if cert.directory_url.contains("letsencrypt.org") {
+                    if cert.terms_of_service.trim().is_empty()
+                        || cert.terms_of_service.contains("LE-SA-v1.4-April-3-2024")
+                    {
+                        cert.terms_of_service = DEFAULT_LETSENCRYPT_TOS.to_string();
+                    }
+                } else if cert.terms_of_service.trim().is_empty() {
+                    return Err(bad_req(format!(
+                        "Failed to fetch ACME directory metadata from {}: {e}",
+                        cert.directory_url
+                    )));
+                }
+            }
+        }
+    } else if cert.cert_type == "files" {
+        let cert_path = cert.cert_file.trim();
+        let key_path = cert.key_file.trim();
+        if cert_path.is_empty() || key_path.is_empty() {
+            return Err(bad_req("Both certificate file path and key file path are required"));
+        }
+        let cert_pem = std::fs::read_to_string(cert_path)
+            .map_err(|e| bad_req(format!("Cannot read certificate file '{cert_path}': {e}")))?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .map_err(|e| bad_req(format!("Cannot read private key file '{key_path}': {e}")))?;
+        let info = validate_cert_key_pair(&cert_pem, &key_pem)
+            .await
+            .map_err(bad_req)?;
+        if cert.domains.is_empty() && !info.sans.is_empty() {
+            cert.domains = info.sans;
+        }
     }
+
+    let saved = save_cert_with_rollback(&state, cert).await?;
     ok_json(saved)
 }
 
@@ -751,22 +961,19 @@ async fn api_upload_cert(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UploadCertReq>,
 ) -> ApiResult {
-    let safe_name: String = req
-        .name
-        .trim()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if safe_name.is_empty() {
-        return Err(bad_req("Certificate name must contain alphanumeric characters"));
+    let safe_name = sanitize_cert_filename(&req.name);
+    if req.name.trim().is_empty() {
+        return Err(bad_req("Certificate name must not be empty"));
     }
+    let info = validate_cert_key_pair(&req.cert_pem, &req.key_pem)
+        .await
+        .map_err(bad_req)?;
+
     let cert_dir = state.db.data_dir.join("certs");
-    std::fs::create_dir_all(&cert_dir).map_err(internal_err)?;
     let cert_path = cert_dir.join(format!("{safe_name}.crt"));
     let key_path = cert_dir.join(format!("{safe_name}.key"));
-
-    std::fs::write(&cert_path, req.cert_pem.trim().as_bytes()).map_err(internal_err)?;
-    std::fs::write(&key_path, req.key_pem.trim().as_bytes()).map_err(internal_err)?;
+    write_cert_and_key_atomic(&cert_path, &key_path, &req.cert_pem, &req.key_pem)
+        .map_err(internal_err)?;
 
     let rec = CertificateRecord {
         id: req.id,
@@ -774,7 +981,7 @@ async fn api_upload_cert(
         cert_type: "files".to_string(),
         cert_file: cert_path.to_string_lossy().replace('\\', "/"),
         key_file: key_path.to_string_lossy().replace('\\', "/"),
-        domains: Vec::new(),
+        domains: info.sans,
         email: String::new(),
         directory_url: String::new(),
         terms_of_service: String::new(),
@@ -783,8 +990,8 @@ async fn api_upload_cert(
         remark: req.remark,
         created_at: 0,
     };
-    let saved = state.db.save_certificate(rec).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    let saved = save_cert_with_rollback(&state, rec).await?;
+    let _ = reload_panel_https_if_matching(&state, &cert_path, &key_path).await;
     ok_json(saved)
 }
 
@@ -801,23 +1008,37 @@ async fn api_self_signed_cert(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelfSignedReq>,
 ) -> ApiResult {
-    let safe_name: String = req
-        .name
-        .trim()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    if safe_name.is_empty() {
-        return Err(bad_req("Certificate name must contain alphanumeric characters"));
+    if req.name.trim().is_empty() {
+        return Err(bad_req("Certificate name must not be empty"));
     }
-    let (cert_pem, key_pem) = generate_self_signed_cert(&req.domains).map_err(bad_req)?;
+    let safe_name = sanitize_cert_filename(&req.name);
+
+    let mut domains: Vec<String> = req
+        .domains
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if domains.is_empty() {
+        if let Ok(settings) = state.db.get_settings() {
+            let ph = settings.public_host.trim().to_string();
+            if !ph.is_empty() && !is_loopback_or_unspecified_host(&ph) {
+                domains.push(ph);
+            }
+        }
+        let detected = state.get_detected_public_ip();
+        if !detected.is_empty() && !domains.contains(&detected) {
+            domains.push(detected);
+        }
+        domains.push("localhost".to_string());
+        domains.push("127.0.0.1".to_string());
+    }
+
+    let (cert_pem, key_pem) = generate_self_signed_cert(&domains).map_err(bad_req)?;
     let cert_dir = state.db.data_dir.join("certs");
-    std::fs::create_dir_all(&cert_dir).map_err(internal_err)?;
     let cert_path = cert_dir.join(format!("{safe_name}.crt"));
     let key_path = cert_dir.join(format!("{safe_name}.key"));
-
-    std::fs::write(&cert_path, cert_pem.as_bytes()).map_err(internal_err)?;
-    std::fs::write(&key_path, key_pem.as_bytes()).map_err(internal_err)?;
+    write_cert_and_key_atomic(&cert_path, &key_path, &cert_pem, &key_pem).map_err(internal_err)?;
 
     let rec = CertificateRecord {
         id: 0,
@@ -825,30 +1046,239 @@ async fn api_self_signed_cert(
         cert_type: "files".to_string(),
         cert_file: cert_path.to_string_lossy().replace('\\', "/"),
         key_file: key_path.to_string_lossy().replace('\\', "/"),
-        domains: req.domains,
+        domains,
         email: String::new(),
         directory_url: String::new(),
         terms_of_service: String::new(),
         challenge_type: "http01".to_string(),
         http01_listen: String::new(),
-        remark: if req.remark.is_empty() {
+        remark: if req.remark.trim().is_empty() {
             "Self-Signed".to_string()
         } else {
-            req.remark
+            req.remark.trim().to_string()
         },
         created_at: 0,
     };
-    let saved = state.db.save_certificate(rec).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    let saved = save_cert_with_rollback(&state, rec).await?;
     ok_json(saved)
+}
+
+#[derive(Deserialize)]
+struct IssueIpCertReq {
+    #[serde(default)]
+    id: i64,
+    name: String,
+    ips: Vec<String>,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    directory_url: String,
+    #[serde(default)]
+    http01_listen: String,
+    #[serde(default)]
+    remark: String,
+}
+
+async fn api_issue_ip_cert(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IssueIpCertReq>,
+) -> ApiResult {
+    if req.name.trim().is_empty() {
+        return Err(bad_req("Certificate name must not be empty"));
+    }
+    let safe_name = sanitize_cert_filename(&req.name);
+    let dir_url = if req.directory_url.trim().is_empty() {
+        DEFAULT_LETSENCRYPT_DIR.to_string()
+    } else {
+        req.directory_url.trim().to_string()
+    };
+    let listen = if req.http01_listen.trim().is_empty() {
+        "0.0.0.0:80".to_string()
+    } else {
+        req.http01_listen.trim().to_string()
+    };
+
+    let issued = issue_shortlived_ip_cert(
+        &state.db.data_dir,
+        &safe_name,
+        &req.ips,
+        &req.email,
+        &dir_url,
+        &listen,
+    )
+    .await
+    .map_err(bad_req)?;
+
+    let cert_dir = state.db.data_dir.join("certs");
+    let cert_path = cert_dir.join(format!("{safe_name}.crt"));
+    let key_path = cert_dir.join(format!("{safe_name}.key"));
+    write_cert_and_key_atomic(&cert_path, &key_path, &issued.cert_pem, &issued.key_pem)
+        .map_err(internal_err)?;
+
+    let existing_id = if req.id > 0 {
+        req.id
+    } else {
+        state
+            .db
+            .list_certificates()
+            .ok()
+            .and_then(|list| list.into_iter().find(|c| c.name == safe_name).map(|c| c.id))
+            .unwrap_or(0)
+    };
+
+    let norm_ips: Vec<String> = req
+        .ips
+        .into_iter()
+        .map(|s| s.trim().trim_matches(['[', ']']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let rec = CertificateRecord {
+        id: existing_id,
+        name: safe_name,
+        cert_type: "acme_ip".to_string(),
+        cert_file: cert_path.to_string_lossy().replace('\\', "/"),
+        key_file: key_path.to_string_lossy().replace('\\', "/"),
+        domains: if issued.info.sans.is_empty() {
+            norm_ips
+        } else {
+            issued.info.sans.clone()
+        },
+        email: req.email.trim().to_string(),
+        directory_url: dir_url,
+        terms_of_service: issued.terms_of_service,
+        challenge_type: "http01".to_string(),
+        http01_listen: listen,
+        remark: if req.remark.trim().is_empty() {
+            "Let's Encrypt IP SSL (shortlived 6d auto-renew)".to_string()
+        } else {
+            req.remark.trim().to_string()
+        },
+        created_at: 0,
+    };
+    let saved = save_cert_with_rollback(&state, rec).await?;
+    let _ = reload_panel_https_if_matching(&state, &cert_path, &key_path).await;
+    ok_json(json!({
+        "cert": saved,
+        "info": issued.info,
+    }))
+}
+
+async fn api_renew_cert(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let cert = state
+        .db
+        .get_certificate(id)
+        .map_err(internal_err)?
+        .ok_or_else(|| bad_req("Certificate not found"))?;
+    match cert.cert_type.as_str() {
+        "acme_ip" => {
+            let info = renew_ip_certificate_record(&state, &cert)
+                .await
+                .map_err(bad_req)?;
+            ok_json(json!({
+                "renewed": true,
+                "info": info,
+            }))
+        }
+        "acme" => {
+            state.proc_mgr.reload_config().await.map_err(bad_req)?;
+            ok_json(json!({
+                "renewed": false,
+                "message": "Triggered Shoes config reload; Shoes manages domain ACME issuance & renewal automatically in the background.",
+            }))
+        }
+        _ => Err(bad_req("Only ACME certificates support automatic renewal")),
+    }
+}
+
+async fn api_apply_panel_https(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let cert = state
+        .db
+        .get_certificate(id)
+        .map_err(internal_err)?
+        .ok_or_else(|| bad_req("Certificate not found"))?;
+
+    let (cert_path, key_path) = if cert.cert_type == "acme" {
+        export_acme_state_for_panel(&state.db.data_dir, &cert).map_err(bad_req)?
+    } else {
+        let cp = std::path::PathBuf::from(cert.cert_file.trim());
+        let kp = std::path::PathBuf::from(cert.key_file.trim());
+        if !cp.is_file() || !kp.is_file() {
+            return Err(bad_req("Certificate or private key file does not exist on disk"));
+        }
+        (cp, kp)
+    };
+
+    // Verify PEM pair before persisting to Panel HTTPS settings
+    axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(|e| bad_req(format!("Invalid TLS certificate/key for Panel HTTPS: {e}")))?;
+
+    let cert_str = cert_path.to_string_lossy().replace('\\', "/");
+    let key_str = key_path.to_string_lossy().replace('\\', "/");
+    state
+        .db
+        .set_setting_kv("panel_cert_file", &cert_str)
+        .map_err(internal_err)?;
+    state
+        .db
+        .set_setting_kv("panel_key_file", &key_str)
+        .map_err(internal_err)?;
+
+    let hot_reloaded = reload_panel_https_if_matching(&state, &cert_path, &key_path)
+        .await
+        .unwrap_or(false);
+
+    ok_json(json!({
+        "panel_cert_file": cert_str,
+        "panel_key_file": key_str,
+        "hot_reloaded": hot_reloaded,
+        "restart_required": !hot_reloaded,
+    }))
 }
 
 async fn api_delete_cert(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> ApiResult {
+    let existing = state
+        .db
+        .get_certificate(id)
+        .map_err(internal_err)?
+        .ok_or_else(|| bad_req("Certificate not found"))?;
+
+    let inbounds = state.db.list_inbounds().unwrap_or_default();
+    let used_by = inbounds_referencing_cert(&inbounds, &existing.name);
+    if !used_by.is_empty() {
+        return Err(bad_req(format!(
+            "Certificate '{}' is still used by inbound(s): {}. Switch or disable those inbounds first.",
+            existing.name,
+            used_by.join(", ")
+        )));
+    }
+
+    if let Ok(settings) = state.db.get_settings() {
+        let panel_cert = settings.panel_cert_file.trim().replace('\\', "/");
+        let cert_norm = existing.cert_file.trim().replace('\\', "/");
+        if !panel_cert.is_empty() && !cert_norm.is_empty() && panel_cert == cert_norm {
+            return Err(bad_req(format!(
+                "Certificate '{}' is currently configured as the Panel HTTPS certificate. Clear Panel HTTPS in Settings first.",
+                existing.name
+            )));
+        }
+    }
+
     state.db.delete_certificate(id).map_err(bad_req)?;
-    state.proc_mgr.reload_config().await.map_err(bad_req)?;
+    if let Err(e) = state.proc_mgr.reload_config().await {
+        let _ = state.db.restore_certificate(&existing);
+        return Err(bad_req(e));
+    }
     ok_json(true)
 }
 
@@ -1027,7 +1457,9 @@ async fn api_get_settings(State(state): State<Arc<AppState>>, headers: HeaderMap
         "settings": s,
         "admin_username": username,
         "effective_share_host": effective_host,
-        "detected_public_ip": state.get_detected_public_ip()
+        "detected_public_ip": state.get_detected_public_ip(),
+        "listener_scheme": state.listener_scheme,
+        "default_credentials": state.db.is_default_credentials()
     }))
 }
 
@@ -1069,13 +1501,14 @@ async fn api_save_settings(
 struct ChangePwdReq {
     current_password: String,
     new_username: String,
+    #[serde(default)]
     new_password: String,
 }
 
 async fn api_change_password(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChangePwdReq>,
-) -> ApiResult {
+) -> Result<Response, (StatusCode, Json<Value>)> {
     state
         .db
         .update_credentials(
@@ -1085,7 +1518,11 @@ async fn api_change_password(
         )
         .map_err(bad_req)?;
     state.sessions.revoke_all();
-    ok_json(true)
+    let clear = format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    let mut resp = Json(json!({ "ok": true, "data": true })).into_response();
+    resp.headers_mut()
+        .insert(header::SET_COOKIE, clear.parse().unwrap());
+    Ok(resp)
 }
 
 async fn api_backup_db(
@@ -1106,6 +1543,239 @@ async fn api_backup_db(
         )
         .body(Body::from(bytes))
         .unwrap())
+}
+
+async fn apply_post_restore(state: &AppState, pre_backup: String) -> ApiResult {
+    if let Ok(settings) = state.db.get_settings() {
+        state.set_base_path(&settings.panel_base_path);
+    }
+    // Reload shoes config with restored inbounds/certs/routing (log warning if shoes bin missing)
+    let reload_note = match state.proc_mgr.reload_config().await {
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    state.sessions.revoke_all();
+    ok_json(json!({
+        "restored": true,
+        "pre_restore_backup": pre_backup,
+        "reload_warning": reload_note,
+    }))
+}
+
+async fn api_restore_db(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> ApiResult {
+    let mut uploaded: Option<Vec<u8>> = None;
+    while let Some(field) = multipart.next_field().await.map_err(bad_req)? {
+        let is_file_field = field.name() == Some("file") || field.file_name().is_some();
+        if is_file_field {
+            let data = field.bytes().await.map_err(bad_req)?;
+            if !data.is_empty() {
+                uploaded = Some(data.to_vec());
+                break;
+            }
+        }
+    }
+    let bytes = uploaded.ok_or_else(|| bad_req("No SQLite .db file uploaded"))?;
+    let db = state.db.clone();
+    let pre_backup = tokio::task::spawn_blocking(move || db.restore_from_bytes(&bytes))
+        .await
+        .map_err(internal_err)?
+        .map_err(bad_req)?;
+    apply_post_restore(&state, pre_backup).await
+}
+
+async fn api_list_backups(State(state): State<Arc<AppState>>) -> ApiResult {
+    let list = list_local_backups(&state.db.data_dir).map_err(internal_err)?;
+    ok_json(list)
+}
+
+#[derive(Deserialize, Default)]
+struct BackupNowReq {
+    #[serde(default)]
+    send_telegram: bool,
+}
+
+async fn api_backup_now(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<BackupNowReq>>,
+) -> ApiResult {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let retain = settings.auto_backup_retain_count.clamp(1, 100) as usize;
+    let db = state.db.clone();
+    let (entry, bytes) =
+        tokio::task::spawn_blocking(move || create_local_backup(&db, "manual", Some(retain)))
+            .await
+            .map_err(internal_err)?
+            .map_err(internal_err)?;
+
+    let mut tg_sent = 0usize;
+    if req.send_telegram
+        || (settings.tg_backup_enabled
+            && !settings.tg_bot_token.trim().is_empty()
+            && !settings.tg_chat_id.trim().is_empty())
+    {
+        let host = if !settings.public_host.trim().is_empty() {
+            settings.public_host.clone()
+        } else {
+            state.get_detected_public_ip()
+        };
+        let caption = build_backup_caption(&state.db, &host);
+        tg_sent = send_backup_to_telegram(
+            None,
+            &settings.tg_bot_token,
+            &settings.tg_chat_id,
+            &entry.filename,
+            &bytes,
+            &caption,
+        )
+        .await
+        .map_err(bad_req)?;
+    }
+
+    ok_json(json!({
+        "backup": entry,
+        "telegram_sent": tg_sent,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct TgBackupTestReq {
+    #[serde(default)]
+    tg_bot_token: String,
+    #[serde(default)]
+    tg_chat_id: String,
+}
+
+async fn api_backup_tg_test(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TgBackupTestReq>,
+) -> ApiResult {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let token = if !req.tg_bot_token.trim().is_empty() {
+        req.tg_bot_token.trim().to_string()
+    } else {
+        settings.tg_bot_token.trim().to_string()
+    };
+    let chat_id = if !req.tg_chat_id.trim().is_empty() {
+        req.tg_chat_id.trim().to_string()
+    } else {
+        settings.tg_chat_id.trim().to_string()
+    };
+    let db = state.db.clone();
+    let bytes = tokio::task::spawn_blocking(move || db.backup_snapshot())
+        .await
+        .map_err(internal_err)?
+        .map_err(internal_err)?;
+    let filename = format!(
+        "shoes-panel-test-{}.db",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    let host = if !settings.public_host.trim().is_empty() {
+        settings.public_host.clone()
+    } else {
+        state.get_detected_public_ip()
+    };
+    let caption = build_backup_caption(&state.db, &host);
+    let sent = send_backup_to_telegram(None, &token, &chat_id, &filename, &bytes, &caption)
+        .await
+        .map_err(bad_req)?;
+    ok_json(json!({ "sent_chats": sent, "filename": filename }))
+}
+
+async fn api_download_local_backup(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let safe = sanitize_backup_filename(&filename).map_err(bad_req)?;
+    let path = backups_dir(&state.db.data_dir).join(&safe);
+    let bytes = std::fs::read(&path)
+        .map_err(|_| err_json(StatusCode::NOT_FOUND, format!("Backup '{safe}' not found")))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{safe}\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap())
+}
+
+async fn api_restore_local_backup(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> ApiResult {
+    let safe = sanitize_backup_filename(&filename).map_err(bad_req)?;
+    let path = backups_dir(&state.db.data_dir).join(&safe);
+    let bytes = std::fs::read(&path)
+        .map_err(|_| err_json(StatusCode::NOT_FOUND, format!("Backup '{safe}' not found")))?;
+    let db = state.db.clone();
+    let pre_backup = tokio::task::spawn_blocking(move || db.restore_from_bytes(&bytes))
+        .await
+        .map_err(internal_err)?
+        .map_err(bad_req)?;
+    apply_post_restore(&state, pre_backup).await
+}
+
+async fn api_delete_local_backup(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> ApiResult {
+    let safe = sanitize_backup_filename(&filename).map_err(bad_req)?;
+    let path = backups_dir(&state.db.data_dir).join(&safe);
+    if !path.is_file() {
+        return Err(err_json(
+            StatusCode::NOT_FOUND,
+            format!("Backup '{safe}' not found"),
+        ));
+    }
+    std::fs::remove_file(&path).map_err(internal_err)?;
+    ok_json(true)
+}
+
+// ==================== Panel Restart & GitHub Online Updates ====================
+
+async fn api_panel_restart(State(state): State<Arc<AppState>>) -> ApiResult {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let target_scheme = settings.scheme();
+    let target_port = settings.panel_port;
+    let target_base_path = settings.panel_base_path.clone();
+    schedule_panel_restart(state, 700);
+    ok_json(json!({
+        "restarting": true,
+        "target_scheme": target_scheme,
+        "target_port": target_port,
+        "target_base_path": target_base_path,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct UpdatesQuery {
+    #[serde(default)]
+    force: Option<String>,
+}
+
+async fn api_check_updates(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UpdatesQuery>,
+) -> ApiResult {
+    let force = matches!(q.force.as_deref(), Some("1" | "true" | "yes"));
+    let result = check_github_updates(&state.db, &state.proc_mgr, force).await;
+    ok_json(result)
+}
+
+async fn api_upgrade_panel(State(state): State<Arc<AppState>>) -> ApiResult {
+    let res = upgrade_panel_binary(state).await.map_err(bad_req)?;
+    ok_json(res)
+}
+
+async fn api_upgrade_shoes(State(state): State<Arc<AppState>>) -> ApiResult {
+    let res = upgrade_shoes_binary(state).await.map_err(bad_req)?;
+    ok_json(res)
 }
 
 // ==================== Embedded SPA Fallback ====================

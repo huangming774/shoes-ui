@@ -38,11 +38,21 @@
 - **Two-Layer `Inbound -> Clients` Data Model**:
   - Dedicated port per client (`1 Client = 1 Port`) for single-credential protocols (VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC v5, Snell, SOCKS5, HTTP, Mixed) with accurate per-inbound traffic accounting, quotas, expiration dates, monthly auto-reset, and **1-click Dedicated-Port Client Cloning (`+Port`)**.
   - Native multi-user support on a single port for **AnyTLS** and **NaiveProxy**.
-- **Full Protocol Form + 1-Click Key Generators**: VLESS (TLS / REALITY / XTLS-Vision), VMess, Trojan, Shadowsocks (Classic & 2022 AEAD), Hysteria2 (QUIC), TUIC v5 (QUIC), AnyTLS, NaiveProxy, Snell, SOCKS5, HTTP, Mixed, plus WebSocket & XHTTP/SplitHTTP transports. Built-in generators for UUID, Reality X25519 keypairs, SS-2022 keys, and ECDSA self-signed certificates.
+- **Full Protocol Form + H2Mux Multiplexing + 1-Click Key Generators**: VLESS (TLS / REALITY / XTLS-Vision), VMess, Trojan, Shadowsocks (Classic & 2022 AEAD), Hysteria2 (QUIC), TUIC v5 (QUIC), AnyTLS, NaiveProxy, Snell, SOCKS5, HTTP, Mixed, plus WebSocket & XHTTP/SplitHTTP transports. Supports **H2Mux multiplexing** on both compatible inbounds and outbound group members (automatically preventing conflicts with `VLESS XTLS-Vision`) and syncs cleanly to **Shoes (`h2mux`)**, **Clash / Mihomo (`smux`)**, and **sing-box (`multiplex`)** configs. Built-in generators for UUID, Reality X25519 keypairs, SS-2022 keys, and ECDSA self-signed certificates.
 - **Share Links, QR Codes & Multi-Format Subscriptions**: Generates standard client URIs, QR codes, `shoes` client YAML snippets, and `/sub/<token>` subscriptions in **v2rayN Base64**, **Clash / Mihomo YAML**, and **sing-box JSON** formats (auto-detected by User-Agent or `?format=`, including `Subscription-Userinfo` headers).
-- **Real-Time Traffic Accounting & Quota Enforcement**: Polls `shoes` Clash Controller API (`/connections`) every second to persist byte deltas to SQLite, and automatically disables expired or over-quota inbounds while terminating active connections.
-- **Certificates, Outbound Groups & Routing Rules**: Manage ACME auto-renewing certificates, PEM uploads, self-signed certs, `client_group` (`selector` / `url-test` / `round-robin` with live node switching & latency probes), and `panel-routing` rules.
-- **Single Binary & Security**: Embedded Vue 3 SPA via `rust-embed`, Argon2id password hashing, panel HTTPS support, and instant dynamic secret base path (e.g., `/secret`).
+- **Dashboard Observability, Traffic Accounting & Quota Enforcement**:
+  - **Last-2-Minute Live Charts**: Host CPU/memory utilization and NIC throughput.
+  - **Network Health (Linux `/proc`)**: Clearly scoped to either the **Shoes process** (FDs used / soft limit, e.g. `8,200 / 1,048,576`) or **Host** (active TCP congestion control algorithm plus ~1-minute deltas for `ListenOverflows`, TCP `RetransSegs`, and UDP `RcvbufErrors` / `SndbufErrors`).
+  - **Shoes Core 24-Hour History**: Minute-level aggregated **Core CPU, resident memory (RSS), active connections, and proxy throughput** persisted in SQLite, with **core start / restart / config reload** events marked as dashed vertical lines and a collapsible timeline list.
+  - **30-Day Daily Proxy Traffic & Quota Enforcement**: Polls `shoes` Clash Controller API (`/connections`) every second to persist byte deltas and daily totals to SQLite, automatically disabling expired or over-quota inbounds while terminating active connections.
+- **Certificate Center (with Free Public IP HTTPS), Outbound Groups & Routing Rules**:
+  - Supports **Let's Encrypt free public IP certificates** (`shortlived` 6-day profile per RFC 8555 / RFC 8738 with automatic background renewal when `< 48h` remain), domain ACME auto-renewal (HTTP-01 / TLS-ALPN-01 with live ToS metadata sync), PEM uploads, self-signed certs, X.509 expiry inspection, in-use delete protection, and **1-click Panel HTTPS apply with zero-downtime hot reload**.
+  - Manage `client_group` (`selector` / `url-test` / `round-robin` with live node switching & latency probes) and `panel-routing` rules.
+- **Backup/Restore, Web Operations & Security Hardening**:
+  - Embedded Vue 3 SPA via `rust-embed` with zero external runtime dependencies.
+  - **SQLite Online Backup & 1-Click Restore**: Upload `.db` files directly in the web UI to restore online (with SQLite integrity checks and automatic `pre-restore-*.db` safety snapshots), manage local backup snapshots, and configure **scheduled local + Telegram Bot auto-backups**.
+  - **Web UI Operations**: 1-click panel restart, GitHub release update checks, SHA-256 verified **1-click panel online upgrade**, and **1-click `shoes` core upgrade** (with automatic rollback).
+  - **Security**: Argon2id password hashing, login brute-force lockout (8 failed attempts -> 5-minute `429` cooldown), `HttpOnly` + automatic `Secure` cookies on HTTPS, username-only rename, default weak-credential banner, and instant dynamic secret base path (e.g., `/secret`).
 
 ---
 
@@ -54,7 +64,14 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/huangming774/shoes-ui/main/install.sh)
 ```
 
-Automatically installs the official `shoes` binary and `shoes-panel`, lets you customize (or accept defaults `54321` / `/`) the panel port, base path, and admin credentials, opens local firewall rules (`ufw` / `firewalld` / `iptables`), enables and verifies the `shoes-panel` systemd service, and installs the `s-ui` management CLI.
+Automatically installs the official `shoes` binary and `shoes-panel`, generates random admin credentials (or lets you customize port `54321`, base path, and credentials), **provisions Panel HTTPS automatically via a free Let's Encrypt public IP certificate** (falling back to a self-signed HTTPS certificate if port 80 HTTP-01 validation is unavailable), opens local firewall rules (`ufw` / `firewalld` / `iptables`), enables and verifies the `shoes-panel` systemd service, and installs the `s-ui` management CLI.
+
+For an existing installation, run `sudo bash install.sh --install-cli` from the updated source directory to refresh the menu. In `sudo s-ui`:
+- Option `10`: Panel HTTPS certificate manager (free public IP SSL / self-signed HTTPS / clear HTTPS).
+- Options `11`, `12`, `16`: Update panel, `shoes` core, or `s-ui` script individually (`17` updates all three).
+- Option `13`: Local SQLite backup and 1-click snapshot restore.
+- Option `14`: Full uninstall (requires typing `PURGE` before deleting database, certificates, and backups).
+- Option `15`: **TCP Congestion Control & Acceleration Manager** — enable **BBRv1 + FQ**, install/switch **BBR Plus (UJX6N)**, **Mod BBR (Tsunami)**, or **PCC / PCC Vivace**, hot-switch available kernel algorithms & qdiscs (`fq` / `fq_codel` / `cake`), apply proxy buffer sysctl tuning, or restore defaults.
 
 ### Option 2: Prebuilt Multi-Arch Docker Image (`linux/amd64` & `linux/arm64`)
 

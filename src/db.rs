@@ -51,6 +51,15 @@ impl Database {
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS core_minutes (time INTEGER PRIMARY KEY, metrics TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS core_events (time INTEGER NOT NULL, kind TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS core_events_time ON core_events(time);
+            CREATE TABLE IF NOT EXISTS daily_traffic (
+                day TEXT PRIMARY KEY,
+                up_bytes INTEGER NOT NULL,
+                down_bytes INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -194,6 +203,12 @@ impl Database {
                 ("shoes_auto_start", "true"),
                 ("shoes_extra_yaml", ""),
                 ("session_ttl_hours", "168"),
+                ("auto_backup_enabled", "false"),
+                ("auto_backup_interval_hours", "24"),
+                ("auto_backup_retain_count", "7"),
+                ("tg_bot_token", ""),
+                ("tg_chat_id", ""),
+                ("tg_backup_enabled", "false"),
             ] {
                 insert.execute(params![key, value])?;
             }
@@ -256,6 +271,20 @@ impl Database {
         Ok(u)
     }
 
+    pub fn is_default_credentials(&self) -> bool {
+        let conn = self.conn.lock();
+        let res: Option<(String, String)> = conn
+            .query_row(
+                "SELECT username, password_hash FROM users ORDER BY id ASC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        matches!(res, Some((u, h)) if u == "admin" && verify_password("admin", &h))
+    }
+
     pub fn update_credentials(
         &self,
         current_password: Option<&str>,
@@ -266,25 +295,36 @@ impl Database {
         if new_username.is_empty() {
             return Err(anyhow!("Username must not be empty"));
         }
-        if new_password.len() < 4 {
+        let changing_password = !new_password.is_empty();
+        if !changing_password && current_password.is_none() {
+            return Err(anyhow!("Password must be at least 4 characters"));
+        }
+        if changing_password && new_password.len() < 4 {
             return Err(anyhow!("Password must be at least 4 characters"));
         }
         let conn = self.conn.lock();
-        let (id, existing_hash): (i64, String) = conn.query_row(
-            "SELECT id, password_hash FROM users ORDER BY id ASC LIMIT 1",
+        let (id, existing_user, existing_hash): (i64, String, String) = conn.query_row(
+            "SELECT id, username, password_hash FROM users ORDER BY id ASC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         if let Some(curr) = current_password {
             if !verify_password(curr, &existing_hash) {
                 return Err(anyhow!("Current password is incorrect"));
             }
         }
-        let hash = hash_password(new_password)?;
+        if !changing_password && new_username == existing_user {
+            return Err(anyhow!("Please enter a new username or a new password"));
+        }
+        let final_hash = if changing_password {
+            hash_password(new_password)?
+        } else {
+            existing_hash
+        };
         let now = Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE users SET username = ?1, password_hash = ?2, updated_at = ?3 WHERE id = ?4",
-            params![new_username, hash, now, id],
+            params![new_username, final_hash, now, id],
         )?;
         Ok(())
     }
@@ -320,6 +360,20 @@ impl Database {
             shoes_auto_start: get("shoes_auto_start")? == "true",
             shoes_extra_yaml: get("shoes_extra_yaml")?,
             session_ttl_hours: get("session_ttl_hours")?.parse().unwrap_or(168),
+            auto_backup_enabled: map.remove("auto_backup_enabled").as_deref() == Some("true"),
+            auto_backup_interval_hours: map
+                .remove("auto_backup_interval_hours")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24)
+                .clamp(1, 720),
+            auto_backup_retain_count: map
+                .remove("auto_backup_retain_count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7)
+                .clamp(1, 100),
+            tg_bot_token: map.remove("tg_bot_token").unwrap_or_default(),
+            tg_chat_id: map.remove("tg_chat_id").unwrap_or_default(),
+            tg_backup_enabled: map.remove("tg_backup_enabled").as_deref() == Some("true"),
         };
         Ok(settings)
     }
@@ -337,6 +391,83 @@ impl Database {
         let conn = self.conn.lock();
         let snapshot = conn.serialize(rusqlite::DatabaseName::Main)?;
         Ok(snapshot.to_vec())
+    }
+
+    /// Validates an uploaded SQLite backup image, creates a safety pre-restore snapshot,
+    /// restores atomically via SQLite's online Backup API, and re-runs schema seeding.
+    pub fn restore_from_bytes(&self, raw_bytes: &[u8]) -> Result<String> {
+        use rusqlite::OpenFlags;
+        use std::io::Write;
+
+        if raw_bytes.len() < 100 || !raw_bytes.starts_with(b"SQLite format 3\0") {
+            return Err(anyhow!(
+                "Uploaded file is not a valid SQLite 3 database (.db)"
+            ));
+        }
+
+        // Write candidate database to a temp file and verify integrity + expected panel tables
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.data_dir)?;
+        tmp.write_all(raw_bytes)?;
+        tmp.flush()?;
+
+        let src_conn = Connection::open_with_flags(
+            tmp.path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("Failed to open uploaded SQLite database")?;
+
+        let integrity: String = src_conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .context("Failed to run SQLite integrity_check")?;
+        if !integrity.eq_ignore_ascii_case("ok") {
+            return Err(anyhow!("Uploaded SQLite database failed integrity check: {integrity}"));
+        }
+
+        for required in ["users", "settings", "inbounds"] {
+            let exists: i64 = src_conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![required],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Err(anyhow!(
+                    "Uploaded database is missing required shoes-panel table '{required}'"
+                ));
+            }
+        }
+        let user_count: i64 =
+            src_conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+        if user_count == 0 {
+            return Err(anyhow!("Uploaded database has no admin user account"));
+        }
+
+        // Create safety pre-restore snapshot before touching live DB
+        let backup_dir = self.data_dir.join("backups");
+        std::fs::create_dir_all(&backup_dir)?;
+        let pre_name = format!(
+            "pre-restore-{}.db",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let pre_path = backup_dir.join(&pre_name);
+        let pre_bytes = self.backup_snapshot()?;
+        std::fs::write(&pre_path, &pre_bytes)?;
+        crate::acme_util::set_private_file_permissions(&pre_path);
+
+        // Online SQLite backup from validated source into live DB connection
+        {
+            let mut dst_conn = self.conn.lock();
+            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+                .context("Failed to initialize SQLite restore backup handle")?;
+            backup
+                .run_to_completion(128, std::time::Duration::from_millis(5), None)
+                .context("SQLite restore failed")?;
+        }
+        drop(src_conn);
+        drop(tmp);
+
+        // Ensure any newer tables/settings keys exist if restoring an older panel version backup
+        self.init_schema()?;
+        Ok(pre_name)
     }
 
     pub fn save_settings(&self, s: &PanelSettings) -> Result<()> {
@@ -360,6 +491,24 @@ impl Database {
             ),
             ("shoes_extra_yaml", s.shoes_extra_yaml.clone()),
             ("session_ttl_hours", s.session_ttl_hours.max(1).to_string()),
+            (
+                "auto_backup_enabled",
+                if s.auto_backup_enabled { "true" } else { "false" }.to_string(),
+            ),
+            (
+                "auto_backup_interval_hours",
+                s.auto_backup_interval_hours.clamp(1, 720).to_string(),
+            ),
+            (
+                "auto_backup_retain_count",
+                s.auto_backup_retain_count.clamp(1, 100).to_string(),
+            ),
+            ("tg_bot_token", s.tg_bot_token.trim().to_string()),
+            ("tg_chat_id", s.tg_chat_id.trim().to_string()),
+            (
+                "tg_backup_enabled",
+                if s.tg_backup_enabled { "true" } else { "false" }.to_string(),
+            ),
         ];
         for (k, v) in pairs {
             tx.execute(
@@ -901,13 +1050,76 @@ impl Database {
         Ok(candidate)
     }
 
-    /// Accumulates per-inbound byte deltas (`tag -> (up_delta, down_delta)`) into SQLite.
-    pub fn add_traffic_deltas(&self, deltas: &HashMap<String, (u64, u64)>) -> Result<()> {
-        if deltas.is_empty() {
+    /// Missing days remain null so a monitoring gap is distinct from an idle day.
+    pub fn save_core_minute(&self, time: i64, metrics: serde_json::Value) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT OR REPLACE INTO core_minutes VALUES (?1, ?2)", params![time, metrics.to_string()])?;
+        let cutoff = time - 86_400_000;
+        tx.execute("DELETE FROM core_minutes WHERE time <= ?1", [cutoff])?;
+        tx.execute("DELETE FROM core_events WHERE time < ?1", [cutoff])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_core_event(&self, kind: &str) {
+        if let Err(err) = self.conn.lock().execute("INSERT INTO core_events VALUES (?1, ?2)", params![Utc::now().timestamp_millis(), kind]) {
+            tracing::warn!("Could not record core event: {err}");
+        }
+    }
+
+    pub fn core_history(&self) -> Result<serde_json::Value> {
+        let end = Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let start = end - 1439 * 60_000;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT metrics FROM core_minutes WHERE time BETWEEN ?1 AND ?2 ORDER BY time")?;
+        let mut minutes = Vec::new();
+        for row in stmt.query_map([start, end], |r| r.get::<_, String>(0))? {
+            minutes.push(serde_json::from_str::<serde_json::Value>(&row?)?);
+        }
+        let mut stmt = conn.prepare("SELECT time, kind FROM core_events WHERE time >= ?1 ORDER BY time")?;
+        let events = stmt.query_map([start], |r| Ok(serde_json::json!({"time": r.get::<_, i64>(0)?, "kind": r.get::<_, String>(1)?})))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(serde_json::json!({"start":start,"minutes":minutes,"events":events}))
+    }
+
+    pub fn daily_traffic(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE days(day) AS (
+                SELECT date('now', 'localtime', '-29 days')
+                UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now', 'localtime')
+             )
+             SELECT days.day, up_bytes, down_bytes FROM days
+             LEFT JOIN daily_traffic USING(day) ORDER BY days.day",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(serde_json::json!({
+            "day": r.get::<_, String>(0)?,
+            "up": r.get::<_, Option<i64>>(1)?,
+            "down": r.get::<_, Option<i64>>(2)?,
+        })))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record the controller-wide daily delta alongside any per-inbound accounting.
+    pub fn add_traffic_deltas(
+        &self,
+        deltas: &HashMap<String, (u64, u64)>,
+        daily: Option<(&str, u64, u64)>,
+    ) -> Result<()> {
+        if deltas.is_empty() && daily.is_none() {
             return Ok(());
         }
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
+        if let Some((day, up, down)) = daily {
+            tx.execute(
+                "INSERT INTO daily_traffic VALUES (?1, ?2, ?3)
+                 ON CONFLICT(day) DO UPDATE SET up_bytes = up_bytes + excluded.up_bytes,
+                                                down_bytes = down_bytes + excluded.down_bytes",
+                params![day, up, down],
+            )?;
+        }
         for (tag, (up, down)) in deltas {
             if *up == 0 && *down == 0 {
                 continue;
@@ -1070,6 +1282,37 @@ impl Database {
             .into_iter()
             .find(|item| item.id == id)
             .ok_or_else(|| anyhow!("failed to reload certificate"))
+    }
+
+    pub fn get_certificate(&self, id: i64) -> Result<Option<CertificateRecord>> {
+        Ok(self.list_certificates()?.into_iter().find(|c| c.id == id))
+    }
+
+    pub fn restore_certificate(&self, c: &CertificateRecord) -> Result<()> {
+        let domains_json = serde_json::to_string(&c.domains)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO certificates (
+                id, name, cert_type, cert_file, key_file, domains_json, email,
+                directory_url, terms_of_service, challenge_type, http01_listen, remark, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                c.id,
+                c.name.trim(),
+                c.cert_type.trim(),
+                c.cert_file.trim(),
+                c.key_file.trim(),
+                domains_json,
+                c.email.trim(),
+                c.directory_url.trim(),
+                c.terms_of_service.trim(),
+                c.challenge_type.trim(),
+                c.http01_listen.trim(),
+                c.remark.trim(),
+                c.created_at
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn delete_certificate(&self, id: i64) -> Result<()> {
@@ -1425,6 +1668,43 @@ pub fn default_client_for_inbound(ib: &Inbound, idx: usize) -> ClientRecord {
 mod tests {
     use super::*;
     use serde_json::{json, to_value};
+
+    #[test]
+    fn core_history_keeps_recent_minutes_and_events() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+        let now = Utc::now().timestamp_millis() / 60_000 * 60_000;
+        let old = now - 86_400_000;
+        db.save_core_minute(old, json!({"time":old}))?;
+        db.save_core_minute(now, json!({"time":now,"cpu":15}))?;
+        db.record_core_event("restart");
+        let history = db.core_history()?;
+        assert_eq!(history["minutes"], json!([{"time":now,"cpu":15}]));
+        assert_eq!(history["events"][0]["kind"], "restart");
+        Ok(())
+    }
+
+    #[test]
+    fn daily_proxy_history_survives_counter_resets_and_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("panel.db");
+        let db = Database::open(&file, dir.path())?;
+        let rows = db.daily_traffic()?;
+        assert_eq!(rows.len(), 30);
+        assert!(rows.iter().all(|r| r["up"].is_null()));
+        let yesterday = rows[28]["day"].as_str().unwrap();
+        let today = rows[29]["day"].as_str().unwrap();
+        let empty = HashMap::new();
+        db.add_traffic_deltas(&empty, Some((yesterday, 0, 0)))?;
+        db.add_traffic_deltas(&empty, Some((today, 19, 27)))?;
+        db.add_traffic_deltas(&empty, Some((today, 3, 4)))?;
+        db.reset_all_traffic()?;
+        drop(db);
+        let rows = Database::open(&file, dir.path())?.daily_traffic()?;
+        assert_eq!(rows[28], json!({"day": yesterday, "up": 0, "down": 0}));
+        assert_eq!(rows[29], json!({"day": today, "up": 22, "down": 31}));
+        Ok(())
+    }
 
     #[test]
     fn subscription_counts_include_only_enabled_nodes() -> Result<()> {

@@ -1,12 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use ring::digest;
 use serde_yaml::{Mapping, Value};
 use std::collections::HashSet;
-use std::path::Path;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 use crate::db::Database;
 use crate::models::{
     CertificateRecord, ClientRecord, Inbound, OutboundGroupRecord, OutboundMember, PanelSettings,
-    RoutingRuleRecord,
+    RoutingRuleRecord, DEFAULT_LETSENCRYPT_DIR,
 };
 
 fn str_val(s: &str) -> Value {
@@ -59,8 +61,43 @@ pub fn build_shoes_yaml(
         top_entries.push(Value::Mapping(cache_map));
     }
 
+    // Collect certificate sources actively referenced by enabled inbounds.
+    let mut referenced_cert_sources = HashSet::new();
+    for ib in inbounds.iter().filter(|i| i.enable) {
+        if !ib.protocol_settings.raw_override_yaml.trim().is_empty() {
+            continue;
+        }
+        let has_enabled_clients = ib.clients.iter().any(|c| c.enable)
+            || matches!(ib.protocol.as_str(), "socks" | "http" | "mixed");
+        if !has_enabled_clients {
+            continue;
+        }
+        if ib.is_quic() || ib.stream_settings.security == "tls" {
+            let tls = &ib.stream_settings.tls;
+            let src = tls.certificate_source.trim();
+            if !src.is_empty()
+                && (tls.cert_mode == "source"
+                    || (tls.cert_file.trim().is_empty() && tls.key_file.trim().is_empty()))
+            {
+                referenced_cert_sources.insert(src.to_string());
+            }
+        }
+    }
+
+    let mut acme_cert_names = HashSet::new();
+
     // 2. Managed certificate_source entries
     for cert in certs {
+        if cert.cert_type == "acme" {
+            acme_cert_names.insert(cert.name.trim().to_string());
+            // shoes rejects TLS-ALPN-01 ACME sources unless an enabled TCP TLS inbound binds every domain.
+            // Defer emitting unreferenced TLS-ALPN-01 sources so users can create the cert first, then attach an inbound.
+            if cert.challenge_type == "tls_alpn01"
+                && !referenced_cert_sources.contains(cert.name.trim())
+            {
+                continue;
+            }
+        }
         top_entries.push(build_certificate_entry(data_dir, cert)?);
     }
 
@@ -80,9 +117,14 @@ pub fn build_shoes_yaml(
 
     // 5. Enabled Inbound Server entries
     for ib in inbounds.iter().filter(|i| i.enable) {
-        if let Some(entry) =
-            build_inbound_entry(data_dir, ib, has_panel_routing, &enabled_group_names)
-                .with_context(|| format!("inbound '{}' (port {})", ib.remark, ib.port))?
+        if let Some(entry) = build_inbound_entry(
+            data_dir,
+            ib,
+            has_panel_routing,
+            &enabled_group_names,
+            &acme_cert_names,
+        )
+        .with_context(|| format!("inbound '{}' (port {})", ib.remark, ib.port))?
         {
             top_entries.push(entry);
         }
@@ -110,35 +152,124 @@ pub fn build_shoes_yaml(
     ))
 }
 
+/// Ensures a directory exists and has owner-only (`0700`) permissions on Unix,
+/// as strictly required by `shoes` ACME `state_dir` checks.
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .with_context(|| format!("failed to create private directory '{}'", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to chmod 0700 '{}'", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory '{}'", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Validates and normalizes DNS domain names for Shoes built-in ACME
+/// (unique lowercase ASCII DNS names; rejects wildcards and IP literals).
+pub fn normalize_acme_domains(domains: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in domains {
+        let d = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+        if d.is_empty() {
+            continue;
+        }
+        if d.starts_with("*.") || d.contains('*') {
+            return Err(anyhow!(
+                "ACME domain '{d}' uses a wildcard, which HTTP-01 / TLS-ALPN-01 cannot issue"
+            ));
+        }
+        if d.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+            return Err(anyhow!(
+                "'{d}' is an IP address. Shoes built-in ACME only supports DNS domain names; for no-domain IP SSL, use 'Free Public IP SSL (Let's Encrypt shortlived)' or 'Self-Signed IP Cert'."
+            ));
+        }
+        let valid_dns = d.len() <= 253
+            && d.contains('.')
+            && d.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            });
+        if !valid_dns {
+            return Err(anyhow!(
+                "Invalid ACME DNS domain '{d}' (must be a valid ASCII domain like proxy.example.com)"
+            ));
+        }
+        if seen.insert(d.clone()) {
+            out.push(d);
+        }
+    }
+    if out.is_empty() {
+        return Err(anyhow!("ACME certificate requires at least one valid DNS domain"));
+    }
+    Ok(out)
+}
+
+/// Computes an isolated `state_dir` path scoped by `(cert_name, directory_url, normalized_domains)`
+/// so changing Staging -> Production or editing domains never collides with Shoes's ACME identity lock.
+pub fn acme_state_dir(
+    data_dir: &Path,
+    cert_name: &str,
+    directory_url: &str,
+    norm_domains: &[String],
+) -> PathBuf {
+    let safe_name: String = cert_name
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let safe_name = if safe_name.is_empty() {
+        "acme".to_string()
+    } else {
+        safe_name
+    };
+    let mut identity = String::from(directory_url.trim());
+    for d in norm_domains {
+        identity.push('\0');
+        identity.push_str(d);
+    }
+    let hash = digest::digest(&digest::SHA256, identity.as_bytes());
+    let suffix = hex::encode(&hash.as_ref()[..4]);
+    data_dir.join("acme").join(format!("{safe_name}-{suffix}"))
+}
+
 fn build_certificate_entry(data_dir: &Path, c: &CertificateRecord) -> Result<Value> {
     let mut m = Mapping::new();
     insert(&mut m, "certificate_source", str_val(c.name.trim()));
     match c.cert_type.as_str() {
         "acme" => {
-            if c.domains.is_empty() {
-                return Err(anyhow!(
-                    "ACME certificate '{}' requires at least one domain",
-                    c.name
-                ));
-            }
+            let norm_domains = normalize_acme_domains(&c.domains)
+                .with_context(|| format!("ACME certificate '{}'", c.name))?;
             insert(&mut m, "type", str_val("acme"));
             insert(
                 &mut m,
                 "domains",
-                Value::Sequence(c.domains.iter().map(|d| str_val(d.trim())).collect()),
+                Value::Sequence(norm_domains.iter().map(|d| str_val(d)).collect()),
             );
             let dir_url = if c.directory_url.trim().is_empty() {
-                "https://acme-v02.api.letsencrypt.org/directory"
+                DEFAULT_LETSENCRYPT_DIR
             } else {
                 c.directory_url.trim()
             };
             insert(&mut m, "directory_url", str_val(dir_url));
-            let state_dir = data_dir
-                .join("acme")
-                .join(c.name.trim())
-                .to_string_lossy()
-                .replace('\\', "/");
-            std::fs::create_dir_all(data_dir.join("acme").join(c.name.trim())).ok();
+            let state_dir_path = acme_state_dir(data_dir, &c.name, dir_url, &norm_domains);
+            ensure_private_dir(&state_dir_path)?;
+            let state_dir = state_dir_path.to_string_lossy().replace('\\', "/");
             insert(&mut m, "state_dir", str_val(&state_dir));
             if !c.email.trim().is_empty() {
                 let contact = if c.email.trim().starts_with("mailto:") {
@@ -170,6 +301,7 @@ fn build_certificate_entry(data_dir: &Path, c: &CertificateRecord) -> Result<Val
             insert(&mut m, "challenge", Value::Mapping(ch));
         }
         _ => {
+            // Covers both "files" (manual / uploaded / self-signed) and "acme_ip" (panel-managed IP SSL PEMs)
             if c.cert_file.trim().is_empty() || c.key_file.trim().is_empty() {
                 return Err(anyhow!(
                     "File certificate '{}' requires both cert_file and key_file",
@@ -236,6 +368,23 @@ fn build_outbound_group_entry(g: &OutboundGroupRecord) -> Result<Value> {
     Ok(Value::Mapping(m))
 }
 
+fn build_shoes_h2mux_value(mux: &crate::models::H2MuxSettings) -> Value {
+    let mut m = Mapping::new();
+    if mux.max_connections > 0 {
+        insert(&mut m, "max_connections", num_u64(mux.max_connections as u64));
+    }
+    if mux.min_streams > 0 {
+        insert(&mut m, "min_streams", num_u64(mux.min_streams as u64));
+    }
+    if mux.max_streams > 0 {
+        insert(&mut m, "max_streams", num_u64(mux.max_streams as u64));
+    }
+    if mux.padding {
+        insert(&mut m, "padding", bool_val(true));
+    }
+    Value::Mapping(m)
+}
+
 fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
     let mut wrapper = Mapping::new();
     if m.protocol == "group" {
@@ -299,6 +448,9 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
             "vless" => {
                 insert(&mut inner, "type", str_val("vless"));
                 insert(&mut inner, "user_id", str_val(m.uuid.trim()));
+                if m.h2mux.enabled {
+                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
+                }
             }
             "vmess" => {
                 insert(&mut inner, "type", str_val("vmess"));
@@ -309,12 +461,24 @@ fn build_outbound_member_chain(m: &OutboundMember) -> Result<Value> {
                 };
                 insert(&mut inner, "cipher", str_val(cipher));
                 insert(&mut inner, "user_id", str_val(m.uuid.trim()));
+                if m.h2mux.enabled {
+                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
+                }
             }
             "trojan" => {
                 insert(&mut inner, "type", str_val("trojan"));
                 insert(&mut inner, "password", str_val(m.password.trim()));
+                if m.h2mux.enabled {
+                    insert(&mut inner, "h2mux", build_shoes_h2mux_value(&m.h2mux));
+                }
             }
             other => return Err(anyhow!("Unsupported outbound member protocol '{other}'")),
+        }
+        if m.h2mux.enabled && !matches!(m.protocol.as_str(), "vless" | "vmess" | "trojan") {
+            return Err(anyhow!(
+                "Outbound member '{}': Shoes client H2Mux only supports VLESS, VMess, and Trojan",
+                m.name
+            ));
         }
 
         let final_proto = if m.tls {
@@ -477,6 +641,7 @@ fn build_inbound_entry(
     ib: &Inbound,
     has_panel_routing: bool,
     group_names: &HashSet<String>,
+    acme_cert_names: &HashSet<String>,
 ) -> Result<Option<Value>> {
     // Allow full raw YAML override for advanced power-user protocols
     if !ib.protocol_settings.raw_override_yaml.trim().is_empty() {
@@ -498,6 +663,12 @@ fn build_inbound_entry(
     let primary = enabled_clients.first().copied();
     let ps = &ib.protocol_settings;
     let ss = &ib.stream_settings;
+
+    if ss.h2mux.enabled && ib.has_vless_vision() {
+        return Err(anyhow!(
+            "VLESS Vision cannot be enabled together with H2Mux multiplexing"
+        ));
+    }
 
     // 1. Build innermost protocol config
     let mut inner = Mapping::new();
@@ -797,14 +968,26 @@ fn build_inbound_entry(
 
         let mut tls_outer = Mapping::new();
         insert(&mut tls_outer, "type", str_val("tls"));
-        let sni = ss.tls.sni.trim();
+        let raw_sni = ss.tls.sni.trim();
+        let is_ip_sni = !raw_sni.is_empty()
+            && raw_sni.trim_matches(['[', ']']).parse::<IpAddr>().is_ok();
+        let uses_acme = ss.tls.cert_mode == "source"
+            && acme_cert_names.contains(ss.tls.certificate_source.trim());
+        let sni = if is_ip_sni {
+            // RFC 6066 forbids IP addresses in TLS SNI; match via default_tls_target so no-SNI IP handshakes succeed.
+            String::new()
+        } else if uses_acme {
+            raw_sni.trim_end_matches('.').to_ascii_lowercase()
+        } else {
+            raw_sni.to_string()
+        };
         if !sni.is_empty() && !ss.tls.allow_any_sni {
             let mut targets = Mapping::new();
-            insert(&mut targets, sni, Value::Mapping(target));
+            insert(&mut targets, &sni, Value::Mapping(target));
             insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
         } else if !sni.is_empty() && ss.tls.allow_any_sni {
             let mut targets = Mapping::new();
-            insert(&mut targets, sni, Value::Mapping(target.clone()));
+            insert(&mut targets, &sni, Value::Mapping(target.clone()));
             insert(&mut tls_outer, "tls_targets", Value::Mapping(targets));
             insert(&mut tls_outer, "default_tls_target", Value::Mapping(target));
         } else {

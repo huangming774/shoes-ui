@@ -111,14 +111,15 @@ pub fn generate_self_signed_cert(domains: &[String]) -> Result<(String, String)>
     params.distinguished_name = dn;
 
     let mut sans = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let list: Vec<String> = if domains.is_empty() {
         vec!["localhost".to_string(), "127.0.0.1".to_string()]
     } else {
         domains.to_vec()
     };
     for item in list {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
+        let trimmed = item.trim().trim_matches(['[', ']']);
+        if trimmed.is_empty() || !seen.insert(trimmed.to_ascii_lowercase()) {
             continue;
         }
         if let Ok(ip) = trimmed.parse::<IpAddr>() {
@@ -126,6 +127,9 @@ pub fn generate_self_signed_cert(domains: &[String]) -> Result<(String, String)>
         } else if let Ok(ia5) = trimmed.try_into() {
             sans.push(SanType::DnsName(ia5));
         }
+    }
+    if sans.is_empty() {
+        return Err(anyhow!("At least one valid domain name or IP address is required"));
     }
     params.subject_alt_names = sans;
 

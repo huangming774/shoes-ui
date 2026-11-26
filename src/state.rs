@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::auth::SessionStore;
+use crate::auth::{LoginGuard, SessionStore};
 use crate::db::{normalize_base_path, Database};
 use crate::monitor::RuntimeMonitor;
 use crate::process::ShoesProcessManager;
@@ -13,10 +13,12 @@ pub struct AppState {
     pub proc_mgr: Arc<ShoesProcessManager>,
     pub monitor: Arc<RuntimeMonitor>,
     pub sessions: SessionStore,
+    pub login_guard: LoginGuard,
     pub listener_scheme: &'static str,
     pub listener_port: u16,
     pub base_path: RwLock<String>,
     pub detected_public_ip: RwLock<String>,
+    pub panel_tls_config: RwLock<Option<axum_server::tls_rustls::RustlsConfig>>,
 }
 
 impl AppState {
@@ -31,13 +33,19 @@ impl AppState {
             proc_mgr,
             monitor,
             sessions: SessionStore::default(),
+            login_guard: LoginGuard::default(),
             base_path: RwLock::new(settings.panel_base_path.clone()),
             listener_scheme: settings.scheme(),
             listener_port: settings.panel_port,
             detected_public_ip: RwLock::new(String::new()),
+            panel_tls_config: RwLock::new(None),
         });
         Self::spawn_public_ip_detector(st.clone());
         st
+    }
+
+    pub fn set_panel_tls_config(&self, cfg: axum_server::tls_rustls::RustlsConfig) {
+        *self.panel_tls_config.write() = Some(cfg);
     }
 
     pub fn get_base_path(&self) -> String {

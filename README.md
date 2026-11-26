@@ -41,38 +41,43 @@
   - 数据库原生采用 `inbounds` → `clients` 两层表结构。
   - 针对原生 `shoes` 单端口单凭据协议（VLESS / VMess / Trojan / Shadowsocks / Hysteria2 / TUIC 等），采用 **1 客户端 = 1 独立端口**，流量、配额上限、到期时间、按月重置日均按入站精准统计，并提供 **一键克隆新端口客户端 (`+Port`)** 按钮，一键复用证书/Reality 配置并自动分配新端口与全新密钥。
   - 针对原生支持多用户的协议（**AnyTLS** / **NaiveProxy**），支持在同一入站下添加、编辑、删除多个客户端凭据。
-- **全协议可视化配置 + 一键密钥生成**
+- **全协议可视化配置 + H2Mux 多路复用 + 一键密钥生成**
   - 覆盖 12 种入站协议与多种传输/安全组合，内置 **UUID v4**、**REALITY X25519 密钥对 & ShortId**、**Shadowsocks 2022 Base64 密钥**、**ECDSA P-256 自签证书**一键生成，同时保留原生 YAML 覆盖入口。
+  - 完整支持 **H2Mux 多路复用**（入站与出站策略组成员均支持勾选，自动阻止与 `VLESS XTLS-Vision` 冲突），开启后自动同步生成 **Shoes (`h2mux`)**、**Clash / Mihomo (`smux`)** 与 **sing-box (`multiplex`)** 三端配置。
 - **分享二维码与多格式订阅中心**
   - 单节点支持标准分享链接（`vless://`、`vmess://`、`trojan://`、`ss://`、`hysteria2://`、`tuic://`、`anytls://`、`naive+https://`、`socks://` 等）、二维码及 `shoes` 客户端 YAML 配置片段。
   - `/sub/<token>` 支持按客户端 `User-Agent` 或 `?format=v2ray|clash|singbox` 自动输出 **v2rayN Base64**、**Clash / Mihomo YAML**、**sing-box JSON**，并携带标准 `Subscription-Userinfo` 流量与到期时间响应头；支持一键重置订阅 Token。
-- **实时流量监控、到期/超额自动停用与连接管理**
-  - 每秒轮询 `shoes` 内置 Clash Controller API (`/connections`) 计算每条活动连接的上下行字节增量并写入 SQLite。
-  - 后台定时巡检到期时间与流量配额，触发阈值时**自动禁用入站、热重载配置并立即踢出存量活动连接**。
-  - 实时展示主机 CPU、内存、Swap、磁盘、网卡速率、代理实时吞吐、活动连接明细（支持单条/全部断开）与核心运行日志。
-- **证书源、出站策略组与分流规则管理**
-  - 可视化管理 `certificate_source`：**ACME 自动申请与续期**（HTTP-01 / TLS-ALPN-01）、粘贴上传 PEM 证书、一键生成自签证书、引用服务器已有证书路径。
+- **仪表盘深度可观测性、流量计费与连接管理**
+  - **近 2 分钟实时图**：实时绘制主机 CPU / 内存占用与网卡上下行速率。
+  - **网络健康面板（Linux `/proc`）**：明确标注「Shoes 进程」与「主机」作用域，实时展示 Shoes 进程文件描述符占用（已用 / 软上限，如 `8,200 / 1,048,576`）、主机当前 TCP 拥塞算法，以及最近约 1 分钟的主机监听队列溢出（`ListenOverflows`）、TCP 重传段（`RetransSegs`）、UDP 接收/发送缓冲错误数。
+  - **Shoes 核心最近 24 小时历史趋势**：按分钟聚合持久化至 SQLite，支持切换查看 **核心 CPU、常驻内存（RSS）、活动连接数、代理上下行速率**，并在时间轴上以虚线标注 **核心启动 / 核心重启 / 配置重载** 事件与明细列表，方便回溯排障。
+  - **近 30 天每日代理流量 + 到期/超额自动停用**：每秒轮询 `shoes` Clash Controller API (`/connections`) 计算上下行增量写入 SQLite，触发配额或到期阈值时**自动禁用入站、热重载配置并立即踢出存量活动连接**；支持活动连接明细查看（单条/全部断开）与核心实时日志。
+- **证书中心（支持公网 IP 免费 HTTPS）、出站策略组与分流规则**
+  - 支持 **Let's Encrypt 免费公网 IP 证书**（`shortlived` 6 天短期证书，遵循 RFC 8555 / RFC 8738，后台每 30 分钟巡检、剩余不足 48 小时自动续期并热重载）与 **域名 ACME 自动申请/续期**（HTTP-01 / TLS-ALPN-01，自动同步最新 ToS），以及上传 PEM 证书、一键生成自签证书、引用服务器路径。
+  - 支持 X.509 证书有效期检测、使用中删除保护，以及**一键应用到面板 HTTPS（在线热重载免重启）**。
   - 可视化配置 `client_group`（`selector` 手动切换、`url-test` 自动测速、`round-robin` 轮询），支持在面板内直接调用 Clash API **实时切换出站节点与延迟测速**，以及配置全局 `panel-routing` 分流规则。
-- **单文件部署 & 安全防护**
+- **备份还原、在线运维与安全加固**
   - 前端静态资源通过 `rust-embed` 编译进单个 `shoes-panel` 二进制文件，无外部运行时依赖。
-  - Argon2id 密码哈希存储、HttpOnly 会话 Cookie、支持面板自身 HTTPS 证书，以及与 3x-ui 一致的**动态安全根路径**（如 `/my-secret-path`，修改后无需重启立即生效，未匹配路径直接返回 404）。
+  - **数据库备份与一键恢复**：支持网页端手动下载 / 上传 `.db` 一键在线恢复（SQLite Online Backup API + 完整性校验 + 恢复前自动保存 `pre-restore-*.db` 快照）、本地备份历史管理、**定时本地自动备份**与 **Telegram Bot 定时推送备份**。
+  - **网页端在线运维**：支持网页端一键重启面板、检测 GitHub 新版本、一键在线升级面板（SHA-256 校验）与一键升级 `shoes` 内核（失败自动回滚）。
+  - **安全防护**：Argon2id 密码哈希、登录防爆破锁定（连续失败 8 次锁定 5 分钟并返回 `429`）、HttpOnly + HTTPS 自动 `Secure` 会话 Cookie、支持仅修改用户名与默认弱口令提醒，以及与 3x-ui 一致的**动态安全根路径**（修改后无需重启立即生效，未匹配路径返回 404）。
 
 ---
 
 ## 支持协议与传输矩阵
 
-| 协议 | 传输层支持 | 安全层支持 | 多用户模式 | 订阅导出支持 |
+| 协议 | 传输层支持 | 安全层支持 | 多路复用 / 多用户模式 | 订阅导出支持 |
 | :--- | :--- | :--- | :--- | :--- |
-| **VLESS** | TCP / WebSocket / XHTTP / QUIC | None / TLS / **REALITY** (+ **XTLS-Vision**) | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
-| **VMess** | TCP / WebSocket / XHTTP | None / TLS / REALITY | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
-| **Trojan** | TCP / WebSocket / XHTTP | TLS / REALITY | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
-| **Shadowsocks** | TCP / WebSocket / XHTTP | None / TLS / REALITY（支持经典 AEAD 与 **SS-2022**） | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
-| **Hysteria2** | QUIC (UDP) | TLS | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
-| **TUIC v5** | QUIC (UDP, 可选 0-RTT) | TLS | 1 端口 1 客户端 (`+Port` 克隆) | URI / Clash / sing-box |
+| **VLESS** | TCP / WebSocket / XHTTP / QUIC | None / TLS / **REALITY** (+ **XTLS-Vision**) | 支持 **H2Mux**（与 Vision 互斥）· 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
+| **VMess** | TCP / WebSocket / XHTTP | None / TLS / REALITY | 支持 **H2Mux** · 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
+| **Trojan** | TCP / WebSocket / XHTTP | TLS / REALITY | 支持 **H2Mux** · 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
+| **Shadowsocks** | TCP / WebSocket / XHTTP | None / TLS / REALITY（支持经典 AEAD 与 **SS-2022**） | 支持 **H2Mux** · 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
+| **Hysteria2** | QUIC (UDP) | TLS | 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
+| **TUIC v5** | QUIC (UDP, 可选 0-RTT) | TLS | 1 端口 1 客户端 (`+Port`) | URI / Clash / sing-box |
 | **AnyTLS** | TCP | TLS / REALITY | **单端口多用户** | URI / Clash / sing-box |
 | **NaiveProxy** | HTTP/2 | TLS / REALITY | **单端口多用户** | URI / Shoes YAML |
-| **Snell** | TCP | 内置加密 | 1 端口 1 客户端 (`+Port` 克隆) | Surge / Clash |
-| **SOCKS5 / HTTP / Mixed** | TCP / WebSocket | None / TLS | 可选账号密码认证 | URI / Clash / sing-box |
+| **Snell** | TCP | 内置加密 | 1 端口 1 客户端 (`+Port`) | Surge / Clash |
+| **SOCKS5 / HTTP / Mixed** | TCP / WebSocket | None / TLS | 支持 **H2Mux** · 可选账号密码认证 | URI / Clash / sing-box |
 
 ---
 
@@ -111,8 +116,15 @@ sudo bash install.sh
 脚本会自动完成以下工作：
 1. 从官方 `cfal/shoes` Releases 下载对应架构的 `shoes` 核心二进制到 `/usr/local/bin/shoes`；
 2. 下载（或本地编译）`shoes-panel` 到 `/usr/local/bin/shoes-panel`；
-3. 交互式设置（可直接回车使用默认端口 `54321` 与根路径 `/`）管理员密码、面板端口与安全路径，自动放行本机防火墙（`ufw` / `firewalld` / `iptables`），配置 `systemd` 开机自启并进行本机 HTTP 自检；
-4. 安装 `s-ui` 命令行快捷管理菜单（随时在终端输入 `s-ui` 即可查看面板地址、启停服务、重置密码或修改端口）。
+3. 自动生成随机管理员用户名与强密码（也可交互自定义端口 `54321` 与安全根路径），并**默认自动申请公网 IP 免费 SSL 证书开启面板 HTTPS**（无法使用 80 端口完成 Let's Encrypt HTTP-01 验证时自动降级为自签 HTTPS 证书），自动放行本机防火墙（`ufw` / `firewalld` / `iptables`），配置 `systemd` 开机自启并进行本机连通性自检；
+4. 安装 `s-ui` 命令行快捷管理菜单（随时在终端输入 `sudo s-ui` 即可管理服务、证书、备份与加速）。
+
+已有安装可在新版源码目录执行 `sudo bash install.sh --install-cli` 单独刷新 `s-ui` 菜单。运行 `sudo s-ui` 后常用运维项：
+- `10`：面板 HTTPS 证书管理（申请免费公网 IP SSL / 自签 HTTPS / 清除 HTTPS）
+- `11` / `12` / `16`：分别在线更新面板、Shoes 内核、`s-ui` 管理脚本；`17` 一键同时更新三项
+- `13`：数据库立即备份到本地 / 从本地快照一键还原
+- `14`：彻底卸载面板（删除数据库、证书和备份前需要输入 `PURGE` 二次确认）
+- `15`：**TCP 拥塞控制与加速管理**：支持一键开启原版 **BBRv1 + FQ**、安装切换 **BBR Plus (UJX6N)**、**魔改版 BBR (BBR Mod / Tsunami)**、**PCC / PCC Vivace**，在线热切换内核已加载算法与队列调度器（`fq` / `fq_codel` / `cake`）、代理缓冲区调优与恢复默认配置。
 
 ### 方式二：Docker / Docker Compose 部署（支持 `amd64` / `arm64` 预编译镜像）
 
@@ -177,14 +189,24 @@ cargo build --release
 忘记密码或改错配置导致无法访问 Web 界面时，可在服务器终端直接通过 CLI 修复：
 
 ```bash
-# 查看当前管理员账号、监听端口、安全根路径与核心路径
+# 查看当前管理员账号、监听端口、HTTPS 状态、安全根路径与核心路径
 shoes-panel info --data-dir /etc/shoes-panel
 
-# 重置管理员用户名与密码
+# 重置管理员用户名与密码（或使用 --random 自动生成随机账号密码）
 shoes-panel reset --username admin --password YourNewStrongPassword --data-dir /etc/shoes-panel
+shoes-panel reset --random --data-dir /etc/shoes-panel
 
 # 修改面板监听端口、访问根路径或 shoes 二进制路径
 shoes-panel setting --port 54321 --base-path /secret --shoes-bin /usr/local/bin/shoes --data-dir /etc/shoes-panel
+
+# 为面板申请免费公网 IP SSL 证书 / 生成自签 HTTPS / 清除面板 HTTPS
+shoes-panel cert ip --panel-https --data-dir /etc/shoes-panel
+shoes-panel cert self-signed --panel-https --data-dir /etc/shoes-panel
+shoes-panel cert clear --data-dir /etc/shoes-panel
+
+# 在线备份与恢复 SQLite 数据库
+shoes-panel backup --data-dir /etc/shoes-panel
+shoes-panel restore /etc/shoes-panel/backups/shoes-panel-xxx.db --data-dir /etc/shoes-panel
 ```
 
 ---
@@ -194,15 +216,17 @@ shoes-panel setting --port 54321 --base-path /secret --shoes-bin /usr/local/bin/
 ```text
 shoes-ui/
 ├── src/
-│   ├── main.rs          # CLI 入口、HTTP/HTTPS 服务启动与动态根路径分发
-│   ├── db.rs            # SQLite 双层模型 (inbounds -> clients) 与事务持久化
-│   ├── models.rs        # 协议、传输层、证书源、路由与订阅数据结构
+│   ├── main.rs          # CLI 入口、HTTP/HTTPS 热重载服务、定时备份/续期与动态根路径分发
+│   ├── db.rs            # SQLite 双层模型 (inbounds -> clients)、24h 历史趋势与在线备份/恢复
+│   ├── models.rs        # 协议、传输层、H2Mux、证书源、路由与订阅数据结构
 │   ├── yaml_gen.rs      # shoes 配置编译器 + shoes check 预校验 + 原子热重载
-│   ├── sub_gen.rs       # 节点分享链接与 v2ray / Clash / sing-box 订阅生成器
-│   ├── process.rs       # shoes 子进程生命周期守护与环形日志缓冲
-│   ├── monitor.rs       # 1 秒级连接流量增量采集、系统指标与到期/超额自动停用
+│   ├── sub_gen.rs       # 节点分享链接与 v2ray / Clash / sing-box (含 H2Mux/smux/multiplex) 订阅生成
+│   ├── acme_util.rs     # Let's Encrypt 公网 IP 短期证书 (RFC 8738) 与域名 ACME 元数据/校验
+│   ├── ops_util.rs      # 数据库在线备份/恢复、Telegram 推送、面板重启与 GitHub 在线升级
+│   ├── process.rs       # shoes 子进程生命周期守护、核心事件记录与环形日志缓冲
+│   ├── monitor.rs       # 1 秒级连接流量增量、Linux /proc 网络健康、24h 分钟聚合与配额自动停用
 │   ├── crypto_util.rs   # Argon2 哈希、Reality X25519、SS2022 密钥与自签证书生成
-│   ├── auth.rs          # 会话鉴权管理
+│   ├── auth.rs          # 会话鉴权与登录防爆破锁定
 │   └── api.rs           # REST API 路由与 rust-embed 前端静态资源服务
 ├── web/                 # Vue 3 + Vite + Ant Design Vue + vue-i18n 中英双语前端
 ├── deploy/              # systemd 服务单元模板

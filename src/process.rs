@@ -141,6 +141,10 @@ impl ShoesProcessManager {
         None
     }
 
+    pub fn clear_version_cache(&self) {
+        *self.cached_version.lock() = None;
+    }
+
     pub async fn query_version(&self, bin_path: &str) -> String {
         let trimmed = bin_path.trim();
         if let Some((cached_bin, cached_ver)) = self.cached_version.lock().clone() {
@@ -192,10 +196,10 @@ impl ShoesProcessManager {
 
     pub async fn start(&self) -> Result<ProcessStatus> {
         let _operation = self.operation.lock().await;
-        self.start_locked().await
+        self.start_locked("start").await
     }
 
-    async fn start_locked(&self) -> Result<ProcessStatus> {
+    pub(crate) async fn start_locked(&self, event: &'static str) -> Result<ProcessStatus> {
         self.desired_running.store(true, Ordering::SeqCst);
         if self.current_pid().await.is_some() {
             return Ok(self.status().await);
@@ -203,11 +207,11 @@ impl ShoesProcessManager {
 
         let settings = self.db.get_settings()?;
         sync_and_apply_config(&self.db, None).await?;
-        self.launch(&settings).await?;
+        self.launch(&settings, event).await?;
         Ok(self.status().await)
     }
 
-    async fn launch(&self, settings: &PanelSettings) -> Result<()> {
+    async fn launch(&self, settings: &PanelSettings, event: &'static str) -> Result<()> {
         let bin = PathBuf::from(settings.shoes_bin_path.trim());
         if !bin.exists() {
             let err = format!(
@@ -269,6 +273,7 @@ impl ShoesProcessManager {
             return Err(anyhow!(msg));
         }
 
+        self.db.record_core_event(event);
         Ok(())
     }
 
@@ -279,7 +284,7 @@ impl ShoesProcessManager {
         Ok(self.status().await)
     }
 
-    async fn stop_child(&self) -> Result<()> {
+    pub(crate) async fn stop_child(&self) -> Result<()> {
         let mut guard = self.child.lock().await;
         if let Some(child) = guard.as_mut() {
             let pid = child.id().unwrap_or(0);
@@ -297,13 +302,14 @@ impl ShoesProcessManager {
         let _operation = self.operation.lock().await;
         self.stop_child().await?;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        self.start_locked().await
+        self.start_locked("restart").await
     }
 
     pub async fn reload_config(&self) -> Result<String> {
         let _operation = self.operation.lock().await;
         let pid = self.current_pid().await;
         let yaml = sync_and_apply_config(&self.db, pid).await?;
+        if pid.is_some() { self.db.record_core_event("reload"); }
         Self::push_log(
             &self.logs,
             "panel",
@@ -366,7 +372,7 @@ impl ShoesProcessManager {
                     .with_context(|| format!("Cannot write {}", path.display()))?;
             }
             if restart {
-                self.launch(candidate).await?;
+                self.launch(candidate, "restart").await?;
             }
             self.db.save_settings(candidate)
         }
@@ -386,7 +392,7 @@ impl ShoesProcessManager {
                     }
                 }
                 if restart {
-                    self.launch(&old).await?;
+                    self.launch(&old, "restart").await?;
                 }
                 Ok(())
             }
@@ -397,6 +403,9 @@ impl ShoesProcessManager {
                 );
             }
             return Err(error);
+        }
+        if changed && !restart && self.current_pid().await.is_some() {
+            self.db.record_core_event("reload");
         }
         Ok(())
     }
@@ -424,7 +433,7 @@ impl ShoesProcessManager {
                         "Watchdog detected shoes is not running; attempting automatic restart..."
                             .to_string(),
                     );
-                    if let Err(e) = mgr.start_locked().await {
+                    if let Err(e) = mgr.start_locked("restart").await {
                         *mgr.last_error.lock() = Some(e.to_string());
                     }
                 }

@@ -22,7 +22,7 @@
               <span v-if="record.raw_chains_yaml">Custom YAML</span>
               <a-space v-else wrap :size="4">
                 <a-tag v-for="(m, i) in record.members" :key="i">
-                  {{ m.name }} ({{ m.protocol }})
+                  {{ m.name }} ({{ m.protocol }}{{ m.h2mux?.enabled ? ' · H2Mux' : '' }})
                 </a-tag>
               </a-space>
             </template>
@@ -156,11 +156,12 @@
               <a-input v-model:value="m.name" placeholder="Node Name" size="small" />
             </a-col>
             <a-col :span="5">
-              <a-select v-model:value="m.protocol" size="small" style="width: 100%">
+              <a-select v-model:value="m.protocol" size="small" style="width: 100%" @change="onMemberProtoChange(m)">
                 <a-select-option value="socks">SOCKS5</a-select-option>
                 <a-select-option value="http">HTTP</a-select-option>
                 <a-select-option value="shadowsocks">Shadowsocks</a-select-option>
                 <a-select-option value="vless">VLESS</a-select-option>
+                <a-select-option value="vmess">VMess</a-select-option>
                 <a-select-option value="trojan">Trojan</a-select-option>
                 <a-select-option value="direct">Direct</a-select-option>
               </a-select>
@@ -170,7 +171,7 @@
             </a-col>
             <a-col :span="5">
               <a-input
-                v-if="m.protocol === 'vless'"
+                v-if="['vless', 'vmess'].includes(m.protocol)"
                 v-model:value="m.uuid"
                 placeholder="UUID"
                 size="small"
@@ -184,6 +185,23 @@
             </a-col>
             <a-col :span="2" style="text-align: right">
               <a-button size="small" danger type="text" @click="groupForm.members.splice(idx, 1)">✕</a-button>
+            </a-col>
+          </a-row>
+          <a-row v-if="['vless', 'vmess', 'trojan'].includes(m.protocol)" :gutter="8" style="margin-top: 8px; align-items: center">
+            <a-col :span="4">
+              <a-checkbox v-model:checked="m.tls">TLS</a-checkbox>
+            </a-col>
+            <a-col :span="6">
+              <a-input v-if="m.tls" v-model:value="m.sni" placeholder="SNI" size="small" />
+            </a-col>
+            <a-col :span="6">
+              <a-checkbox v-model:checked="ensureMemberH2Mux(m).enabled">H2Mux</a-checkbox>
+            </a-col>
+            <a-col v-if="ensureMemberH2Mux(m).enabled" :span="4">
+              <a-input-number v-model:value="m.h2mux.max_connections" :min="1" :max="64" size="small" style="width: 100%" placeholder="Conns" />
+            </a-col>
+            <a-col v-if="ensureMemberH2Mux(m).enabled" :span="4">
+              <a-checkbox v-model:checked="m.h2mux.padding">Padding</a-checkbox>
             </a-col>
           </a-row>
         </div>
@@ -345,6 +363,23 @@ async function onTabChange(k) {
   }
 }
 
+function defaultH2Mux() {
+  return { enabled: false, max_connections: 4, min_streams: 4, max_streams: 0, padding: false };
+}
+
+function ensureMemberH2Mux(m) {
+  if (!m.h2mux) {
+    m.h2mux = defaultH2Mux();
+  }
+  return m.h2mux;
+}
+
+function onMemberProtoChange(m) {
+  if (!['vless', 'vmess', 'trojan'].includes(m.protocol) && m.h2mux) {
+    m.h2mux.enabled = false;
+  }
+}
+
 function addMemberRow() {
   groupForm.members.push({
     name: `node-${groupForm.members.length + 1}`,
@@ -357,6 +392,7 @@ function addMemberRow() {
     tls: false,
     sni: '',
     verify: true,
+    h2mux: defaultH2Mux(),
   });
 }
 

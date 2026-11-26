@@ -83,6 +83,7 @@
                 {{ securityLabel(record) }}
               </a-tag>
               <a-tag v-if="hasVision(record)" color="purple">Vision</a-tag>
+              <a-tag v-if="hasH2Mux(record)" color="cyan">H2Mux</a-tag>
             </a-space>
           </template>
 
@@ -440,6 +441,16 @@ function hasVision(ib) {
     (ib.stream_settings?.security === 'reality' && ib.stream_settings?.reality?.vision) ||
     (ib.stream_settings?.security === 'tls' && ib.stream_settings?.tls?.vision)
   );
+}
+
+function hasH2Mux(ib) {
+  if (!ib.stream_settings?.h2mux?.enabled || hasVision(ib)) return false;
+  const p = ib.protocol;
+  const net = ib.stream_settings?.network || 'tcp';
+  const sec = ib.stream_settings?.security || 'none';
+  if (['vless', 'vmess', 'trojan'].includes(p)) return ['tcp', 'ws'].includes(net);
+  if (p === 'shadowsocks') return net === 'tcp' && sec === 'none';
+  return false;
 }
 
 function quotaPct(ib) {

@@ -292,6 +292,7 @@
             <a-checkbox
               v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp' && !isQuicOuter"
               v-model:checked="form.stream_settings.tls.vision"
+              @change="(e) => onVisionToggle(e.target.checked)"
             >
               {{ t('inbounds.vision') }}
             </a-checkbox>
@@ -344,11 +345,54 @@
             <a-checkbox
               v-if="form.protocol === 'vless' && form.stream_settings.network === 'tcp'"
               v-model:checked="form.stream_settings.reality.vision"
+              @change="(e) => onVisionToggle(e.target.checked)"
             >
               {{ t('inbounds.vision') }}
             </a-checkbox>
           </a-col>
         </a-row>
+      </div>
+
+      <!-- H2Mux Multiplexing -->
+      <div v-if="supportsH2Mux" class="sub-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px">
+          <span class="sub-box-title" style="margin-bottom: 0">{{ t('inbounds.h2muxTitle') }}</span>
+          <a-switch
+            v-model:checked="form.stream_settings.h2mux.enabled"
+            size="small"
+            @change="onH2MuxToggle"
+          />
+        </div>
+        <template v-if="form.stream_settings.h2mux.enabled">
+          <a-alert
+            type="info"
+            show-icon
+            :message="t('inbounds.h2muxTip')"
+            style="margin-bottom: 10px; font-size: 12px"
+          />
+          <a-row :gutter="12">
+            <a-col :span="6">
+              <a-form-item :label="t('inbounds.h2muxMaxConns')">
+                <a-input-number v-model:value="form.stream_settings.h2mux.max_connections" :min="1" :max="64" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="6">
+              <a-form-item :label="t('inbounds.h2muxMinStreams')">
+                <a-input-number v-model:value="form.stream_settings.h2mux.min_streams" :min="1" :max="256" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="6">
+              <a-form-item :label="t('inbounds.h2muxMaxStreams')">
+                <a-input-number v-model:value="form.stream_settings.h2mux.max_streams" :min="0" :max="1024" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="6" style="display: flex; align-items: center; padding-top: 16px">
+              <a-checkbox v-model:checked="form.stream_settings.h2mux.padding">
+                {{ t('inbounds.h2muxPadding') }}
+              </a-checkbox>
+            </a-col>
+          </a-row>
+        </template>
       </div>
 
       <!-- Advanced & Routing -->
@@ -473,6 +517,7 @@ function blankInbound() {
       },
       ws: { path: '/ws', host: '', headers: {}, max_early_data: 0, early_data_header_name: '' },
       xhttp: { path: '/xhttp', host: '', mode: 'auto', headers: {} },
+      h2mux: { enabled: false, max_connections: 4, min_streams: 4, max_streams: 0, padding: false },
     },
     clients: [
       {
@@ -513,6 +558,18 @@ const supportsWs = computed(() =>
   ['vless', 'vmess', 'trojan', 'shadowsocks', 'socks'].includes(form.protocol)
 );
 const supportsXhttp = computed(() => ['vless', 'vmess', 'trojan', 'shadowsocks'].includes(form.protocol));
+const supportsH2Mux = computed(() => {
+  const p = form.protocol;
+  const net = form.stream_settings.network;
+  const sec = form.stream_settings.security;
+  if (['vless', 'vmess', 'trojan'].includes(p)) {
+    return ['tcp', 'ws'].includes(net);
+  }
+  if (p === 'shadowsocks') {
+    return net === 'tcp' && sec === 'none';
+  }
+  return false;
+});
 
 const needsUuid = computed(() => ['vless', 'vmess', 'tuic'].includes(form.protocol));
 const needsPassword = computed(() =>
@@ -584,7 +641,13 @@ watch(
     if (!val) return;
     if (props.record && props.record.id > 0) {
       const cloned = JSON.parse(JSON.stringify(props.record));
-      Object.assign(form, blankInbound(), cloned);
+      const blank = blankInbound();
+      Object.assign(form, blank, cloned);
+      form.stream_settings.h2mux = Object.assign(
+        {},
+        blank.stream_settings.h2mux,
+        cloned.stream_settings?.h2mux || {}
+      );
       if (isQuicProtocol.value) selectAutoCertIfEmpty();
       quotaGb.value = form.total_quota_bytes > 0 ? +(form.total_quota_bytes / 1073741824).toFixed(2) : 0;
       expiryDayjs.value = form.expiry_time > 0 ? dayjs(form.expiry_time) : null;
@@ -662,15 +725,42 @@ async function onProtocolChange(proto) {
 function onNetworkChange(net) {
   if (net === 'quic') {
     form.stream_settings.security = 'tls';
+    form.stream_settings.h2mux.enabled = false;
+  } else if (net === 'xhttp') {
+    form.stream_settings.h2mux.enabled = false;
+  }
+}
+
+function onH2MuxToggle(enabled) {
+  if (enabled) {
+    // VLESS Vision is mutually exclusive with H2Mux across Shoes, Mihomo, and sing-box.
+    form.stream_settings.tls.vision = false;
+    form.stream_settings.reality.vision = false;
+  }
+}
+
+function onVisionToggle(enabled) {
+  if (enabled) {
+    form.stream_settings.h2mux.enabled = false;
   }
 }
 
 function onCertSourceChange(certName) {
   const matched = (props.certs || []).find((c) => c.name === certName);
   if (!matched) return;
-  if (
-    matched.cert_type !== 'acme' &&
-    ((matched.remark || '').toLowerCase().includes('self') || certName.toLowerCase().startsWith('self'))
+  if (matched.cert_type === 'acme') {
+    form.stream_settings.tls.allow_insecure = false;
+    if (!form.stream_settings.tls.sni && matched.domains?.length > 0) {
+      form.stream_settings.tls.sni = matched.domains[0];
+    }
+  } else if (matched.cert_type === 'acme_ip') {
+    form.stream_settings.tls.allow_insecure = false;
+    // RFC 6066: IP certificates are verified by IP SAN without a hostname SNI
+    form.stream_settings.tls.sni = '';
+  } else if (
+    matched.runtime?.is_self_signed ||
+    (matched.remark || '').toLowerCase().includes('self') ||
+    certName.toLowerCase().startsWith('self')
   ) {
     form.stream_settings.tls.allow_insecure = true;
   }
@@ -706,12 +796,24 @@ async function refreshRealityKeys() {
 
 async function quickGenSelfSigned() {
   try {
-    const sni = form.stream_settings.tls.sni?.trim() || 'localhost';
+    const sni = form.stream_settings.tls.sni?.trim();
+    const domains = [];
+    if (sni) domains.push(sni);
+    try {
+      const s = await api.getSettings();
+      const ph = s?.settings?.public_host?.trim();
+      const dip = s?.detected_public_ip?.trim();
+      if (ph && !domains.includes(ph)) domains.push(ph);
+      if (dip && !domains.includes(dip)) domains.push(dip);
+    } catch {}
+    if (!domains.includes('localhost')) domains.push('localhost');
+    if (!domains.includes('127.0.0.1')) domains.push('127.0.0.1');
+    const primaryLabel = domains[0] || 'localhost';
     const name = `selfsigned-${Date.now().toString().slice(-5)}`;
     const cert = await api.selfSignedCert({
       name,
-      domains: [sni, '127.0.0.1'],
-      remark: `Auto Self-Signed (${sni})`,
+      domains,
+      remark: `Auto Self-Signed (${primaryLabel})`,
     });
     emit('certsChanged');
     form.stream_settings.tls.cert_mode = 'source';

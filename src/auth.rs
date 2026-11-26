@@ -7,6 +7,59 @@ use crate::crypto_util::generate_random_alnum;
 
 pub const SESSION_COOKIE_NAME: &str = "shoes_panel_session";
 
+const MAX_LOGIN_FAILURES: u32 = 8;
+const FAILURE_WINDOW_MS: i64 = 5 * 60 * 1000;
+const LOCKOUT_DURATION_MS: i64 = 5 * 60 * 1000;
+
+/// In-memory brute-force protection for public-facing panel login endpoints.
+#[derive(Default)]
+pub struct LoginGuard {
+    state: Mutex<LoginGuardState>,
+}
+
+#[derive(Default)]
+struct LoginGuardState {
+    failures: u32,
+    first_failure_ms: i64,
+    locked_until_ms: i64,
+}
+
+impl LoginGuard {
+    pub fn check_locked(&self) -> Option<u64> {
+        let now = Utc::now().timestamp_millis();
+        let mut guard = self.state.lock();
+        if guard.locked_until_ms > now {
+            let secs = ((guard.locked_until_ms - now) + 999) / 1000;
+            return Some(secs.max(1) as u64);
+        }
+        if guard.locked_until_ms > 0 && guard.locked_until_ms <= now {
+            *guard = LoginGuardState::default();
+        }
+        None
+    }
+
+    pub fn record_failure(&self) -> Option<u64> {
+        let now = Utc::now().timestamp_millis();
+        let mut guard = self.state.lock();
+        if guard.first_failure_ms == 0 || now - guard.first_failure_ms > FAILURE_WINDOW_MS {
+            guard.failures = 1;
+            guard.first_failure_ms = now;
+            guard.locked_until_ms = 0;
+            return None;
+        }
+        guard.failures += 1;
+        if guard.failures >= MAX_LOGIN_FAILURES {
+            guard.locked_until_ms = now + LOCKOUT_DURATION_MS;
+            return Some((LOCKOUT_DURATION_MS / 1000) as u64);
+        }
+        None
+    }
+
+    pub fn record_success(&self) {
+        *self.state.lock() = LoginGuardState::default();
+    }
+}
+
 pub struct SessionStore {
     // token -> (username, expires_at_ms)
     sessions: Mutex<HashMap<String, (String, i64)>>,

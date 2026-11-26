@@ -8,7 +8,7 @@ use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use crate::crypto_util::derive_reality_public_key;
-use crate::models::{CertificateRecord, ClientRecord, Inbound};
+use crate::models::{CertificateRecord, ClientRecord, H2MuxSettings, Inbound};
 
 /// RFC 3986 query value encode set: preserves unreserved chars (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`)
 /// and `/`, encoding only controls, spaces, and query/URI delimiters (`#`, `%`, `&`, `+`, `=`, `?`).
@@ -140,12 +140,17 @@ fn effective_reality_pubkey(ib: &Inbound) -> String {
 
 /// Resolves effective TLS SNI: if user left SNI empty on a self-signed (`allow_insecure`) inbound,
 /// fallback to `"localhost"` (which matches our generated self-signed cert SAN) so QUIC/TLS clients don't fail on empty SNI.
+/// RFC 6066 forbids literal IP addresses in TLS SNI, so IP-valued SNIs return empty string
+/// (clients validate the certificate's IP SAN directly against the server IP).
 fn effective_tls_sni(ib: &Inbound) -> String {
     if ib.uses_auto_quic_cert() {
         return "localhost".into();
     }
     let sni = ib.stream_settings.tls.sni.trim();
     if !sni.is_empty() {
+        if sni.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok() {
+            return String::new();
+        }
         sni.to_string()
     } else if ib.stream_settings.tls.allow_insecure {
         "localhost".to_string()
@@ -192,7 +197,10 @@ fn resolve_inbound_cert_pem(ib: &Inbound, certs: &[CertificateRecord]) -> Option
     } else if tls.cert_mode == "source" && !tls.certificate_source.trim().is_empty() {
         certs
             .iter()
-            .find(|c| c.name.trim() == tls.certificate_source.trim() && c.cert_type == "files")
+            .find(|c| {
+                c.name.trim() == tls.certificate_source.trim()
+                    && matches!(c.cert_type.as_str(), "files" | "acme_ip")
+            })
             .map(|c| c.cert_file.trim().to_string())
             .filter(|p| !p.is_empty())?
     } else {
@@ -621,21 +629,94 @@ pub fn build_uri(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> Stri
     }
 }
 
+fn inbound_effective_h2mux(ib: &Inbound) -> Option<&H2MuxSettings> {
+    let mux = &ib.stream_settings.h2mux;
+    if mux.enabled && ib.supports_h2mux() && !ib.has_vless_vision() {
+        Some(mux)
+    } else {
+        None
+    }
+}
+
+fn build_shoes_h2mux_json(mux: &H2MuxSettings) -> JsonValue {
+    let mut obj = serde_json::Map::new();
+    if mux.max_connections > 0 {
+        obj.insert("max_connections".to_string(), json!(mux.max_connections));
+    }
+    if mux.min_streams > 0 {
+        obj.insert("min_streams".to_string(), json!(mux.min_streams));
+    }
+    if mux.max_streams > 0 {
+        obj.insert("max_streams".to_string(), json!(mux.max_streams));
+    }
+    if mux.padding {
+        obj.insert("padding".to_string(), json!(true));
+    }
+    JsonValue::Object(obj)
+}
+
+fn build_clash_smux_json(mux: &H2MuxSettings) -> JsonValue {
+    let mut obj = json!({
+        "enabled": true,
+        "protocol": "h2mux",
+        "padding": mux.padding,
+    });
+    if mux.max_streams > 0 {
+        obj["max-streams"] = json!(mux.max_streams);
+    } else {
+        obj["max-connections"] = json!(mux.max_connections.max(1));
+        obj["min-streams"] = json!(mux.min_streams.max(1));
+    }
+    obj
+}
+
+fn build_singbox_multiplex_json(mux: &H2MuxSettings) -> JsonValue {
+    let mut obj = json!({
+        "enabled": true,
+        "protocol": "h2mux",
+        "padding": mux.padding,
+    });
+    if mux.max_streams > 0 {
+        obj["max_streams"] = json!(mux.max_streams);
+    } else {
+        obj["max_connections"] = json!(mux.max_connections.max(1));
+        obj["min_streams"] = json!(mux.min_streams.max(1));
+    }
+    obj
+}
+
 fn build_shoes_client_snippet(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> String {
     let ss = &ib.stream_settings;
     let ps = &ib.protocol_settings;
     let target_addr = format!("{}:{}", format_host(host), ib.port);
+    let active_mux = inbound_effective_h2mux(ib);
 
     let inner = match ib.protocol.as_str() {
-        "vless" => json!({"type": "vless", "user_id": c.uuid.trim()}),
+        "vless" => {
+            let mut m = json!({"type": "vless", "user_id": c.uuid.trim()});
+            if let Some(mux) = active_mux {
+                m["h2mux"] = build_shoes_h2mux_json(mux);
+            }
+            m
+        }
         "vmess" => {
             let cipher = match ps.cipher.trim() {
                 "" | "any" | "auto" => "aes-128-gcm",
                 other => other,
             };
-            json!({"type": "vmess", "cipher": cipher, "user_id": c.uuid.trim()})
+            let mut m = json!({"type": "vmess", "cipher": cipher, "user_id": c.uuid.trim()});
+            if let Some(mux) = active_mux {
+                m["h2mux"] = build_shoes_h2mux_json(mux);
+            }
+            m
         }
-        "trojan" => json!({"type": "trojan", "password": c.password.trim()}),
+        "trojan" => {
+            let mut m = json!({"type": "trojan", "password": c.password.trim()});
+            if let Some(mux) = active_mux {
+                m["h2mux"] = build_shoes_h2mux_json(mux);
+            }
+            m
+        }
         "shadowsocks" => {
             let cipher = if ps.cipher.trim().is_empty() {
                 "2022-blake3-aes-256-gcm"
@@ -1128,6 +1209,9 @@ fn build_clash_proxy(ib: &Inbound, c: &ClientRecord, host: &str, name: &str) -> 
             obj["sni"] = json!(sni);
         }
     }
+    if let Some(mux) = inbound_effective_h2mux(ib) {
+        obj["smux"] = build_clash_smux_json(mux);
+    }
     Some(obj)
 }
 
@@ -1443,6 +1527,9 @@ fn build_singbox_outbound(
                 obj["transport"]["early_data_header_name"] = json!(ss.ws.early_data_header_name.trim());
             }
         }
+    }
+    if let Some(mux) = inbound_effective_h2mux(ib) {
+        obj["multiplex"] = build_singbox_multiplex_json(mux);
     }
     Some(obj)
 }

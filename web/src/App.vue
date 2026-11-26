@@ -99,6 +99,20 @@
         </header>
 
         <main class="panel-content" aria-labelledby="panel-title">
+          <a-alert
+            v-if="defaultCredentials && currentKey !== 'settings'"
+            type="warning"
+            show-icon
+            closable
+            :message="t('settings.defaultCredWarn')"
+            style="margin-bottom: 14px"
+          >
+            <template #action>
+              <a-button size="small" type="primary" danger @click="selectedKeys = ['settings']">
+                {{ t('settings.changeNow') }}
+              </a-button>
+            </template>
+          </a-alert>
           <div :key="currentKey" class="panel-view">
             <template v-if="currentKey === 'dashboard'">
               <DashboardView v-if="statusData" :status-data="statusData" @refresh="pollStatus" />
@@ -116,7 +130,11 @@
             <CertsView v-else-if="currentKey === 'certificates'" />
             <RoutingView v-else-if="currentKey === 'routing'" />
             <ConnectionsView v-else-if="currentKey === 'connections'" />
-            <SettingsView v-else-if="currentKey === 'settings'" @logged-out="endSession" />
+            <SettingsView
+              v-else-if="currentKey === 'settings'"
+              @logged-out="endSession"
+              @navigate="(k) => (selectedKeys = [k])"
+            />
           </div>
         </main>
       </div>
@@ -182,6 +200,7 @@ const { t, locale } = useI18n();
 const ready = ref(false);
 const authenticated = ref(false);
 const username = ref('admin');
+const defaultCredentials = ref(false);
 const collapsed = ref(false);
 const compactViewport = window.matchMedia('(max-width: 48rem)');
 const mobile = ref(compactViewport.matches);
@@ -256,8 +275,13 @@ async function pollStatus() {
   }
 }
 
-function onLoggedIn(u) {
-  username.value = u || 'admin';
+function onLoggedIn(payload) {
+  if (typeof payload === 'string') {
+    username.value = payload || 'admin';
+  } else {
+    username.value = payload?.username || 'admin';
+    defaultCredentials.value = !!payload?.default_credentials;
+  }
   authenticated.value = true;
   pollStatus();
 }
@@ -290,6 +314,7 @@ onMounted(async () => {
     if (me?.authenticated) {
       authenticated.value = true;
       username.value = me.username || 'admin';
+      defaultCredentials.value = !!me.default_credentials;
       pollStatus();
     }
   } catch {}
