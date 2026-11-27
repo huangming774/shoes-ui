@@ -1,6 +1,6 @@
 [package]
 name = "shoes-panel"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Unofficial 3x-ui style web management panel for cfal/shoes multi-protocol proxy server"
 license = "Apache-2.0"
