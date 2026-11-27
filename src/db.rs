@@ -2459,31 +2459,51 @@ impl Database {
 
     pub fn get_cluster_local_config(&self) -> Result<ClusterLocalConfig> {
         let conn = self.conn.lock();
-        let get_key = |k: &str| -> String {
-            conn.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-        };
-        let mut instance_id = get_key("cluster_instance_id");
-        if instance_id.trim().is_empty() {
-            instance_id = generate_uuid();
-            let _ = conn.execute(
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM settings WHERE key IN (
+                'cluster_instance_id',
+                'cluster_local_name',
+                'cluster_local_region',
+                'cluster_local_region_flag',
+                'cluster_api_token'
+            )",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut cfg = ClusterLocalConfig::default();
+        for row in rows {
+            let (k, v) = row?;
+            match k.as_str() {
+                "cluster_instance_id" => cfg.instance_id = v,
+                "cluster_local_name" => cfg.local_name = v,
+                "cluster_local_region" => cfg.local_region = v,
+                "cluster_local_region_flag" => cfg.local_region_flag = v,
+                "cluster_api_token" => cfg.api_token = v,
+                _ => {}
+            }
+        }
+        drop(stmt);
+
+        if cfg.instance_id.trim().is_empty() {
+            cfg.instance_id = generate_uuid();
+            conn.execute(
                 "INSERT INTO settings (key, value) VALUES ('cluster_instance_id', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![&instance_id],
-            );
+                params![&cfg.instance_id],
+            )?;
         }
-        Ok(ClusterLocalConfig {
-            instance_id,
-            local_name: get_key("cluster_local_name"),
-            local_region: get_key("cluster_local_region"),
-            local_region_flag: get_key("cluster_local_region_flag"),
-            api_token: get_key("cluster_api_token"),
-        })
+        Ok(cfg)
+    }
+
+    pub fn get_cluster_api_token(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let val = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'cluster_api_token'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(val)
     }
 
     pub fn save_cluster_local_identity(
@@ -2520,15 +2540,34 @@ impl Database {
         self.set_setting_kv("cluster_api_token", "")
     }
 
+    pub fn get_cluster_instance_id(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let val = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'cluster_instance_id'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(val)
+    }
+
     pub fn verify_cluster_api_token(&self, candidate: &str) -> bool {
         let cand = candidate.trim();
         if cand.is_empty() {
             return false;
         }
-        let Ok(cfg) = self.get_cluster_local_config() else {
+        let stored_opt = match self.get_cluster_api_token() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("failed to read cluster_api_token from SQLite: {e:#}");
+                return false;
+            }
+        };
+        let Some(raw) = stored_opt else {
             return false;
         };
-        let stored = cfg.api_token.trim();
+        let stored = raw.trim();
         if stored.is_empty() {
             return false;
         }
@@ -2995,6 +3034,46 @@ mod tests {
         );
         let multi: Vec<_> = list[1].clients.iter().map(|c| (c.id, c.up_bytes)).collect();
         assert_eq!(multi, [(10, 7), (12, 9)]);
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_token_single_lookup_and_error_propagation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Database::open(&dir.path().join("panel.db"), dir.path())?;
+
+        // Initially disabled; missing or empty key both reject tokens cleanly
+        assert!(!db.verify_cluster_api_token("sp_anything"));
+        let cfg0 = db.get_cluster_local_config()?;
+        assert!(!cfg0.instance_id.is_empty());
+        assert_eq!(
+            db.get_cluster_instance_id()?.as_deref(),
+            Some(cfg0.instance_id.as_str())
+        );
+
+        let saved = db.save_cluster_local_identity("HK-01", "HK", "🇭🇰")?;
+        assert_eq!(saved.instance_id, cfg0.instance_id);
+        assert_eq!(saved.local_name, "HK-01");
+        assert_eq!(saved.local_region, "HK");
+        assert_eq!(saved.local_region_flag, "🇭🇰");
+
+        let tok = db.rotate_cluster_api_token()?;
+        assert!(db.verify_cluster_api_token(&tok));
+        assert!(!db.verify_cluster_api_token(&format!("{tok}x")));
+        assert!(!db.verify_cluster_api_token(""));
+
+        // Deleting the token row distinguishes missing key (Ok(None)) from SQLite error
+        db.conn
+            .lock()
+            .execute("DELETE FROM settings WHERE key = 'cluster_api_token'", [])?;
+        assert_eq!(db.get_cluster_api_token()?, None);
+        assert!(!db.verify_cluster_api_token(&tok));
+
+        // Real SQLite error must propagate as Err instead of being swallowed into empty defaults
+        db.conn.lock().execute_batch("DROP TABLE settings;")?;
+        assert!(db.get_cluster_api_token().is_err());
+        assert!(db.get_cluster_local_config().is_err());
+        assert!(!db.verify_cluster_api_token(&tok));
         Ok(())
     }
 }

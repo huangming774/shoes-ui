@@ -2251,7 +2251,7 @@ async fn build_cluster_overview_json(state: &AppState, headers: &HeaderMap) -> R
 
     let mut enriched_nodes = Vec::with_capacity(nodes.len());
     for n in nodes {
-        let snap = snapshots.get(&n.id).cloned();
+        let snap = snapshots.get(&n.id);
         if n.enable {
             nodes_total += 1;
             if !n.region.trim().is_empty() {
@@ -2262,7 +2262,7 @@ async fn build_cluster_overview_json(state: &AppState, headers: &HeaderMap) -> R
                 };
                 *region_counts.entry(lbl).or_insert(0) += 1;
             }
-            if let Some(ref s) = snap {
+            if let Some(s) = snap {
                 if s.online {
                     nodes_online += 1;
                     if s.shoes.running {
@@ -2289,7 +2289,7 @@ async fn build_cluster_overview_json(state: &AppState, headers: &HeaderMap) -> R
             "node": sanitized,
             "has_token": has_token,
             "token_preview": token_preview,
-            "snapshot": snap,
+            "snapshot": snap.map(Arc::as_ref),
         }));
     }
 
@@ -2420,7 +2420,7 @@ async fn api_cluster_save_node(
         "node": sanitized,
         "has_token": has_token,
         "token_preview": token_preview,
-        "snapshot": snapshot,
+        "snapshot": snapshot.as_deref(),
     }))
 }
 
@@ -2437,7 +2437,7 @@ async fn api_cluster_sync_one(
     Path(id): Path<i64>,
 ) -> ApiResult {
     let snap = state.cluster.sync_node_by_id(id).await.map_err(bad_req)?;
-    ok_json(snap)
+    ok_json(&*snap)
 }
 
 async fn api_cluster_delete_node(
@@ -2457,7 +2457,7 @@ fn render_subscription_for_state(
     local_host: &str,
     local_cfg: &crate::models::ClusterLocalConfig,
     remote_nodes: &[ClusterNodeRecord],
-    snapshots: &HashMap<i64, RemoteNodeSnapshot>,
+    snapshots: &HashMap<i64, Arc<RemoteNodeSnapshot>>,
     include_cluster: bool,
     sub_id_filter: &str,
     format: SubFormat,
@@ -2469,7 +2469,7 @@ fn render_subscription_for_state(
             .iter()
             .filter(|n| n.enable && n.include_in_sub)
             .filter_map(|n| {
-                let snap = snapshots.get(&n.id)?;
+                let snap = snapshots.get(&n.id)?.as_ref();
                 if snap.has_usable_inbounds(now) {
                     Some((n, snap, effective_node_prefix(n)))
                 } else {
@@ -3496,6 +3496,14 @@ async fn cluster_federation_and_regional_aggregated_subscription_e2e() -> anyhow
             ))?;
         let resp = app.clone().oneshot(save_req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Verify get_snapshots() shares immutable Arc<RemoteNodeSnapshot> without deep-copying inbounds/certs
+    let snaps_a = m_state.cluster.get_snapshots();
+    let snaps_b = m_state.cluster.get_snapshots();
+    assert_eq!(snaps_a.len(), 2);
+    for (nid, arc_a) in &snaps_a {
+        assert!(Arc::ptr_eq(arc_a, snaps_b.get(nid).unwrap()));
     }
 
     // 3. Overview aggregates all 3 VPS nodes (online count, inbounds, cumulative traffic)

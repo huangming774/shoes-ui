@@ -184,7 +184,7 @@ pub struct ClusterManager {
     db: Arc<Database>,
     http_verified: Client,
     http_insecure: Client,
-    snapshots: RwLock<HashMap<i64, RemoteNodeSnapshot>>,
+    snapshots: RwLock<HashMap<i64, Arc<RemoteNodeSnapshot>>>,
 }
 
 impl ClusterManager {
@@ -264,20 +264,20 @@ impl ClusterManager {
             ));
         }
 
-        let envelope: Value = serde_json::from_str(&text)
+        let mut envelope: Value = serde_json::from_str(&text)
             .context("Remote panel returned invalid JSON (verify panel URL & base path)")?;
         if envelope.get("ok").and_then(Value::as_bool) != Some(true) {
             let msg = envelope["error"].as_str().unwrap_or("unknown error");
             return Err(anyhow!("Remote panel returned error: {msg}"));
         }
-        let payload: ClusterExportPayload = serde_json::from_value(envelope["data"].clone())
+        let payload: ClusterExportPayload = serde_json::from_value(envelope["data"].take())
             .context("Remote panel export payload schema mismatch (upgrade child shoes-panel)")?;
 
         // Prevent accidental self-mount loops
-        if let Ok(local_cfg) = self.db.get_cluster_local_config() {
+        if let Ok(Some(local_instance_id)) = self.db.get_cluster_instance_id() {
             if !payload.instance_id.is_empty()
-                && !local_cfg.instance_id.is_empty()
-                && payload.instance_id == local_cfg.instance_id
+                && !local_instance_id.is_empty()
+                && payload.instance_id == local_instance_id
             {
                 return Err(anyhow!(
                     "Remote URL points to this same shoes-panel instance (self-mount blocked)"
@@ -314,9 +314,8 @@ impl ClusterManager {
         })
     }
 
-    pub async fn sync_node(&self, node: &ClusterNodeRecord) -> RemoteNodeSnapshot {
+    pub async fn sync_node(&self, node: &ClusterNodeRecord) -> Arc<RemoteNodeSnapshot> {
         let now = Utc::now().timestamp_millis();
-        let prev = self.snapshots.read().get(&node.id).cloned();
 
         let snap = match self
             .fetch_remote_export(&node.api_url, &node.api_token, node.allow_insecure)
@@ -324,7 +323,7 @@ impl ClusterManager {
         {
             Ok((payload, latency_ms)) => {
                 let effective_host = resolve_remote_share_host(node, &payload.share_host);
-                RemoteNodeSnapshot {
+                Arc::new(RemoteNodeSnapshot {
                     node_id: node.id,
                     online: true,
                     latency_ms: Some(latency_ms),
@@ -339,26 +338,29 @@ impl ClusterManager {
                     totals: payload.totals,
                     inbounds: payload.inbounds,
                     cert_pems: payload.cert_pems,
-                }
+                })
             }
             Err(err) => {
-                let mut failed = prev.unwrap_or_else(|| RemoteNodeSnapshot {
-                    node_id: node.id,
-                    ..Default::default()
-                });
+                let prev = self.snapshots.read().get(&node.id).cloned();
+                let mut failed = prev
+                    .map(|arc| (*arc).clone())
+                    .unwrap_or_else(|| RemoteNodeSnapshot {
+                        node_id: node.id,
+                        ..Default::default()
+                    });
                 failed.online = false;
                 failed.latency_ms = None;
                 failed.last_synced_at = now;
                 failed.last_error = Some(err.to_string());
-                failed
+                Arc::new(failed)
             }
         };
 
-        self.snapshots.write().insert(node.id, snap.clone());
+        self.snapshots.write().insert(node.id, Arc::clone(&snap));
         snap
     }
 
-    pub async fn sync_all_now(self: &Arc<Self>) -> Vec<RemoteNodeSnapshot> {
+    pub async fn sync_all_now(self: &Arc<Self>) -> Vec<Arc<RemoteNodeSnapshot>> {
         let Ok(nodes) = self.db.list_cluster_nodes() else {
             return Vec::new();
         };
@@ -385,7 +387,7 @@ impl ClusterManager {
         results
     }
 
-    pub async fn sync_node_by_id(&self, id: i64) -> Result<RemoteNodeSnapshot> {
+    pub async fn sync_node_by_id(&self, id: i64) -> Result<Arc<RemoteNodeSnapshot>> {
         let node = self
             .db
             .get_cluster_node(id)?
@@ -397,7 +399,7 @@ impl ClusterManager {
         self.snapshots.write().remove(&id);
     }
 
-    pub fn get_snapshots(&self) -> HashMap<i64, RemoteNodeSnapshot> {
+    pub fn get_snapshots(&self) -> HashMap<i64, Arc<RemoteNodeSnapshot>> {
         self.snapshots.read().clone()
     }
 
@@ -408,19 +410,21 @@ impl ClusterManager {
             return;
         };
         let now = Utc::now().timestamp_millis();
-        let current = self.snapshots.read().clone();
-        let stale: Vec<ClusterNodeRecord> = nodes
-            .into_iter()
-            .filter(|n| {
-                if !n.enable || !n.include_in_sub {
-                    return false;
-                }
-                match current.get(&n.id) {
-                    None => true,
-                    Some(s) => now.saturating_sub(s.last_synced_at) > max_age_ms,
-                }
-            })
-            .collect();
+        let stale: Vec<ClusterNodeRecord> = {
+            let current = self.snapshots.read();
+            nodes
+                .into_iter()
+                .filter(|n| {
+                    if !n.enable || !n.include_in_sub {
+                        return false;
+                    }
+                    match current.get(&n.id) {
+                        None => true,
+                        Some(s) => now.saturating_sub(s.last_synced_at) > max_age_ms,
+                    }
+                })
+                .collect()
+        };
         if stale.is_empty() {
             return;
         }
