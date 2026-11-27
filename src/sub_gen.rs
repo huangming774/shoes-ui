@@ -244,8 +244,28 @@ fn has_non_host_ws_headers(ib: &Inbound) -> bool {
 
 /// Reads the inbound's public TLS certificate PEM (never private keys) so strict TLS
 /// clients like sing-box NaiveProxy (Cronet) can pin self-signed certs cleanly.
-fn resolve_inbound_cert_pem(ib: &Inbound, certs: &[CertificateRecord]) -> Option<String> {
+fn resolve_inbound_cert_pem(
+    ib: &Inbound,
+    certs: &[CertificateRecord],
+    cert_pems: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
     let tls = &ib.stream_settings.tls;
+    if let Some(pems) = cert_pems {
+        if tls.cert_mode == "source" && !tls.certificate_source.trim().is_empty() {
+            if let Some(pem) = pems.get(tls.certificate_source.trim()) {
+                if pem.contains("-----BEGIN CERTIFICATE-----") {
+                    return Some(pem.trim().to_string());
+                }
+            }
+        }
+        if !tls.cert_file.trim().is_empty() {
+            if let Some(pem) = pems.get(tls.cert_file.trim()) {
+                if pem.contains("-----BEGIN CERTIFICATE-----") {
+                    return Some(pem.trim().to_string());
+                }
+            }
+        }
+    }
     let cert_path = if tls.cert_mode == "files" && !tls.cert_file.trim().is_empty() {
         tls.cert_file.trim().to_string()
     } else if tls.cert_mode == "source" && !tls.certificate_source.trim().is_empty() {
@@ -266,6 +286,30 @@ fn resolve_inbound_cert_pem(ib: &Inbound, certs: &[CertificateRecord]) -> Option
     } else {
         None
     }
+}
+
+/// Collects public TLS certificate PEMs referenced by enabled inbounds (never private keys)
+/// for inclusion in read-only cluster export snapshots.
+pub fn collect_public_cert_pems(
+    inbounds: &[Inbound],
+    certs: &[CertificateRecord],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for ib in inbounds
+        .iter()
+        .filter(|i| i.enable && i.stream_settings.tls.allow_insecure)
+    {
+        if let Some(pem) = resolve_inbound_cert_pem(ib, certs, None) {
+            let tls = &ib.stream_settings.tls;
+            if tls.cert_mode == "source" && !tls.certificate_source.trim().is_empty() {
+                out.insert(tls.certificate_source.trim().to_string(), pem.clone());
+            }
+            if !tls.cert_file.trim().is_empty() {
+                out.insert(tls.cert_file.trim().to_string(), pem);
+            }
+        }
+    }
+    out
 }
 
 fn extract_pem_cert_raw(pem: &str) -> Option<String> {
@@ -1484,6 +1528,7 @@ fn build_singbox_outbound(
     host: &str,
     name: &str,
     certs: &[CertificateRecord],
+    cert_pems: Option<&std::collections::HashMap<String, String>>,
 ) -> Option<(JsonValue, Option<JsonValue>)> {
     if ib.protocol == "portforward" || ib.stream_settings.sudoku.enabled {
         return None;
@@ -1722,7 +1767,7 @@ fn build_singbox_outbound(
                             // Self-signed cert SAN usually matches SNI, not a different WS Host.
                             return None;
                         }
-                        let pem = resolve_inbound_cert_pem(ib, certs)?;
+                        let pem = resolve_inbound_cert_pem(ib, certs, cert_pems)?;
                         let raw = extract_pem_cert_raw(&pem)?;
                         opts.push(format!("certRaw={raw}"));
                     }
@@ -1812,7 +1857,7 @@ fn build_singbox_outbound(
                 naive_tls["server_name"] = json!(sni);
             }
             if ss.tls.allow_insecure {
-                let pem = resolve_inbound_cert_pem(ib, certs)?;
+                let pem = resolve_inbound_cert_pem(ib, certs, cert_pems)?;
                 naive_tls["certificate"] = json!([pem]);
             }
             Some(json!({
@@ -2125,13 +2170,200 @@ fn parse_singbox_custom_rules(raw: &str) -> Vec<JsonValue> {
     rules
 }
 
+/// Represents one VPS panel source (local master or mounted remote cluster node)
+/// contributing inbounds to a unified multi-node subscription.
+pub struct SubSourceNode<'a> {
+    pub region: &'a str,
+    pub region_flag: &'a str,
+    pub prefix: &'a str,
+    pub host: &'a str,
+    pub inbounds: &'a [Inbound],
+    pub certs: &'a [CertificateRecord],
+    pub cert_pems: Option<&'a std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone)]
+struct RegionGroupSpec {
+    label: String,
+    members: Vec<String>,
+}
+
+/// Canonical `(code, flag, display_label, sort_rank)` catalog for regional auto-grouping.
+const REGION_CATALOG: &[(&str, &str, &str, usize)] = &[
+    ("HK", "🇭🇰", "🇭🇰 香港", 1),
+    ("JP", "🇯🇵", "🇯🇵 日本", 2),
+    ("SG", "🇸🇬", "🇸🇬 新加坡", 3),
+    ("TW", "🇹🇼", "🇹🇼 台湾", 4),
+    ("US", "🇺🇸", "🇺🇸 美国", 5),
+    ("KR", "🇰🇷", "🇰🇷 韩国", 6),
+    ("UK", "🇬🇧", "🇬🇧 英国", 7),
+    ("DE", "🇩🇪", "🇩🇪 德国", 8),
+    ("NL", "🇳🇱", "🇳🇱 荷兰", 9),
+    ("FR", "🇫🇷", "🇫🇷 法国", 10),
+    ("CA", "🇨🇦", "🇨🇦 加拿大", 11),
+    ("AU", "🇦🇺", "🇦🇺 澳大利亚", 12),
+    ("TR", "🇹🇷", "🇹🇷 土耳其", 13),
+    ("IN", "🇮🇳", "🇮🇳 印度", 14),
+    ("RU", "🇷🇺", "🇷🇺 俄罗斯", 15),
+];
+
+fn lookup_canonical_region(raw: &str) -> Option<(&'static str, &'static str, usize)> {
+    let up = raw.trim().to_ascii_uppercase();
+    let norm = match up.as_str() {
+        "HK" | "HONG KONG" | "HONGKONG" | "香港" => "HK",
+        "JP" | "JAPAN" | "TOKYO" | "OSAKA" | "日本" => "JP",
+        "SG" | "SINGAPORE" | "新加坡" | "狮城" => "SG",
+        "TW" | "TAIWAN" | "TAIPEI" | "台湾" | "台灣" => "TW",
+        "US" | "USA" | "UNITED STATES" | "AMERICA" | "美国" | "美國" => "US",
+        "KR" | "KOREA" | "SOUTH KOREA" | "SEOUL" | "韩国" | "韓國" => "KR",
+        "UK" | "GB" | "UNITED KINGDOM" | "BRITAIN" | "LONDON" | "英国" | "英國" => "UK",
+        "DE" | "GERMANY" | "FRANKFURT" | "德国" | "德國" => "DE",
+        "NL" | "NETHERLANDS" | "AMSTERDAM" | "荷兰" | "荷蘭" => "NL",
+        "FR" | "FRANCE" | "PARIS" | "法国" | "法國" => "FR",
+        "CA" | "CANADA" | "TORONTO" | "加拿大" => "CA",
+        "AU" | "AUSTRALIA" | "SYDNEY" | "澳大利亚" | "澳洲" => "AU",
+        "TR" | "TURKEY" | "TURKIYE" | "土耳其" => "TR",
+        "IN" | "INDIA" | "印度" => "IN",
+        "RU" | "RUSSIA" | "俄罗斯" | "俄羅斯" => "RU",
+        _ => return None,
+    };
+    REGION_CATALOG
+        .iter()
+        .find(|(code, _, _, _)| *code == norm)
+        .map(|(code, _, label, rank)| (*code, *label, *rank))
+}
+
+fn contains_ascii_word(haystack_upper: &str, needle: &str) -> bool {
+    let bytes = haystack_upper.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() || bytes.len() < nbytes.len() {
+        return false;
+    }
+    for i in 0..=bytes.len() - nbytes.len() {
+        if &bytes[i..i + nbytes.len()] == nbytes {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphabetic();
+            let right_ok =
+                i + nbytes.len() == bytes.len() || !bytes[i + nbytes.len()].is_ascii_alphabetic();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolves `(region_key, display_label, sort_rank)` for a proxy node.
+/// Uses explicit node `region` / `region_flag` first, falling back to emoji/keyword inference on node name.
+fn resolve_node_region(
+    explicit_region: &str,
+    explicit_flag: &str,
+    node_name: &str,
+) -> Option<(String, String, usize)> {
+    let reg = explicit_region.trim();
+    if !reg.is_empty() {
+        if let Some((code, label, rank)) = lookup_canonical_region(reg) {
+            return Some((code.to_string(), label.to_string(), rank));
+        }
+        let flag = explicit_flag.trim();
+        let label = if !flag.is_empty() && !reg.starts_with(flag) {
+            format!("{flag} {reg}")
+        } else {
+            reg.to_string()
+        };
+        return Some((reg.to_ascii_uppercase(), label, 50));
+    }
+
+    // Infer from flag emojis or well-known region keywords in node display name
+    for (code, flag, label, rank) in REGION_CATALOG {
+        if node_name.contains(flag) {
+            return Some(((*code).to_string(), (*label).to_string(), *rank));
+        }
+    }
+    const KEYWORD_RULES: &[(&str, &[&str], &[&str])] = &[
+        ("HK", &["香港"], &["HK", "HONGKONG", "HKG"]),
+        ("JP", &["日本", "东京", "大阪"], &["JP", "JAPAN", "TOKYO", "OSAKA", "NRT", "KIX"]),
+        ("SG", &["新加坡", "狮城"], &["SG", "SINGAPORE", "SIN"]),
+        ("TW", &["台湾", "台灣", "台北"], &["TW", "TAIWAN", "TAIPEI", "TPE"]),
+        ("US", &["美国", "美國", "洛杉矶", "圣何塞", "纽约", "西雅图"], &["US", "USA", "LAX", "SJC", "NYC", "SEA"]),
+        ("KR", &["韩国", "韓國", "首尔"], &["KR", "KOREA", "SEOUL", "ICN"]),
+        ("UK", &["英国", "英國", "伦敦"], &["UK", "GB", "LONDON", "LHR"]),
+        ("DE", &["德国", "德國", "法兰克福"], &["DE", "GERMANY", "FRANKFURT", "FRA"]),
+        ("NL", &["荷兰", "荷蘭", "阿姆斯特丹"], &["NL", "AMSTERDAM", "AMS"]),
+        ("FR", &["法国", "法國", "巴黎"], &["FR", "FRANCE", "PARIS", "CDG"]),
+        ("CA", &["加拿大", "多伦多"], &["CA", "CANADA", "TORONTO"]),
+        ("AU", &["澳大利亚", "澳洲", "悉尼"], &["AU", "AUSTRALIA", "SYDNEY"]),
+    ];
+    let upper = node_name.to_ascii_uppercase();
+    for (code, cn_kws, en_kws) in KEYWORD_RULES {
+        if cn_kws.iter().any(|k| node_name.contains(k))
+            || en_kws.iter().any(|k| contains_ascii_word(&upper, k))
+        {
+            if let Some((_, _, label, rank)) = REGION_CATALOG.iter().find(|(c, _, _, _)| c == code) {
+                return Some(((*code).to_string(), (*label).to_string(), *rank));
+            }
+        }
+    }
+    None
+}
+
+fn build_region_groups(
+    entries: &[(String, Option<(String, String, usize)>)],
+    multi_source: bool,
+    enable_region_groups: bool,
+) -> Vec<RegionGroupSpec> {
+    if !enable_region_groups || entries.is_empty() {
+        return Vec::new();
+    }
+    let mut named_map: std::collections::HashMap<String, (String, usize, Vec<String>)> =
+        std::collections::HashMap::new();
+    let mut unlabeled: Vec<String> = Vec::new();
+
+    for (name, reg) in entries {
+        if let Some((key, label, rank)) = reg {
+            let entry = named_map
+                .entry(key.clone())
+                .or_insert_with(|| (label.clone(), *rank, Vec::new()));
+            entry.2.push(name.clone());
+        } else {
+            unlabeled.push(name.clone());
+        }
+    }
+
+    // Emit regional groups when we have >= 2 distinct regions, or a multi-node cluster with >= 1 labeled region.
+    if named_map.len() < 2 && !(multi_source && !named_map.is_empty()) {
+        return Vec::new();
+    }
+
+    let mut groups: Vec<(usize, String, Vec<String>)> = named_map
+        .into_values()
+        .map(|(label, rank, members)| (rank, label, members))
+        .collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut out: Vec<RegionGroupSpec> = groups
+        .into_iter()
+        .map(|(_, label, members)| RegionGroupSpec { label, members })
+        .collect();
+    if !unlabeled.is_empty() {
+        out.push(RegionGroupSpec {
+            label: "🌐 其他".to_string(),
+            members: unlabeled,
+        });
+    }
+    out
+}
+
 fn build_clash_document(
     proxies: Vec<JsonValue>,
     names: &[String],
+    region_groups: &[RegionGroupSpec],
     tpl: &SubscriptionTemplateConfig,
 ) -> JsonValue {
     let preset = tpl.preset.trim().to_ascii_lowercase();
+    let region_labels: Vec<String> = region_groups.iter().map(|rg| rg.label.clone()).collect();
+
     let mut selector_members = vec!["⚡ Auto".to_string()];
+    selector_members.extend(region_labels.iter().cloned());
     selector_members.extend(names.iter().cloned());
     selector_members.push("DIRECT".to_string());
 
@@ -2152,16 +2384,19 @@ fn build_clash_document(
             "type": "url-test",
             "url": "https://www.gstatic.com/generate_204",
             "interval": 300,
+            "tolerance": 50,
             "proxies": auto_members
         }),
     ];
 
     if preset == "streaming" {
         let mut service_proxies = vec!["🚀 Proxy".to_string(), "⚡ Auto".to_string()];
+        service_proxies.extend(region_labels.iter().cloned());
         service_proxies.extend(names.iter().cloned());
         service_proxies.push("DIRECT".to_string());
 
         let mut direct_first = vec!["DIRECT".to_string(), "🚀 Proxy".to_string(), "⚡ Auto".to_string()];
+        direct_first.extend(region_labels.iter().cloned());
         direct_first.extend(names.iter().cloned());
 
         for group_name in ["🤖 AI", "🎬 Netflix", "📺 YouTube", "✈️ Telegram", "🌍 Google"] {
@@ -2180,6 +2415,18 @@ fn build_clash_document(
             "name": "🎯 Direct",
             "type": "select",
             "proxies": ["DIRECT", "🚀 Proxy"]
+        }));
+    }
+
+    // Per-region automatic latency-tested groups (url-test)
+    for rg in region_groups {
+        proxy_groups.push(json!({
+            "name": rg.label,
+            "type": "url-test",
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": 300,
+            "tolerance": 50,
+            "proxies": rg.members
         }));
     }
 
@@ -2297,10 +2544,14 @@ fn build_clash_document(
 fn build_singbox_document(
     outbounds: Vec<JsonValue>,
     tags: &[String],
+    region_groups: &[RegionGroupSpec],
     tpl: &SubscriptionTemplateConfig,
 ) -> JsonValue {
     let preset = tpl.preset.trim().to_ascii_lowercase();
+    let region_labels: Vec<String> = region_groups.iter().map(|rg| rg.label.clone()).collect();
+
     let mut select_tags = vec!["auto".to_string()];
+    select_tags.extend(region_labels.iter().cloned());
     select_tags.extend(tags.iter().cloned());
     select_tags.push("direct".to_string());
 
@@ -2315,7 +2566,8 @@ fn build_singbox_document(
             "type": "urltest",
             "outbounds": tags,
             "url": "https://www.gstatic.com/generate_204",
-            "interval": "5m"
+            "interval": "5m",
+            "tolerance": 50
         }));
     } else {
         all_outbounds.push(json!({
@@ -2326,10 +2578,12 @@ fn build_singbox_document(
 
     if preset == "streaming" {
         let mut service_tags = vec!["proxy".to_string(), "auto".to_string()];
+        service_tags.extend(region_labels.iter().cloned());
         service_tags.extend(tags.iter().cloned());
         service_tags.push("direct".to_string());
 
         let mut apple_tags = vec!["direct".to_string(), "proxy".to_string(), "auto".to_string()];
+        apple_tags.extend(region_labels.iter().cloned());
         apple_tags.extend(tags.iter().cloned());
 
         for g in ["ai", "netflix", "youtube", "telegram", "google"] {
@@ -2343,6 +2597,18 @@ fn build_singbox_document(
             "tag": "apple",
             "type": "selector",
             "outbounds": apple_tags
+        }));
+    }
+
+    // Per-region automatic latency-tested groups (urltest)
+    for rg in region_groups {
+        all_outbounds.push(json!({
+            "tag": rg.label,
+            "type": "urltest",
+            "outbounds": rg.members,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "5m",
+            "tolerance": 50
         }));
     }
 
@@ -2513,9 +2779,39 @@ pub fn generate_subscription_with_options(
     format: SubFormat,
     template: &SubscriptionTemplateConfig,
 ) -> SubscriptionPayload {
-    let match_all = sub_id_filter.eq_ignore_ascii_case("all") || sub_id_filter == "*";
+    let local = SubSourceNode {
+        region: "",
+        region_flag: "",
+        prefix: "",
+        host,
+        inbounds,
+        certs,
+        cert_pems: None,
+    };
+    generate_aggregated_subscription(&[local], sub_id_filter, format, template)
+}
 
-    let mut matched_pairs: Vec<(&Inbound, &ClientRecord, String)> = Vec::new();
+/// Generates a unified subscription across one or more VPS nodes (local + remote cluster nodes),
+/// merging traffic/quota headers, deduplicating proxy names, and automatically generating
+/// per-region `url-test` / `urltest` groups in Clash / sing-box configs.
+pub fn generate_aggregated_subscription(
+    sources: &[SubSourceNode<'_>],
+    sub_id_filter: &str,
+    format: SubFormat,
+    template: &SubscriptionTemplateConfig,
+) -> SubscriptionPayload {
+    let match_all = sub_id_filter.eq_ignore_ascii_case("all") || sub_id_filter == "*";
+    let multi_source = sources.len() > 1;
+
+    struct MatchedNode<'a> {
+        source: &'a SubSourceNode<'a>,
+        ib: &'a Inbound,
+        client: &'a ClientRecord,
+        unique_name: String,
+        region: Option<(String, String, usize)>,
+    }
+
+    let mut matched: Vec<MatchedNode<'_>> = Vec::new();
     let mut used_names = std::collections::HashSet::new();
 
     let mut total_up: i64 = 0;
@@ -2524,33 +2820,60 @@ pub fn generate_subscription_with_options(
     let mut has_unlimited_quota = false;
     let mut earliest_expiry_ms: i64 = 0;
 
-    for ib in inbounds.iter().filter(|i| i.enable && i.protocol != "portforward") {
-        let mut inbound_counted = false;
-        for c in ib.clients.iter().filter(|c| c.enable) {
-            if match_all || c.sub_id.trim() == sub_id_filter.trim() {
-                if !inbound_counted {
-                    inbound_counted = true;
-                    total_up = total_up.saturating_add(ib.up_bytes);
-                    total_down = total_down.saturating_add(ib.down_bytes);
-                    if ib.total_quota_bytes > 0 {
-                        total_quota = total_quota.saturating_add(ib.total_quota_bytes);
+    for source in sources {
+        if source.host.trim().is_empty() {
+            continue;
+        }
+        for ib in source
+            .inbounds
+            .iter()
+            .filter(|i| i.enable && i.protocol != "portforward")
+        {
+            let mut inbound_counted = false;
+            for c in ib.clients.iter().filter(|c| c.enable) {
+                if match_all || c.sub_id.trim() == sub_id_filter.trim() {
+                    if !inbound_counted {
+                        inbound_counted = true;
+                        total_up = total_up.saturating_add(ib.up_bytes);
+                        total_down = total_down.saturating_add(ib.down_bytes);
+                        if ib.total_quota_bytes > 0 {
+                            total_quota = total_quota.saturating_add(ib.total_quota_bytes);
+                        } else {
+                            has_unlimited_quota = true;
+                        }
+                        if ib.expiry_time > 0
+                            && (earliest_expiry_ms == 0 || ib.expiry_time < earliest_expiry_ms)
+                        {
+                            earliest_expiry_ms = ib.expiry_time;
+                        }
+                    }
+                    let raw_name = node_display_name(ib, c);
+                    let base_name = if !source.prefix.trim().is_empty() {
+                        let p = source.prefix.trim();
+                        if raw_name.starts_with(p) {
+                            raw_name
+                        } else {
+                            format!("{p} | {raw_name}")
+                        }
                     } else {
-                        has_unlimited_quota = true;
+                        raw_name
+                    };
+                    let mut unique_name = base_name.clone();
+                    let mut suffix = 2;
+                    while !used_names.insert(unique_name.clone()) {
+                        unique_name = format!("{base_name}-{suffix}");
+                        suffix += 1;
                     }
-                    if ib.expiry_time > 0
-                        && (earliest_expiry_ms == 0 || ib.expiry_time < earliest_expiry_ms)
-                    {
-                        earliest_expiry_ms = ib.expiry_time;
-                    }
+                    let region =
+                        resolve_node_region(source.region, source.region_flag, &unique_name);
+                    matched.push(MatchedNode {
+                        source,
+                        ib,
+                        client: c,
+                        unique_name,
+                        region,
+                    });
                 }
-                let base_name = node_display_name(ib, c);
-                let mut unique_name = base_name.clone();
-                let mut suffix = 2;
-                while !used_names.insert(unique_name.clone()) {
-                    unique_name = format!("{base_name}-{suffix}");
-                    suffix += 1;
-                }
-                matched_pairs.push((ib, c, unique_name));
             }
         }
     }
@@ -2567,9 +2890,9 @@ pub fn generate_subscription_with_options(
 
     match format {
         SubFormat::RawUris | SubFormat::V2rayBase64 => {
-            let uris: Vec<String> = matched_pairs
+            let uris: Vec<String> = matched
                 .iter()
-                .map(|(ib, c, name)| build_uri(ib, c, host, name))
+                .map(|m| build_uri(m.ib, m.client, m.source.host, &m.unique_name))
                 .filter(|s| !s.is_empty() && !s.contains(" = snell,"))
                 .collect();
             let joined = uris.join("\n");
@@ -2587,13 +2910,17 @@ pub fn generate_subscription_with_options(
         SubFormat::ClashYaml => {
             let mut proxies = Vec::new();
             let mut names = Vec::new();
-            for (ib, c, name) in &matched_pairs {
-                if let Some(p) = build_clash_proxy(ib, c, host, name) {
-                    names.push(name.clone());
+            let mut reg_entries = Vec::new();
+            for m in &matched {
+                if let Some(p) = build_clash_proxy(m.ib, m.client, m.source.host, &m.unique_name) {
+                    names.push(m.unique_name.clone());
+                    reg_entries.push((m.unique_name.clone(), m.region.clone()));
                     proxies.push(p);
                 }
             }
-            let doc = build_clash_document(proxies, &names, template);
+            let region_groups =
+                build_region_groups(&reg_entries, multi_source, template.enable_region_groups);
+            let doc = build_clash_document(proxies, &names, &region_groups, template);
             let yaml_val: YamlValue =
                 serde_yaml::to_value(&doc).unwrap_or(YamlValue::Mapping(Mapping::new()));
             let raw_body = serde_yaml::to_string(&yaml_val).unwrap_or_default();
@@ -2607,16 +2934,27 @@ pub fn generate_subscription_with_options(
         SubFormat::SingBoxJson => {
             let mut outbounds = Vec::new();
             let mut tags = Vec::new();
-            for (ib, c, name) in &matched_pairs {
-                if let Some((o, detour)) = build_singbox_outbound(ib, c, host, name, certs) {
-                    tags.push(name.clone());
+            let mut reg_entries = Vec::new();
+            for m in &matched {
+                if let Some((o, detour)) = build_singbox_outbound(
+                    m.ib,
+                    m.client,
+                    m.source.host,
+                    &m.unique_name,
+                    m.source.certs,
+                    m.source.cert_pems,
+                ) {
+                    tags.push(m.unique_name.clone());
+                    reg_entries.push((m.unique_name.clone(), m.region.clone()));
                     outbounds.push(o);
                     if let Some(d) = detour {
                         outbounds.push(d);
                     }
                 }
             }
-            let cfg = build_singbox_document(outbounds, &tags, template);
+            let region_groups =
+                build_region_groups(&reg_entries, multi_source, template.enable_region_groups);
+            let cfg = build_singbox_document(outbounds, &tags, &region_groups, template);
             SubscriptionPayload {
                 content_type: "application/json; charset=utf-8",
                 body: serde_json::to_string_pretty(&cfg).unwrap_or_default(),

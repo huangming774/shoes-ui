@@ -1,6 +1,7 @@
 mod acme_util;
 mod api;
 mod auth;
+mod cluster;
 mod crypto_util;
 mod db;
 mod egress_probe;
@@ -4591,6 +4592,7 @@ mod tests {
             prepend_custom_rules: true,
             enable_adblock: true,
             enable_ipv6: true,
+            enable_region_groups: true,
             clash_custom_rules: "# corp bypass\nDOMAIN-SUFFIX,corp.example.internal,DIRECT\n- IP-CIDR,100.64.0.0/10,DIRECT,no-resolve".to_string(),
             clash_extra_groups_yaml: "- name: 🎮 Gaming\n  type: select\n  proxies:\n    - 🚀 Proxy\n    - DIRECT".to_string(),
             singbox_custom_rules: "DOMAIN-SUFFIX,corp.example.internal,DIRECT\nDOMAIN-KEYWORD,myai,🤖 AI\nIP-CIDR,100.64.0.0/10,direct".to_string(),
@@ -4706,6 +4708,7 @@ mod tests {
             name: "VIP Bypass CN".to_string(),
             enable: true,
             template: "bypass_cn".to_string(),
+            include_cluster: true,
             created_at: 0,
         })?;
         assert_eq!(sub.template, "bypass_cn");

@@ -132,3 +132,15 @@ pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
     }
     None
 }
+
+pub fn extract_cluster_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(tok) = headers
+        .get("x-cluster-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(tok.to_string());
+    }
+    extract_token_from_headers(headers)
+}

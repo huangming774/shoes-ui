@@ -129,6 +129,10 @@
               </div>
             </template>
             <InboundsView v-else-if="currentKey === 'inbounds'" />
+            <ClusterView
+              v-else-if="currentKey === 'cluster'"
+              @navigate="(k) => (selectedKeys = [k])"
+            />
             <SubscriptionsView v-else-if="currentKey === 'subscriptions'" />
             <CertsView v-else-if="currentKey === 'certificates'" />
             <RoutingView v-else-if="currentKey === 'routing'" />
@@ -170,6 +174,7 @@ import { theme } from 'ant-design-vue';
 import {
   DashboardOutlined,
   ClusterOutlined,
+  GlobalOutlined,
   ShareAltOutlined,
   SafetyCertificateOutlined,
   ApartmentOutlined,
@@ -190,6 +195,7 @@ import { getLocaleMeta, setLocale, SUPPORTED_LOCALES } from './i18n';
 import LoginView from './views/LoginView.vue';
 import DashboardView from './views/DashboardView.vue';
 import InboundsView from './views/InboundsView.vue';
+import ClusterView from './views/ClusterView.vue';
 import SubscriptionsView from './views/SubscriptionsView.vue';
 import CertsView from './views/CertsView.vue';
 import RoutingView from './views/RoutingView.vue';
@@ -241,6 +247,7 @@ const currentTitle = computed(() => t(`menu.${currentKey.value}`));
 const menuItems = computed(() => [
   { key: 'dashboard', icon: () => h(DashboardOutlined), label: t('menu.dashboard') },
   { key: 'inbounds', icon: () => h(ClusterOutlined), label: t('menu.inbounds') },
+  { key: 'cluster', icon: () => h(GlobalOutlined), label: t('menu.cluster') },
   { key: 'subscriptions', icon: () => h(ShareAltOutlined), label: t('menu.subscriptions') },
   { key: 'certificates', icon: () => h(SafetyCertificateOutlined), label: t('menu.certificates') },
   { key: 'routing', icon: () => h(ApartmentOutlined), label: t('menu.routing') },

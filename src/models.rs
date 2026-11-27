@@ -21,12 +21,17 @@ pub fn default_sub_id() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboundTotals {
+    #[serde(default)]
     pub up_bytes: i64,
+    #[serde(default)]
     pub down_bytes: i64,
+    #[serde(default)]
     pub inbounds_total: i64,
+    #[serde(default)]
     pub inbounds_enabled: i64,
+    #[serde(default)]
     pub clients_total: i64,
 }
 
@@ -1206,6 +1211,8 @@ pub struct SubscriptionTemplateConfig {
     pub enable_adblock: bool,
     #[serde(default)]
     pub enable_ipv6: bool,
+    #[serde(default = "default_true")]
+    pub enable_region_groups: bool,
     #[serde(default)]
     pub clash_custom_rules: String,
     #[serde(default)]
@@ -1221,6 +1228,7 @@ impl Default for SubscriptionTemplateConfig {
             prepend_custom_rules: true,
             enable_adblock: false,
             enable_ipv6: false,
+            enable_region_groups: true,
             clash_custom_rules: String::new(),
             clash_extra_groups_yaml: String::new(),
             singbox_custom_rules: String::new(),
@@ -1239,8 +1247,60 @@ pub struct SubscriptionRecord {
     pub enable: bool,
     #[serde(default)]
     pub template: String, // "" = inherit global default, or preset name
+    #[serde(default = "default_true")]
+    pub include_cluster: bool,
     #[serde(default)]
     pub created_at: i64,
+}
+
+fn default_cluster_sort_order() -> i64 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterNodeRecord {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub region_flag: String,
+    pub api_url: String,
+    #[serde(default)]
+    pub api_token: String,
+    #[serde(default)]
+    pub share_host_override: String,
+    #[serde(default)]
+    pub allow_insecure: bool,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_true")]
+    pub include_in_sub: bool,
+    #[serde(default)]
+    pub node_prefix: String,
+    #[serde(default)]
+    pub remark: String,
+    #[serde(default = "default_cluster_sort_order")]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClusterLocalConfig {
+    #[serde(default)]
+    pub instance_id: String,
+    #[serde(default)]
+    pub local_name: String,
+    #[serde(default)]
+    pub local_region: String,
+    #[serde(default)]
+    pub local_region_flag: String,
+    #[serde(default)]
+    pub api_token: String,
 }
 
 fn default_backup_interval_hours() -> u64 {

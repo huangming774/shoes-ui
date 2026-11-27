@@ -141,6 +141,16 @@ export const api = {
   rotateSubscription: (id) => apiFetch(`/subscriptions/${id}/rotate`, { method: 'POST' }),
   deleteSubscription: (id) => apiFetch(`/subscriptions/${id}`, { method: 'DELETE' }),
 
+  clusterOverview: () => apiFetch('/cluster/overview'),
+  clusterSaveLocal: (payload) => apiFetch('/cluster/local', { method: 'PUT', body: payload }),
+  clusterRotateToken: () => apiFetch('/cluster/local/token/rotate', { method: 'POST' }),
+  clusterRevokeToken: () => apiFetch('/cluster/local/token/revoke', { method: 'POST' }),
+  clusterSaveNode: (payload) => apiFetch('/cluster/nodes', { method: 'POST', body: payload }),
+  clusterTestNode: (payload) => apiFetch('/cluster/nodes/test', { method: 'POST', body: payload }),
+  clusterSyncAll: () => apiFetch('/cluster/sync', { method: 'POST' }),
+  clusterSyncOne: (id) => apiFetch(`/cluster/nodes/${id}/sync`, { method: 'POST' }),
+  clusterDeleteNode: (id) => apiFetch(`/cluster/nodes/${id}`, { method: 'DELETE' }),
+
   getSettings: () => apiFetch('/settings'),
   saveSettings: (payload) => apiFetch('/settings', { method: 'PUT', body: payload }),
   setPublicHost: (public_host) => apiFetch('/settings/public-host', { method: 'POST', body: { public_host } }),

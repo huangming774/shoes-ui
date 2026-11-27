@@ -26,8 +26,21 @@
               {{ templateShortLabel(record.template) }}
             </a-tag>
           </template>
+          <template v-else-if="column.key === 'scope'">
+            <a-tag :color="record.include_cluster !== false ? 'blue' : 'default'">
+              {{ record.include_cluster !== false ? `🌐 ${t('subs.scopeCluster')}` : `💻 ${t('subs.scopeLocal')}` }}
+            </a-tag>
+          </template>
           <template v-else-if="column.key === 'node_count'">
-            <a-tag color="purple">{{ record.node_count || 0 }}</a-tag>
+            <a-tooltip
+              v-if="record.remote_node_count > 0"
+              :title="t('subs.localPlusRemote', { local: record.local_node_count || 0, remote: record.remote_node_count || 0 })"
+            >
+              <a-tag color="purple">
+                {{ record.node_count || 0 }} ({{ record.local_node_count || 0 }}+{{ record.remote_node_count || 0 }})
+              </a-tag>
+            </a-tooltip>
+            <a-tag v-else color="purple">{{ record.node_count || 0 }}</a-tag>
           </template>
           <template v-else-if="column.key === 'links'">
             <a-space wrap :size="6">
@@ -98,6 +111,9 @@
             </a-form-item>
           </a-col>
           <a-col :xs="24" :lg="10" style="display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding-top: 8px">
+            <a-checkbox v-model:checked="tplForm.enable_region_groups">
+              {{ t('subs.enableRegionGroups') }}
+            </a-checkbox>
             <a-checkbox v-model:checked="tplForm.prepend_custom_rules">
               {{ t('subs.prependCustom') }}
             </a-checkbox>
@@ -164,6 +180,9 @@
             <a-select-option value="streaming">{{ t('subs.presetShortStreaming') }}</a-select-option>
           </a-select>
         </a-form-item>
+        <a-form-item :label="t('subs.includeCluster')" :extra="t('subs.includeClusterTip')">
+          <a-switch v-model:checked="form.include_cluster" />
+        </a-form-item>
         <a-form-item :label="t('app.enable')">
           <a-switch v-model:checked="form.enable" />
         </a-form-item>
@@ -215,7 +234,15 @@ const loading = ref(false);
 const subs = ref([]);
 
 const modalOpen = ref(false);
-const form = reactive({ id: 0, name: '', sub_id: 'all', token: '', enable: true, template: '' });
+const form = reactive({
+  id: 0,
+  name: '',
+  sub_id: 'all',
+  token: '',
+  enable: true,
+  template: '',
+  include_cluster: true,
+});
 
 const savingTpl = ref(false);
 const tplForm = reactive({
@@ -223,6 +250,7 @@ const tplForm = reactive({
   prepend_custom_rules: true,
   enable_adblock: false,
   enable_ipv6: false,
+  enable_region_groups: true,
   clash_custom_rules: '',
   clash_extra_groups_yaml: '',
   singbox_custom_rules: '',
@@ -240,9 +268,10 @@ const qrItems = ref([]);
 const columns = computed(() => [
   { title: t('app.status'), key: 'enable', width: 80 },
   { title: t('subs.name'), dataIndex: 'name', key: 'name', width: 150 },
-  { title: 'subId', key: 'sub_id', width: 100 },
-  { title: t('subs.templateCol'), key: 'template', width: 125 },
-  { title: t('subs.nodeCount'), key: 'node_count', width: 85 },
+  { title: 'subId', key: 'sub_id', width: 95 },
+  { title: t('subs.scopeCol'), key: 'scope', width: 105 },
+  { title: t('subs.templateCol'), key: 'template', width: 120 },
+  { title: t('subs.nodeCount'), key: 'node_count', width: 105 },
   { title: 'Subscription URLs', key: 'links' },
   { title: t('app.actions'), key: 'actions', width: 230 },
 ]);
@@ -276,6 +305,7 @@ async function loadAll() {
         prepend_custom_rules: tpl.prepend_custom_rules !== false,
         enable_adblock: Boolean(tpl.enable_adblock),
         enable_ipv6: Boolean(tpl.enable_ipv6),
+        enable_region_groups: tpl.enable_region_groups !== false,
         clash_custom_rules: tpl.clash_custom_rules || '',
         clash_extra_groups_yaml: tpl.clash_extra_groups_yaml || '',
         singbox_custom_rules: tpl.singbox_custom_rules || '',
@@ -308,6 +338,7 @@ async function openPreview() {
   try {
     const res = await api.previewSubTemplate({
       sub_id: 'all',
+      include_cluster: true,
       template: { ...tplForm },
     });
     previewData.clash_yaml = res.clash_yaml || '';
@@ -337,12 +368,24 @@ function showSubQr(rec) {
 }
 
 function openCreate() {
-  Object.assign(form, { id: 0, name: 'All Nodes', sub_id: 'all', token: '', enable: true, template: '' });
+  Object.assign(form, {
+    id: 0,
+    name: 'All Nodes',
+    sub_id: 'all',
+    token: '',
+    enable: true,
+    template: '',
+    include_cluster: true,
+  });
   modalOpen.value = true;
 }
 
 function openEdit(rec) {
-  Object.assign(form, { ...rec, template: rec.template || '' });
+  Object.assign(form, {
+    ...rec,
+    template: rec.template || '',
+    include_cluster: rec.include_cluster !== false,
+  });
   modalOpen.value = true;
 }
 

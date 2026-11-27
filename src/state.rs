@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::{LoginGuard, SessionStore};
+use crate::cluster::ClusterManager;
 use crate::db::{normalize_base_path, Database};
 use crate::monitor::RuntimeMonitor;
 use crate::process::ShoesProcessManager;
@@ -12,6 +13,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub proc_mgr: Arc<ShoesProcessManager>,
     pub monitor: Arc<RuntimeMonitor>,
+    pub cluster: Arc<ClusterManager>,
     pub sessions: SessionStore,
     pub login_guard: LoginGuard,
     pub listener_scheme: &'static str,
@@ -28,10 +30,12 @@ impl AppState {
         monitor: Arc<RuntimeMonitor>,
         settings: &crate::models::PanelSettings,
     ) -> Arc<Self> {
+        let cluster = ClusterManager::new(db.clone());
         let st = Arc::new(Self {
             db,
             proc_mgr,
             monitor,
+            cluster,
             sessions: SessionStore::default(),
             login_guard: LoginGuard::default(),
             base_path: RwLock::new(settings.panel_base_path.clone()),

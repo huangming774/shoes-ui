@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::crypto_util::{generate_random_alnum, generate_uuid, hash_password, verify_password};
 use crate::models::{
-    CertificateRecord, ClientRecord, CoreGlobalSettings, DnsGroupRecord, Inbound, InboundTotals,
-    OutboundGroupRecord, PanelSettings, RoutingRuleRecord, RuleSourceGroupRecord, RuleSourceItem,
-    StreamSettings, SubscriptionRecord, SubscriptionTemplateConfig,
+    CertificateRecord, ClientRecord, ClusterLocalConfig, ClusterNodeRecord, CoreGlobalSettings,
+    DnsGroupRecord, Inbound, InboundTotals, OutboundGroupRecord, PanelSettings, RoutingRuleRecord,
+    RuleSourceGroupRecord, RuleSourceItem, StreamSettings, SubscriptionRecord,
+    SubscriptionTemplateConfig,
 };
 
 pub struct Database {
@@ -212,7 +213,26 @@ impl Database {
                 name TEXT NOT NULL,
                 enable INTEGER NOT NULL DEFAULT 1,
                 template TEXT NOT NULL DEFAULT '',
+                include_cluster INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cluster_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                region TEXT NOT NULL DEFAULT '',
+                region_flag TEXT NOT NULL DEFAULT '',
+                api_url TEXT NOT NULL,
+                api_token TEXT NOT NULL DEFAULT '',
+                share_host_override TEXT NOT NULL DEFAULT '',
+                allow_insecure INTEGER NOT NULL DEFAULT 0,
+                enable INTEGER NOT NULL DEFAULT 1,
+                include_in_sub INTEGER NOT NULL DEFAULT 1,
+                node_prefix TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
         )?;
 
@@ -266,6 +286,12 @@ impl Database {
                     [],
                 )?;
             }
+            if !cols.contains("include_cluster") {
+                conn.execute(
+                    "ALTER TABLE subscriptions ADD COLUMN include_cluster INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
         }
 
         // Seed default admin user (`admin` / `admin`) if users table is empty
@@ -295,6 +321,7 @@ impl Database {
         let bin = Self::default_shoes_bin_path(&self.data_dir);
         let config = self.data_dir.join("shoes.config.yaml");
         let secret = generate_random_alnum(32);
+        let instance_id = generate_uuid();
         {
             let mut insert =
                 conn.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)")?;
@@ -320,6 +347,11 @@ impl Database {
                 ("tg_chat_id", ""),
                 ("tg_backup_enabled", "false"),
                 ("core_global_settings", "{}"),
+                ("cluster_instance_id", instance_id.as_str()),
+                ("cluster_local_name", ""),
+                ("cluster_local_region", ""),
+                ("cluster_local_region_flag", ""),
+                ("cluster_api_token", ""),
             ] {
                 insert.execute(params![key, value])?;
             }
@@ -571,6 +603,7 @@ impl Database {
         candidate.list_routing_rules()?;
         candidate.list_dns_groups()?;
         candidate.list_rule_source_groups()?;
+        candidate.list_cluster_nodes()?;
         candidate.core_history()?;
         candidate.daily_traffic()?;
         let src_conn = candidate.conn.into_inner();
@@ -2171,7 +2204,8 @@ impl Database {
             name: r.get(3)?,
             enable: r.get::<_, i64>(4)? != 0,
             template: r.get(5)?,
-            created_at: r.get(6)?,
+            include_cluster: r.get::<_, i64>(6)? != 0,
+            created_at: r.get(7)?,
         })
     }
 
@@ -2185,7 +2219,7 @@ impl Database {
 
     fn read_subscriptions(&self, id: Option<i64>) -> Result<Vec<SubscriptionRecord>> {
         self.query_records(
-            "SELECT id, sub_id, token, name, enable, template, created_at FROM subscriptions",
+            "SELECT id, sub_id, token, name, enable, template, include_cluster, created_at FROM subscriptions",
             "id ASC", id, Self::subscription_from_row,
         )
     }
@@ -2193,7 +2227,7 @@ impl Database {
     pub fn find_subscription_by_token(&self, token: &str) -> Result<Option<SubscriptionRecord>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, sub_id, token, name, enable, template, created_at FROM subscriptions WHERE token = ?1 AND enable = 1",
+            "SELECT id, sub_id, token, name, enable, template, include_cluster, created_at FROM subscriptions WHERE token = ?1 AND enable = 1",
             params![token],
             Self::subscription_from_row,
         )
@@ -2210,7 +2244,7 @@ impl Database {
                  WHERE c.enable <> 0 AND i.enable <> 0 AND i.protocol <> 'portforward'
                  GROUP BY c.sub_id
              )
-             SELECT s.id, s.sub_id, s.token, s.name, s.enable, s.template, s.created_at,
+             SELECT s.id, s.sub_id, s.token, s.name, s.enable, s.template, s.include_cluster, s.created_at,
                     CASE WHEN s.sub_id = 'all' COLLATE NOCASE OR s.sub_id = '*'
                          THEN (SELECT COALESCE(SUM(nodes), 0) FROM counts)
                          ELSE COALESCE(counts.nodes, 0) END
@@ -2218,7 +2252,7 @@ impl Database {
              ORDER BY s.id",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((Self::subscription_from_row(row)?, row.get(7)?))
+            Ok((Self::subscription_from_row(row)?, row.get(8)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -2248,14 +2282,14 @@ impl Database {
         let conn = self.conn.lock();
         let id = if s.id > 0 {
             conn.execute(
-                "UPDATE subscriptions SET sub_id = ?1, token = ?2, name = ?3, enable = ?4, template = ?5 WHERE id = ?6",
-                params![sub_id, token, name, if s.enable { 1 } else { 0 }, template, s.id],
+                "UPDATE subscriptions SET sub_id = ?1, token = ?2, name = ?3, enable = ?4, template = ?5, include_cluster = ?6 WHERE id = ?7",
+                params![sub_id, token, name, if s.enable { 1 } else { 0 }, template, if s.include_cluster { 1 } else { 0 }, s.id],
             )?;
             s.id
         } else {
             conn.execute(
-                "INSERT INTO subscriptions (sub_id, token, name, enable, template, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![sub_id, token, name, if s.enable { 1 } else { 0 }, template, now],
+                "INSERT INTO subscriptions (sub_id, token, name, enable, template, include_cluster, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![sub_id, token, name, if s.enable { 1 } else { 0 }, template, if s.include_cluster { 1 } else { 0 }, now],
             )?;
             conn.last_insert_rowid()
         };
@@ -2281,6 +2315,257 @@ impl Database {
         conn.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    // ==================== Cluster Nodes & Local Federation Identity ====================
+
+    fn cluster_node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClusterNodeRecord> {
+        Ok(ClusterNodeRecord {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            region: r.get(2)?,
+            region_flag: r.get(3)?,
+            api_url: r.get(4)?,
+            api_token: r.get(5)?,
+            share_host_override: r.get(6)?,
+            allow_insecure: r.get::<_, i64>(7)? != 0,
+            enable: r.get::<_, i64>(8)? != 0,
+            include_in_sub: r.get::<_, i64>(9)? != 0,
+            node_prefix: r.get(10)?,
+            remark: r.get(11)?,
+            sort_order: r.get(12)?,
+            created_at: r.get(13)?,
+            updated_at: r.get(14)?,
+        })
+    }
+
+    pub fn list_cluster_nodes(&self) -> Result<Vec<ClusterNodeRecord>> {
+        self.read_cluster_nodes(None)
+    }
+
+    pub fn get_cluster_node(&self, id: i64) -> Result<Option<ClusterNodeRecord>> {
+        Ok(self.read_cluster_nodes(Some(id))?.pop())
+    }
+
+    fn read_cluster_nodes(&self, id: Option<i64>) -> Result<Vec<ClusterNodeRecord>> {
+        self.query_records(
+            "SELECT id, name, region, region_flag, api_url, api_token, share_host_override,
+                    allow_insecure, enable, include_in_sub, node_prefix, remark, sort_order,
+                    created_at, updated_at
+             FROM cluster_nodes",
+            "sort_order ASC, id ASC",
+            id,
+            Self::cluster_node_from_row,
+        )
+    }
+
+    pub fn save_cluster_node(&self, mut n: ClusterNodeRecord) -> Result<ClusterNodeRecord> {
+        n.name = n.name.trim().to_string();
+        if n.name.is_empty() {
+            return Err(anyhow!("Cluster node name must not be empty"));
+        }
+        let normalized_url = normalize_cluster_api_url(&n.api_url)?;
+        n.api_url = normalized_url;
+        n.region = n.region.trim().to_string();
+        n.region_flag = n.region_flag.trim().to_string();
+        n.api_token = n.api_token.trim().to_string();
+        n.share_host_override = n.share_host_override.trim().to_string();
+        n.node_prefix = n.node_prefix.trim().to_string();
+        n.remark = n.remark.trim().to_string();
+
+        let now = Utc::now().timestamp_millis();
+        let conn = self.conn.lock();
+        let id = if n.id > 0 {
+            let existing_token: Option<String> = conn
+                .query_row(
+                    "SELECT api_token FROM cluster_nodes WHERE id = ?1",
+                    params![n.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(prev_tok) = existing_token else {
+                return Err(anyhow!("Cluster node #{} not found", n.id));
+            };
+            let final_token = if n.api_token.is_empty() {
+                prev_tok
+            } else {
+                n.api_token.clone()
+            };
+            if final_token.is_empty() {
+                return Err(anyhow!("Remote node API token must not be empty"));
+            }
+            conn.execute(
+                "UPDATE cluster_nodes SET
+                    name = ?1, region = ?2, region_flag = ?3, api_url = ?4, api_token = ?5,
+                    share_host_override = ?6, allow_insecure = ?7, enable = ?8,
+                    include_in_sub = ?9, node_prefix = ?10, remark = ?11, sort_order = ?12,
+                    updated_at = ?13
+                 WHERE id = ?14",
+                params![
+                    n.name,
+                    n.region,
+                    n.region_flag,
+                    n.api_url,
+                    final_token,
+                    n.share_host_override,
+                    if n.allow_insecure { 1 } else { 0 },
+                    if n.enable { 1 } else { 0 },
+                    if n.include_in_sub { 1 } else { 0 },
+                    n.node_prefix,
+                    n.remark,
+                    n.sort_order,
+                    now,
+                    n.id
+                ],
+            )?;
+            n.id
+        } else {
+            if n.api_token.is_empty() {
+                return Err(anyhow!("Remote node API token must not be empty"));
+            }
+            conn.execute(
+                "INSERT INTO cluster_nodes (
+                    name, region, region_flag, api_url, api_token, share_host_override,
+                    allow_insecure, enable, include_in_sub, node_prefix, remark, sort_order,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    n.name,
+                    n.region,
+                    n.region_flag,
+                    n.api_url,
+                    n.api_token,
+                    n.share_host_override,
+                    if n.allow_insecure { 1 } else { 0 },
+                    if n.enable { 1 } else { 0 },
+                    if n.include_in_sub { 1 } else { 0 },
+                    n.node_prefix,
+                    n.remark,
+                    n.sort_order,
+                    now
+                ],
+            )?;
+            conn.last_insert_rowid()
+        };
+        drop(conn);
+        self.get_cluster_node(id)?
+            .ok_or_else(|| anyhow!("failed to reload cluster node"))
+    }
+
+    pub fn delete_cluster_node(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM cluster_nodes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn get_cluster_local_config(&self) -> Result<ClusterLocalConfig> {
+        let conn = self.conn.lock();
+        let get_key = |k: &str| -> String {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+        };
+        let mut instance_id = get_key("cluster_instance_id");
+        if instance_id.trim().is_empty() {
+            instance_id = generate_uuid();
+            let _ = conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('cluster_instance_id', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![&instance_id],
+            );
+        }
+        Ok(ClusterLocalConfig {
+            instance_id,
+            local_name: get_key("cluster_local_name"),
+            local_region: get_key("cluster_local_region"),
+            local_region_flag: get_key("cluster_local_region_flag"),
+            api_token: get_key("cluster_api_token"),
+        })
+    }
+
+    pub fn save_cluster_local_identity(
+        &self,
+        local_name: &str,
+        local_region: &str,
+        local_region_flag: &str,
+    ) -> Result<ClusterLocalConfig> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for (k, v) in [
+            ("cluster_local_name", local_name.trim()),
+            ("cluster_local_region", local_region.trim()),
+            ("cluster_local_region_flag", local_region_flag.trim()),
+        ] {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![k, v],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.get_cluster_local_config()
+    }
+
+    pub fn rotate_cluster_api_token(&self) -> Result<String> {
+        let token = format!("sp_{}", generate_random_alnum(40));
+        self.set_setting_kv("cluster_api_token", &token)?;
+        Ok(token)
+    }
+
+    pub fn revoke_cluster_api_token(&self) -> Result<()> {
+        self.set_setting_kv("cluster_api_token", "")
+    }
+
+    pub fn verify_cluster_api_token(&self, candidate: &str) -> bool {
+        let cand = candidate.trim();
+        if cand.is_empty() {
+            return false;
+        }
+        let Ok(cfg) = self.get_cluster_local_config() else {
+            return false;
+        };
+        let stored = cfg.api_token.trim();
+        if stored.is_empty() {
+            return false;
+        }
+        let d_stored = ring::digest::digest(&ring::digest::SHA256, stored.as_bytes());
+        let d_cand = ring::digest::digest(&ring::digest::SHA256, cand.as_bytes());
+        let diff = d_stored
+            .as_ref()
+            .iter()
+            .zip(d_cand.as_ref().iter())
+            .fold(0u8, |acc, (&a, &b)| acc | (a ^ b));
+        diff == 0 && stored.len() == cand.len()
+    }
+}
+
+pub fn normalize_cluster_api_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(anyhow!("Remote panel API URL must not be empty"));
+    }
+    let mut parsed = url::Url::parse(trimmed)
+        .with_context(|| format!("Invalid remote panel URL '{trimmed}'"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("Remote panel URL must use http:// or https://"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(anyhow!("Remote panel URL must include a host"));
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let mut s = parsed.to_string().trim_end_matches('/').to_string();
+    for suffix in ["/api/cluster/export", "/api/status", "/api"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    Ok(s)
 }
 
 pub fn normalize_base_path(p: &str) -> String {

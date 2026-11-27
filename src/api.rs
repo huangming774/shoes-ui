@@ -18,16 +18,21 @@ use crate::acme_util::{
     issue_shortlived_ip_cert, reload_panel_https_if_matching, renew_ip_certificate_record,
     sanitize_cert_filename, validate_cert_key_pair, write_cert_and_key_atomic, CertRuntimeStatus,
 };
-use crate::auth::{extract_token_from_headers, SESSION_COOKIE_NAME};
+use crate::auth::{extract_cluster_token_from_headers, extract_token_from_headers, SESSION_COOKIE_NAME};
+use crate::cluster::{
+    effective_node_prefix, ClusterExportPayload, ClusterShoesSummary, ClusterSystemSummary,
+    RemoteNodeSnapshot,
+};
 use crate::crypto_util::{
     generate_random_alnum, generate_reality_keypair, generate_self_signed_cert,
     generate_short_id, generate_ss2022_password, generate_uuid, generate_wireguard_keypair,
 };
 use crate::db::{default_client_for_inbound, ConfigTable};
 use crate::models::{
-    CertificateRecord, ClientRecord, DnsGroupRecord, Inbound, OutboundGroupRecord, PanelSettings,
-    RoutingRuleRecord, RuleSourceGroupRecord, SubscriptionRecord, SubscriptionTemplateConfig,
-    DEFAULT_LETSENCRYPT_DIR, DEFAULT_LETSENCRYPT_TOS,
+    CertificateRecord, ClientRecord, ClusterNodeRecord, DnsGroupRecord, Inbound,
+    OutboundGroupRecord, PanelSettings, RoutingRuleRecord, RuleSourceGroupRecord,
+    SubscriptionRecord, SubscriptionTemplateConfig, DEFAULT_LETSENCRYPT_DIR,
+    DEFAULT_LETSENCRYPT_TOS,
 };
 use crate::ops_util::{
     backups_dir, build_backup_caption, check_github_updates, create_local_backup,
@@ -37,7 +42,8 @@ use crate::ops_util::{
 };
 use crate::state::{is_loopback_or_unspecified_host, AppState};
 use crate::sub_gen::{
-    build_client_share_info, generate_subscription_with_options, SubFormat,
+    build_client_share_info, collect_public_cert_pems, generate_aggregated_subscription,
+    SubFormat, SubSourceNode,
 };
 use crate::yaml_gen::{build_shoes_yaml_full, normalize_acme_domains};
 
@@ -207,6 +213,16 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
         )
         .route("/subscriptions/{id}/rotate", post(api_rotate_subscription))
         .route("/subscriptions/{id}", delete(api_delete_subscription))
+        // Multi-Node Cluster Federation
+        .route("/cluster/overview", get(api_cluster_overview))
+        .route("/cluster/local", put(api_cluster_save_local))
+        .route("/cluster/local/token/rotate", post(api_cluster_rotate_token))
+        .route("/cluster/local/token/revoke", post(api_cluster_revoke_token))
+        .route("/cluster/nodes", post(api_cluster_save_node))
+        .route("/cluster/nodes/test", post(api_cluster_test_node))
+        .route("/cluster/sync", post(api_cluster_sync_all))
+        .route("/cluster/nodes/{id}/sync", post(api_cluster_sync_one))
+        .route("/cluster/nodes/{id}", delete(api_cluster_delete_node))
         // Panel Settings & Account
         .route("/settings", get(api_get_settings).put(api_save_settings))
         .route("/settings/public-host", post(api_set_public_host))
@@ -234,7 +250,9 @@ pub fn build_inner_router(state: Arc<AppState>) -> Router {
     let public_api = Router::new()
         .route("/auth/login", post(api_login))
         .route("/auth/logout", post(api_logout))
-        .route("/auth/me", get(api_me));
+        .route("/auth/me", get(api_me))
+        // Read-only cluster federation export (authenticated by Cluster API Token or Admin Session)
+        .route("/cluster/export", get(api_cluster_export));
 
     Router::new()
         .nest("/api", public_api.merge(protected_api))
@@ -2103,7 +2121,401 @@ async fn api_delete_routing_rule(
     ok_json(true)
 }
 
+// ==================== Multi-Node Cluster Federation ====================
+
+fn mask_api_token(tok: &str) -> String {
+    let t = tok.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() <= 10 {
+        return "••••••••".to_string();
+    }
+    let head: String = chars[..6].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}••••••{tail}")
+}
+
+fn resolve_panel_public_url(
+    state: &AppState,
+    settings: &PanelSettings,
+    headers: &HeaderMap,
+) -> String {
+    let base_path = state.get_base_path();
+    let suffix = if base_path == "/" {
+        String::new()
+    } else {
+        base_path
+    };
+    if let Some(xfh) = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("").trim())
+        .filter(|s| !s.is_empty() && !is_loopback_or_unspecified_host(&strip_host_port(s)))
+    {
+        let proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(',').next().unwrap_or("http").trim())
+            .unwrap_or("http");
+        return format!("{proto}://{xfh}{suffix}");
+    }
+    let host = resolve_share_host(state, settings, headers, None);
+    let host_fmt = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    format!("{}://{host_fmt}:{}{suffix}", state.listener_scheme, state.listener_port)
+}
+
+async fn api_cluster_export(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let token = extract_cluster_token_from_headers(&headers).unwrap_or_default();
+    let authorized =
+        state.sessions.validate(&token).is_some() || state.db.verify_cluster_api_token(&token);
+    if !authorized {
+        return Err(err_json(
+            StatusCode::UNAUTHORIZED,
+            "Invalid or disabled cluster API token",
+        ));
+    }
+
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let local_cfg = state.db.get_cluster_local_config().map_err(internal_err)?;
+    let share_host = resolve_share_host(&state, &settings, &headers, None);
+    let shoes = ClusterShoesSummary::from(&state.proc_mgr.status().await);
+    let system = ClusterSystemSummary::from(&state.monitor.snapshot());
+    let totals = state.db.inbound_totals().map_err(internal_err)?;
+    let all_inbounds = state.db.list_inbounds().map_err(internal_err)?;
+    let certs = state.db.list_certificates().unwrap_or_default();
+    let inbounds: Vec<crate::models::Inbound> = all_inbounds
+        .into_iter()
+        .filter(|i| i.enable && i.protocol != "portforward")
+        .collect();
+    let cert_pems = collect_public_cert_pems(&inbounds, &certs);
+
+    ok_json(ClusterExportPayload {
+        instance_id: local_cfg.instance_id,
+        panel_version: env!("CARGO_PKG_VERSION").to_string(),
+        local_name: local_cfg.local_name,
+        local_region: local_cfg.local_region,
+        local_region_flag: local_cfg.local_region_flag,
+        share_host,
+        shoes,
+        system,
+        totals,
+        inbounds,
+        cert_pems,
+    })
+}
+
+async fn build_cluster_overview_json(state: &AppState, headers: &HeaderMap) -> Result<Value, (StatusCode, Json<Value>)> {
+    let settings = state.db.get_settings().map_err(internal_err)?;
+    let local_cfg = state.db.get_cluster_local_config().map_err(internal_err)?;
+    let local_shoes = ClusterShoesSummary::from(&state.proc_mgr.status().await);
+    let local_sys = ClusterSystemSummary::from(&state.monitor.snapshot());
+    let local_totals = state.db.inbound_totals().map_err(internal_err)?;
+    let local_share_host = resolve_share_host(state, &settings, headers, None);
+    let local_panel_url = resolve_panel_public_url(state, &settings, headers);
+
+    let nodes = state.db.list_cluster_nodes().map_err(internal_err)?;
+    let snapshots = state.cluster.get_snapshots();
+
+    let mut nodes_total = 1usize;
+    let mut nodes_online = 1usize;
+    let mut shoes_running = usize::from(local_shoes.running);
+    let mut inbounds_total = local_totals.inbounds_total;
+    let mut inbounds_enabled = local_totals.inbounds_enabled;
+    let mut clients_total = local_totals.clients_total;
+    let mut active_connections = local_sys.active_connections;
+    let mut proxy_up_speed = local_sys.proxy_up_speed;
+    let mut proxy_down_speed = local_sys.proxy_down_speed;
+    let mut net_rx_speed = local_sys.net_rx_speed;
+    let mut net_tx_speed = local_sys.net_tx_speed;
+    let mut total_up_bytes = local_totals.up_bytes;
+    let mut total_down_bytes = local_totals.down_bytes;
+    let mut region_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    if !local_cfg.local_region.trim().is_empty() {
+        let lbl = if !local_cfg.local_region_flag.trim().is_empty() {
+            format!("{} {}", local_cfg.local_region_flag.trim(), local_cfg.local_region.trim())
+        } else {
+            local_cfg.local_region.trim().to_string()
+        };
+        *region_counts.entry(lbl).or_insert(0) += 1;
+    }
+
+    let mut enriched_nodes = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let snap = snapshots.get(&n.id).cloned();
+        if n.enable {
+            nodes_total += 1;
+            if !n.region.trim().is_empty() {
+                let lbl = if !n.region_flag.trim().is_empty() {
+                    format!("{} {}", n.region_flag.trim(), n.region.trim())
+                } else {
+                    n.region.trim().to_string()
+                };
+                *region_counts.entry(lbl).or_insert(0) += 1;
+            }
+            if let Some(ref s) = snap {
+                if s.online {
+                    nodes_online += 1;
+                    if s.shoes.running {
+                        shoes_running += 1;
+                    }
+                    inbounds_total += s.totals.inbounds_total;
+                    inbounds_enabled += s.totals.inbounds_enabled;
+                    clients_total += s.totals.clients_total;
+                    active_connections += s.system.active_connections;
+                    proxy_up_speed = proxy_up_speed.saturating_add(s.system.proxy_up_speed);
+                    proxy_down_speed = proxy_down_speed.saturating_add(s.system.proxy_down_speed);
+                    net_rx_speed = net_rx_speed.saturating_add(s.system.net_rx_speed);
+                    net_tx_speed = net_tx_speed.saturating_add(s.system.net_tx_speed);
+                    total_up_bytes = total_up_bytes.saturating_add(s.totals.up_bytes);
+                    total_down_bytes = total_down_bytes.saturating_add(s.totals.down_bytes);
+                }
+            }
+        }
+        let has_token = !n.api_token.trim().is_empty();
+        let token_preview = mask_api_token(&n.api_token);
+        let mut sanitized = n.clone();
+        sanitized.api_token = String::new();
+        enriched_nodes.push(json!({
+            "node": sanitized,
+            "has_token": has_token,
+            "token_preview": token_preview,
+            "snapshot": snap,
+        }));
+    }
+
+    Ok(json!({
+        "local": {
+            "instance_id": local_cfg.instance_id,
+            "local_name": local_cfg.local_name,
+            "local_region": local_cfg.local_region,
+            "local_region_flag": local_cfg.local_region_flag,
+            "api_token": local_cfg.api_token,
+            "api_token_enabled": !local_cfg.api_token.trim().is_empty(),
+            "panel_version": env!("CARGO_PKG_VERSION"),
+            "share_host": local_share_host,
+            "panel_url": local_panel_url,
+            "shoes": local_shoes,
+            "system": local_sys,
+            "totals": local_totals,
+        },
+        "nodes": enriched_nodes,
+        "summary": {
+            "nodes_total": nodes_total,
+            "nodes_online": nodes_online,
+            "shoes_running": shoes_running,
+            "inbounds_total": inbounds_total,
+            "inbounds_enabled": inbounds_enabled,
+            "clients_total": clients_total,
+            "active_connections": active_connections,
+            "proxy_up_speed": proxy_up_speed,
+            "proxy_down_speed": proxy_down_speed,
+            "net_rx_speed": net_rx_speed,
+            "net_tx_speed": net_tx_speed,
+            "total_up_bytes": total_up_bytes,
+            "total_down_bytes": total_down_bytes,
+            "regions": region_counts,
+        }
+    }))
+}
+
+async fn api_cluster_overview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    ok_json(build_cluster_overview_json(&state, &headers).await?)
+}
+
+#[derive(Deserialize)]
+struct SaveClusterLocalReq {
+    #[serde(default)]
+    local_name: String,
+    #[serde(default)]
+    local_region: String,
+    #[serde(default)]
+    local_region_flag: String,
+}
+
+async fn api_cluster_save_local(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveClusterLocalReq>,
+) -> ApiResult {
+    let saved = state
+        .db
+        .save_cluster_local_identity(&req.local_name, &req.local_region, &req.local_region_flag)
+        .map_err(bad_req)?;
+    ok_json(saved)
+}
+
+async fn api_cluster_rotate_token(State(state): State<Arc<AppState>>) -> ApiResult {
+    let token = state.db.rotate_cluster_api_token().map_err(internal_err)?;
+    ok_json(json!({ "api_token": token }))
+}
+
+async fn api_cluster_revoke_token(State(state): State<Arc<AppState>>) -> ApiResult {
+    state.db.revoke_cluster_api_token().map_err(internal_err)?;
+    ok_json(true)
+}
+
+#[derive(Deserialize)]
+struct TestClusterNodeReq {
+    #[serde(default)]
+    node_id: i64,
+    api_url: String,
+    #[serde(default)]
+    api_token: String,
+    #[serde(default)]
+    allow_insecure: bool,
+}
+
+async fn api_cluster_test_node(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TestClusterNodeReq>,
+) -> ApiResult {
+    let token = if !req.api_token.trim().is_empty() {
+        req.api_token.trim().to_string()
+    } else if req.node_id > 0 {
+        state
+            .db
+            .get_cluster_node(req.node_id)
+            .map_err(internal_err)?
+            .map(|n| n.api_token)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let res = state
+        .cluster
+        .test_connection(&req.api_url, &token, req.allow_insecure)
+        .await
+        .map_err(bad_req)?;
+    ok_json(res)
+}
+
+async fn api_cluster_save_node(
+    State(state): State<Arc<AppState>>,
+    Json(node): Json<ClusterNodeRecord>,
+) -> ApiResult {
+    let saved = state.db.save_cluster_node(node).map_err(bad_req)?;
+    let snapshot = if saved.enable {
+        Some(state.cluster.sync_node(&saved).await)
+    } else {
+        state.cluster.remove_snapshot(saved.id);
+        None
+    };
+    let mut sanitized = saved;
+    let has_token = !sanitized.api_token.trim().is_empty();
+    let token_preview = mask_api_token(&sanitized.api_token);
+    sanitized.api_token = String::new();
+    ok_json(json!({
+        "node": sanitized,
+        "has_token": has_token,
+        "token_preview": token_preview,
+        "snapshot": snapshot,
+    }))
+}
+
+async fn api_cluster_sync_all(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult {
+    let _ = state.cluster.sync_all_now().await;
+    ok_json(build_cluster_overview_json(&state, &headers).await?)
+}
+
+async fn api_cluster_sync_one(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let snap = state.cluster.sync_node_by_id(id).await.map_err(bad_req)?;
+    ok_json(snap)
+}
+
+async fn api_cluster_delete_node(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    state.db.delete_cluster_node(id).map_err(bad_req)?;
+    state.cluster.remove_snapshot(id);
+    ok_json(true)
+}
+
 // ==================== Subscriptions ====================
+
+fn render_subscription_for_state(
+    local_inbounds: &[crate::models::Inbound],
+    local_certs: &[CertificateRecord],
+    local_host: &str,
+    local_cfg: &crate::models::ClusterLocalConfig,
+    remote_nodes: &[ClusterNodeRecord],
+    snapshots: &HashMap<i64, RemoteNodeSnapshot>,
+    include_cluster: bool,
+    sub_id_filter: &str,
+    format: SubFormat,
+    template: &SubscriptionTemplateConfig,
+) -> crate::sub_gen::SubscriptionPayload {
+    let now = chrono::Utc::now().timestamp_millis();
+    let usable_remotes: Vec<(&ClusterNodeRecord, &RemoteNodeSnapshot, String)> = if include_cluster {
+        remote_nodes
+            .iter()
+            .filter(|n| n.enable && n.include_in_sub)
+            .filter_map(|n| {
+                let snap = snapshots.get(&n.id)?;
+                if snap.has_usable_inbounds(now) {
+                    Some((n, snap, effective_node_prefix(n)))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let local_prefix = if !usable_remotes.is_empty() && !local_cfg.local_name.trim().is_empty() {
+        let flag = local_cfg.local_region_flag.trim();
+        if !flag.is_empty() {
+            format!("{flag} {}", local_cfg.local_name.trim())
+        } else {
+            local_cfg.local_name.trim().to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let mut sources = Vec::with_capacity(1 + usable_remotes.len());
+    sources.push(SubSourceNode {
+        region: local_cfg.local_region.trim(),
+        region_flag: local_cfg.local_region_flag.trim(),
+        prefix: local_prefix.as_str(),
+        host: local_host,
+        inbounds: local_inbounds,
+        certs: local_certs,
+        cert_pems: None,
+    });
+    for (node, snap, prefix) in &usable_remotes {
+        sources.push(SubSourceNode {
+            region: node.region.trim(),
+            region_flag: node.region_flag.trim(),
+            prefix: prefix.as_str(),
+            host: snap.share_host.as_str(),
+            inbounds: &snap.inbounds,
+            certs: &[],
+            cert_pems: Some(&snap.cert_pems),
+        });
+    }
+
+    generate_aggregated_subscription(&sources, sub_id_filter, format, template)
+}
 
 async fn api_list_subscriptions(
     State(state): State<Arc<AppState>>,
@@ -2139,10 +2551,17 @@ async fn api_list_subscriptions(
 
     let enriched: Vec<Value> = subs
         .into_iter()
-        .map(|(s, node_count)| {
+        .map(|(s, local_count)| {
+            let remote_count = if s.include_cluster {
+                state.cluster.count_remote_sub_nodes(&s.sub_id)
+            } else {
+                0
+            };
             let sub_url = format!("{base_url}/sub/{}", s.token);
             let mut v = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
-            v["node_count"] = json!(node_count);
+            v["local_node_count"] = json!(local_count);
+            v["remote_node_count"] = json!(remote_count);
+            v["node_count"] = json!(local_count + remote_count);
             v["url_auto"] = json!(sub_url);
             v["url_v2ray"] = json!(format!("{sub_url}?format=v2ray"));
             v["url_clash"] = json!(format!("{sub_url}?format=clash"));
@@ -2190,10 +2609,16 @@ async fn api_save_sub_template(
     ok_json(saved)
 }
 
+fn default_true_val() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct PreviewSubTemplateReq {
     #[serde(default)]
     sub_id: String,
+    #[serde(default = "default_true_val")]
+    include_cluster: bool,
     template: SubscriptionTemplateConfig,
 }
 
@@ -2202,28 +2627,42 @@ async fn api_preview_sub_template(
     headers: HeaderMap,
     Json(req): Json<PreviewSubTemplateReq>,
 ) -> ApiResult {
+    if req.include_cluster {
+        state.cluster.ensure_fresh_for_subscription(30_000).await;
+    }
     let inbounds = state.db.list_inbounds().map_err(internal_err)?;
     let certs = state.db.list_certificates().unwrap_or_default();
     let settings = state.db.get_settings().map_err(internal_err)?;
+    let local_cfg = state.db.get_cluster_local_config().unwrap_or_default();
+    let remote_nodes = state.db.list_cluster_nodes().unwrap_or_default();
+    let snapshots = state.cluster.get_snapshots();
     let host = resolve_share_host(&state, &settings, &headers, None);
     let sub_id = if req.sub_id.trim().is_empty() {
         "all"
     } else {
         req.sub_id.trim()
     };
-    let clash = generate_subscription_with_options(
+    let clash = render_subscription_for_state(
         &inbounds,
         &certs,
-        sub_id,
         &host,
+        &local_cfg,
+        &remote_nodes,
+        &snapshots,
+        req.include_cluster,
+        sub_id,
         SubFormat::ClashYaml,
         &req.template,
     );
-    let singbox = generate_subscription_with_options(
+    let singbox = render_subscription_for_state(
         &inbounds,
         &certs,
-        sub_id,
         &host,
+        &local_cfg,
+        &remote_nodes,
+        &snapshots,
+        req.include_cluster,
+        sub_id,
         SubFormat::SingBoxJson,
         &req.template,
     );
@@ -2245,12 +2684,32 @@ async fn public_subscription_handler(
             return (StatusCode::NOT_FOUND, "Subscription not found or disabled").into_response();
         }
     };
+    let include_cluster = match query.get("cluster").map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "false" | "no" | "off") => false,
+        Some("1" | "true" | "yes" | "on") => true,
+        _ => sub.include_cluster,
+    };
+    if include_cluster {
+        state.cluster.ensure_fresh_for_subscription(30_000).await;
+    }
+
     let Ok(inbounds) = state.db.list_inbounds() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response();
     };
     let certs = state.db.list_certificates().unwrap_or_default();
     let Ok(settings) = state.db.get_settings() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Settings error").into_response();
+    };
+    let local_cfg = state.db.get_cluster_local_config().unwrap_or_default();
+    let remote_nodes = if include_cluster {
+        state.db.list_cluster_nodes().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let snapshots = if include_cluster {
+        state.cluster.get_snapshots()
+    } else {
+        HashMap::new()
     };
 
     let host = resolve_share_host(
@@ -2272,12 +2731,23 @@ async fn public_subscription_handler(
     } else if !sub.template.trim().is_empty() {
         effective_tpl.preset = sub.template.trim().to_ascii_lowercase();
     }
+    if let Some(rg) = query.get("region_groups").map(|s| s.trim().to_ascii_lowercase()) {
+        if matches!(rg.as_str(), "0" | "false" | "no" | "off") {
+            effective_tpl.enable_region_groups = false;
+        } else if matches!(rg.as_str(), "1" | "true" | "yes" | "on") {
+            effective_tpl.enable_region_groups = true;
+        }
+    }
 
-    let payload = generate_subscription_with_options(
+    let payload = render_subscription_for_state(
         &inbounds,
         &certs,
-        &sub.sub_id,
         &host,
+        &local_cfg,
+        &remote_nodes,
+        &snapshots,
+        include_cluster,
+        &sub.sub_id,
         fmt,
         &effective_tpl,
     );
@@ -2866,5 +3336,296 @@ async fn egress_probe_http_endpoint_handles_unknown_group_gracefully() -> anyhow
         .as_str()
         .unwrap_or("")
         .contains("shoes binary not found"));
+    Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cluster_federation_and_regional_aggregated_subscription_e2e() -> anyhow::Result<()> {
+    use crate::{db::Database, monitor::RuntimeMonitor, process::ShoesProcessManager};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use tower::ServiceExt;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Helper to build an isolated shoes-panel instance with 1 VLESS REALITY inbound + traffic
+    async fn spawn_child_node(
+        name: &str,
+        region: &str,
+        flag: &str,
+        share_host: &str,
+        port: u16,
+        up: u64,
+        down: u64,
+    ) -> anyhow::Result<(
+        tempfile::TempDir,
+        String,
+        String,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    )> {
+        let dir = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&dir.path().join("panel.db"), dir.path())?);
+        db.set_setting_kv("shoes_bin_path", "")?;
+        db.set_setting_kv("public_host", share_host)?;
+        db.save_cluster_local_identity(name, region, flag)?;
+        let cluster_token = db.rotate_cluster_api_token()?;
+        let (priv_k, pub_k) = generate_reality_keypair();
+        let ib = db.create_inbound(serde_json::from_value(json!({
+            "protocol": "vless",
+            "remark": format!("{region}-Reality"),
+            "port": port,
+            "stream_settings": {
+                "network": "tcp",
+                "security": "reality",
+                "reality": {
+                    "sni": "www.microsoft.com",
+                    "dest": "www.microsoft.com:443",
+                    "private_key": priv_k,
+                    "public_key": pub_k,
+                    "short_ids": ["0123456789abcdef"],
+                    "vision": true
+                }
+            },
+            "clients": [{ "name": "alice", "uuid": generate_uuid(), "sub_id": "default" }]
+        }))?)?;
+        db.add_traffic_deltas(&HashMap::from([(ib.tag, (up, down))]), None)?;
+
+        let mgr = ShoesProcessManager::new(db.clone());
+        let mon = RuntimeMonitor::new(db.clone(), mgr.clone());
+        let state = AppState::new(db.clone(), mgr, mon, &db.get_settings()?);
+        let app = build_inner_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let srv = tokio::spawn(async move { axum::serve(listener, app).await });
+        Ok((dir, url, cluster_token, srv))
+    }
+
+    let (_hk_dir, hk_url, hk_token, hk_srv) =
+        spawn_child_node("HK-Edge", "HK", "🇭🇰", "hk.example.com", 20443, 1000, 2000).await?;
+    let (_jp_dir, jp_url, jp_token, jp_srv) =
+        spawn_child_node("JP-Tokyo", "JP", "🇯🇵", "jp.example.com", 21443, 3000, 4000).await?;
+
+    // Verify Cluster API Token is strictly read-only (cannot access admin endpoints like /api/settings)
+    let raw_http = reqwest::Client::builder().no_proxy().build()?;
+    let admin_status = raw_http
+        .get(format!("{hk_url}/api/settings"))
+        .bearer_auth(&hk_token)
+        .send()
+        .await?
+        .status();
+    assert_eq!(admin_status, reqwest::StatusCode::UNAUTHORIZED);
+
+    // Master node (US)
+    let master_dir = tempfile::tempdir()?;
+    let master_db = Arc::new(Database::open(
+        &master_dir.path().join("panel.db"),
+        master_dir.path(),
+    )?);
+    master_db.set_setting_kv("shoes_bin_path", "")?;
+    master_db.set_setting_kv("public_host", "us.example.com")?;
+    master_db.save_cluster_local_identity("US-Master", "US", "🇺🇸")?;
+    let mut tpl = master_db.get_settings()?.sub_template;
+    tpl.preset = "streaming".to_string();
+    tpl.enable_region_groups = true;
+    master_db.save_sub_template(&tpl)?;
+
+    let (m_priv, m_pub) = generate_reality_keypair();
+    let master_ib = master_db.create_inbound(serde_json::from_value(json!({
+        "protocol": "vless",
+        "remark": "US-Reality",
+        "port": 22443,
+        "stream_settings": {
+            "network": "tcp",
+            "security": "reality",
+            "reality": {
+                "sni": "www.microsoft.com",
+                "dest": "www.microsoft.com:443",
+                "private_key": m_priv,
+                "public_key": m_pub,
+                "short_ids": ["abcdef0123456789"],
+                "vision": true
+            }
+        },
+        "clients": [{ "name": "alice", "uuid": generate_uuid(), "sub_id": "default" }]
+    }))?)?;
+    master_db.add_traffic_deltas(&HashMap::from([(master_ib.tag, (500, 600))]), None)?;
+
+    let m_mgr = ShoesProcessManager::new(master_db.clone());
+    let m_mon = RuntimeMonitor::new(master_db.clone(), m_mgr.clone());
+    let m_state = AppState::new(master_db.clone(), m_mgr, m_mon, &master_db.get_settings()?);
+    let admin_tok = m_state.sessions.create_session("admin", 1);
+    let app = build_inner_router(m_state.clone());
+
+    // 1. Test connection to HK child node before saving
+    let test_req = Request::builder()
+        .method("POST")
+        .uri("/api/cluster/nodes/test")
+        .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "api_url": hk_url, "api_token": hk_token }).to_string(),
+        ))?;
+    let test_resp = app.clone().oneshot(test_req).await?;
+    assert_eq!(test_resp.status(), StatusCode::OK);
+    let test_json: Value =
+        serde_json::from_slice(&axum::body::to_bytes(test_resp.into_body(), 1024 * 1024).await?)?;
+    assert_eq!(test_json["data"]["share_host"], "hk.example.com");
+    assert_eq!(test_json["data"]["local_region"], "HK");
+
+    // 2. Mount HK and JP remote nodes via POST /api/cluster/nodes
+    for (name, region, flag, url, tok) in [
+        ("HK-Edge", "HK", "🇭🇰", &hk_url, &hk_token),
+        ("JP-Tokyo", "JP", "🇯🇵", &jp_url, &jp_token),
+    ] {
+        let save_req = Request::builder()
+            .method("POST")
+            .uri("/api/cluster/nodes")
+            .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "name": name,
+                    "region": region,
+                    "region_flag": flag,
+                    "api_url": url,
+                    "api_token": tok,
+                    "enable": true,
+                    "include_in_sub": true
+                })
+                .to_string(),
+            ))?;
+        let resp = app.clone().oneshot(save_req).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // 3. Overview aggregates all 3 VPS nodes (online count, inbounds, cumulative traffic)
+    let ov_req = Request::builder()
+        .method("GET")
+        .uri("/api/cluster/overview")
+        .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
+        .body(Body::empty())?;
+    let ov_resp = app.clone().oneshot(ov_req).await?;
+    assert_eq!(ov_resp.status(), StatusCode::OK);
+    let ov_json: Value =
+        serde_json::from_slice(&axum::body::to_bytes(ov_resp.into_body(), 1024 * 1024).await?)?;
+    assert_eq!(ov_json["data"]["summary"]["nodes_total"], 3);
+    assert_eq!(ov_json["data"]["summary"]["nodes_online"], 3);
+    assert_eq!(ov_json["data"]["summary"]["inbounds_enabled"], 3);
+    assert_eq!(ov_json["data"]["summary"]["total_up_bytes"], 4500);
+    assert_eq!(ov_json["data"]["summary"]["total_down_bytes"], 6600);
+    // Remote API tokens must never be returned raw in overview
+    assert_eq!(ov_json["data"]["nodes"][0]["node"]["api_token"], "");
+    assert_eq!(ov_json["data"]["nodes"][0]["has_token"], true);
+
+    // 4. Fetch unified subscription in Clash YAML, sing-box JSON, and v2ray Base64
+    let sub_token = master_db.list_subscriptions()?[0].token.clone();
+
+    let clash_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sub/{sub_token}?format=clash"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(clash_resp.status(), StatusCode::OK);
+    let userinfo = clash_resp
+        .headers()
+        .get("subscription-userinfo")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(userinfo.contains("upload=4500; download=6600"), "userinfo={userinfo}");
+    let clash_text =
+        String::from_utf8(axum::body::to_bytes(clash_resp.into_body(), 2 * 1024 * 1024).await?.to_vec())?;
+    let clash_doc: serde_yaml::Value = serde_yaml::from_str(&clash_text)?;
+    let proxies = clash_doc["proxies"].as_sequence().unwrap();
+    assert_eq!(proxies.len(), 3);
+    let servers: Vec<&str> = proxies
+        .iter()
+        .filter_map(|p| p["server"].as_str())
+        .collect();
+    assert!(servers.contains(&"us.example.com"));
+    assert!(servers.contains(&"hk.example.com"));
+    assert!(servers.contains(&"jp.example.com"));
+
+    let pgroups = clash_doc["proxy-groups"].as_sequence().unwrap();
+    let gnames: Vec<&str> = pgroups
+        .iter()
+        .filter_map(|g| g["name"].as_str())
+        .collect();
+    assert!(gnames.contains(&"🇭🇰 香港"), "groups={gnames:?}");
+    assert!(gnames.contains(&"🇯🇵 日本"), "groups={gnames:?}");
+    assert!(gnames.contains(&"🇺🇸 美国"), "groups={gnames:?}");
+    let ai_group = pgroups.iter().find(|g| g["name"] == "🤖 AI").unwrap();
+    let ai_members: Vec<&str> = ai_group["proxies"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(ai_members.contains(&"🇺🇸 美国"));
+    assert!(ai_members.contains(&"🇯🇵 日本"));
+
+    // sing-box JSON regional urltest groups
+    let sb_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sub/{sub_token}?format=singbox"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(sb_resp.status(), StatusCode::OK);
+    let sb_json: Value =
+        serde_json::from_slice(&axum::body::to_bytes(sb_resp.into_body(), 2 * 1024 * 1024).await?)?;
+    let outbounds = sb_json["outbounds"].as_array().unwrap();
+    assert!(outbounds
+        .iter()
+        .any(|o| o["tag"] == "🇭🇰 香港" && o["type"] == "urltest"));
+    assert!(outbounds
+        .iter()
+        .any(|o| o["tag"] == "🇯🇵 日本" && o["type"] == "urltest"));
+    assert!(outbounds
+        .iter()
+        .any(|o| o["tag"] == "🇺🇸 美国" && o["type"] == "urltest"));
+
+    // v2ray Base64 merges all 3 VPS URIs, while ?cluster=0 restricts to local node only
+    let v2_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sub/{sub_token}?format=v2ray"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let v2_b64 = String::from_utf8(axum::body::to_bytes(v2_resp.into_body(), 1024 * 1024).await?.to_vec())?;
+    let v2_plain = String::from_utf8(STANDARD.decode(v2_b64.trim())?)?;
+    assert_eq!(v2_plain.lines().count(), 3);
+    assert!(v2_plain.contains("hk.example.com:20443"));
+    assert!(v2_plain.contains("jp.example.com:21443"));
+    assert!(v2_plain.contains("us.example.com:22443"));
+
+    let local_only_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/sub/{sub_token}?format=raw&cluster=0"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let local_only_txt = String::from_utf8(
+        axum::body::to_bytes(local_only_resp.into_body(), 1024 * 1024)
+            .await?
+            .to_vec(),
+    )?;
+    assert_eq!(local_only_txt.lines().count(), 1);
+    assert!(local_only_txt.contains("us.example.com:22443"));
+
+    hk_srv.abort();
+    jp_srv.abort();
     Ok(())
 }
